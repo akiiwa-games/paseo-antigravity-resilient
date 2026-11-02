@@ -187,6 +187,8 @@ export function isTransientDiscoveryFailure(result: {
     /\bUNAVAILABLE\b/i.test(combined) ||
     /\bcode\s*50[0234]\b/i.test(combined) ||
     /\bINTERNAL\b/i.test(combined) ||
+    // The CLI has its own model-list deadline and can exit before our timer.
+    /\btimed out waiting for available models\b/i.test(combined) ||
     /TLS handshake timeout/i.test(combined) ||
     /\bEOF\b/.test(combined) ||
     /connection reset/i.test(combined)
