@@ -1,16 +1,81 @@
 # Antigravity Resilient for Paseo
 
-相对于 [Paseo 官方 Antigravity 插件](https://github.com/getpaseo/paseo/tree/da8d58bfee5279369c1a733cf5cf4ddc3bd56bb8/plugins/antigravity-provider)，本插件的差异如下：
+Paseo 内置了 Antigravity（`agy` CLI）provider。本插件在它的基础上修改，主要解决三类问题：**daemon 重启后聊天记录消失**、**网络或登录抖动导致回合直接失败**、**长对话上下文失控**。
 
-| 功能 | 官方插件 | 本插件 |
-| --- | --- | --- |
-| Provider 标识 | `antigravity` | `antigravity-resilient`，可与官方插件并存 |
-| 重启后的时间线 | 保存 CLI 会话 ID 供原生续接，不提供 provider 时间线回放 | 通过快照、追加日志和备份恢复用户消息、助手回复、工具及压缩记录；未收尾的旧工具显示为取消 |
-| 错误恢复 | 上报 CLI 运行错误 | 对 OAuth 刷新间隙和暂时性传输失败进行有限重试；精确区分认证错误；依据明确完成信号识别 CLI 保留的已恢复传输错误，部分回复仍按失败处理 |
-| 模型发现 | 调用 `agy models` 获取模型列表 | 容忍列表中的提示文本；根据 CLI 文件变化使缓存失效；暂时失败最多重试一次，并可回退到有效缓存；未知模型重新探测 |
-| 启动与进程切换 | 默认启动等待 30 秒，提供进程树清理和基础生命周期管理 | 默认启动及模型发现等待 90 秒，启动等待可配置；隔离已退出进程的回调，等待关闭完成后再切换进程 |
-| 最终回复 | 按 CLI 事件映射助手文本 | 结合累计 `result.response` 补齐缺失尾部，避免重复已输出的中间消息 |
-| 思考内容 | 没有独立的原生 transcript 补读 | 从 CLI 新追加的本机 transcript 中补充 stdout 未提供的思考内容；通常随一次模型请求结束出现，非逐 token 输出 |
-| 上下文与压缩 | 上报请求 token 用量，沿用 CLI 原生压缩行为 | 增加上下文窗口估计；统一持久化原生、手动及空闲自动压缩状态；提供压缩失败与快速回填熔断，可禁用空闲自动压缩 |
-| 订阅额度 | 此 provider 不提供额度查询 | 读取 Windows Credential Manager 或 macOS Keychain 中的凭据，查询并显示 Google 订阅额度；不刷新凭据，Linux 凭据发现暂不支持 |
-| 提示输入 | 文本、图片和首次 system prompt | 额外支持命令及非图片附件；为真实非命令提示附加一次“大文件先汇总、完整资料落盘”的处理指引 |
+插件注册为独立的 provider `antigravity-resilient`，可以和内置的 `antigravity` 同时安装，新建 agent 时二选一。
+
+对比基线：[getpaseo/paseo `plugins/antigravity-provider`](https://github.com/getpaseo/paseo/tree/da8d58bfee5279369c1a733cf5cf4ddc3bd56bb8/plugins/antigravity-provider)（提交 `da8d58b`，2026-11-02 核对）。逐项来源见 [docs/UPSTREAM.md](docs/UPSTREAM.md)。
+
+## 和官方插件有什么不同
+
+### 1. 重启后能看到之前的聊天记录
+
+- **官方**：只保存 CLI 的会话 ID。daemon 重启后，agent 可以接着对话，但 Paseo 界面上之前的消息是空的。
+- **本插件**：把每个会话的时间线写到本机磁盘（快照 + 追加日志 + 备份文件），重启后先回放用户消息、助手回复、工具调用和压缩记录，再接收新输入。重启前没跑完的工具调用显示为"已取消"，不会重新执行。
+
+### 2. 暂时性故障自动重试一次
+
+官方遇到 CLI 报错就让本回合失败。本插件对两类已知的暂时性错误各重试一次：
+
+| 情况 | 处理 |
+| --- | --- |
+| OAuth 令牌刷新的空档期返回 401 | 等 8 秒后重试 |
+| 流式传输中断（如 SSE 断流） | 等 2 秒后重试 |
+
+如果失败前已经有部分输出，重试时会让模型从当前状态继续，不重复已完成的文字和工具操作。持续的网络或登录故障仍然会报错。
+
+另外两处错误判断也更准确：
+
+- **登录错误**：官方把带 `auth` 字样的任何报错都当作登录失败（比如 `author`），本插件只匹配真正的认证错误。
+- **假失败**：agy 1.4.12 会把一个已恢复的旧传输错误留在已完成的结果里。本插件确认 CLI 明确发出完成信号后忽略这条旧错误；只输出了一部分的回复仍按失败处理。
+
+### 3. 模型列表更稳定
+
+- 启动和获取模型列表的等待时间从官方的 30 秒放宽到 90 秒。实测第二台主机静默登录就超过了 30 秒。启动等待可用 `providerOptions.startupTimeoutMs` 调整。
+- 获取模型列表超时或暂时失败时重试一次，仍失败则沿用上次的有效缓存。
+- agy 升级（可执行文件变化）后缓存自动失效；输出里夹杂的提示文字不会导致解析失败。
+
+### 4. 上下文用量与自动压缩
+
+- 显示上下文窗口占用（窗口大小是估计值，可用 `providerOptions.contextWindowMaxTokens` 覆盖）。
+- **空闲自动压缩**：agy 的提示缓存约 5 分钟过期。上下文超过 15 万 token 时，本插件在缓存过期前约 1 分钟于后台执行 `/compact`，避免下一条消息按全价重新读入整段上下文。环境变量 `DISABLE_COMPACT=1` 可关闭。
+- **熔断**：连续 3 次压缩失败，或连续 3 次压缩后很快又被填满，就停止自动压缩，并提示可能是某个文件或工具输出过大。
+- CLI 自带的压缩、手动 `/compact` 和空闲压缩共用一份记录，重启后状态不丢。
+
+### 5. 回复更完整
+
+- **最终文本**：CLI 的流式事件有时会漏掉回复末尾。本插件用 CLI 最终结果里的完整回复补齐缺的部分，不重复已经显示的内容。
+- **思考过程**：stdout 里没有的思考内容，从 agy 写在本机的 transcript 中补读。通常在一次模型请求结束时整段出现，不是逐字流式显示。
+
+### 6. 其他
+
+- **订阅额度**：从 Windows 凭据管理器或 macOS 钥匙串读取 Antigravity 凭据，查询并显示 Google 订阅额度。插件不刷新凭据，过期后需要重新打开 `agy` 登录。Linux 暂不支持。
+- **输入类型**：除文本和图片外，还支持斜杠命令和非图片附件。
+- **大文件提示**：会话（重启后重新计）的第一条非命令提示前附加一次说明，让模型处理大型 CSV、JSON 或日志时先筛选汇总，完整结果保存到磁盘。插件本身不会截断用户数据。
+- **进程切换**：重试或重启 CLI 时，忽略已退出进程的回调，等旧进程完全关闭后再启动新进程。
+
+以下是官方已有的能力，本插件只做了适配：图片临时文件、agy 最低版本检查、进程树清理、工具终态收尾、会话身份校验、full-access 模式。
+
+## 安装
+
+前提条件：Paseo >=0.11.2，并已启用插件；daemon 所在用户已安装并登录 `agy >=1.1.15`，且 PATH 中能找到它。
+
+```sh
+paseo plugin install github:akiiwa-games/paseo-antigravity-resilient --ref v0.2.0
+```
+
+安装后新建 agent 时选择 provider `antigravity-resilient`、模式 `full-access`。这个模式会传入 `--dangerously-skip-permissions`，CLI 执行操作前不会再询问。从本地目录安装、更新和验证的步骤见 [docs/INSTALL.md](docs/INSTALL.md)。
+
+## 数据存放
+
+- 提示和工具结果通过本机 `agy` 发送给 Antigravity 服务。
+- 聊天回放数据保存在 `$PASEO_HOME/antigravity-resilient/conversations`（未设置 `PASEO_HOME` 时为 `~/.paseo`），可用 `providerOptions.storeDir` 修改。写入前会过滤已知的凭据字段，但不能保证自由文本里的敏感信息都被去掉。
+- 额度查询会请求 `cloudcode-pa.googleapis.com`。
+
+## 验证情况
+
+版本 0.2.0。已在两台 Windows 主机的真实 Paseo + agy 1.4.12 环境中验证：流式输出、思考记录、续接、回放和取消；79 项自动化测试通过。macOS 和 Linux 尚未做端到端验证。
+
+## 许可证
+
+上游代码来自 [getpaseo/paseo](https://github.com/getpaseo/paseo)，采用 Apache-2.0，原文见 [LICENSE.paseo](LICENSE.paseo)。本仓库修改部分的许可证尚未确定，公开仓库本身不代表授予新的开源许可。详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
