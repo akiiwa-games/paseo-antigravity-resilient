@@ -1,7 +1,7 @@
 # 安装与验证
 
-功能差异和当前验收限制以 [README](../README.md) 为准。0.2.0 当前尚未建立
-release tag；不要把包内版本号当作已发布版本。
+功能差异和当前验收限制以 [README](../README.md) 为准。0.2.0 提供 Git tag
+`v0.2.0`，已在两台 Windows 主机完成真实运行验收。
 
 ## 安装条件
 
@@ -40,11 +40,10 @@ paseo plugin ls
 
 ## 从 Git 安装
 
-Git 安装前，选择一个仓库中真实存在、已通过验收的提交
-或 tag，将下例占位符替换为该引用：
+从已验收的 Git tag 安装：
 
 ```sh
-paseo plugin install github:akiiwa-games/paseo-antigravity-resilient --ref <verified-commit-or-tag>
+paseo plugin install github:akiiwa-games/paseo-antigravity-resilient --ref v0.2.0
 ```
 
 托管的 Git 安装使用 `paseo plugin update antigravity-resilient-provider` 更新。

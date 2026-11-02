@@ -14,5 +14,6 @@ agy >=1.1.15。仅提供 full-access，CLI 将使用 --dangerously-skip-permissi
 系统凭据并调用 Google 接口，不负责刷新凭据。DISABLE_COMPACT=1 可禁用
 空闲自动压缩；上下文窗口是可覆盖的估计值。
 
-当前 0.2.0 尚无发布 tag，远端启动阶段访问 Google userinfo 的 EOF 尚未完成最终 live 验收。Windows
-已有本地检查记录，macOS/Linux 尚未完成端到端验证；Linux 额度发现不支持。
+当前版本为 0.2.0，提供 Git tag v0.2.0。两台 Windows 主机已通过真实流式输出、
+续接、回放和取消验收；79 项测试及干净打包安装通过。macOS/Linux 尚未完成
+端到端验证；Linux 额度发现不支持。

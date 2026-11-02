@@ -1,5 +1,5 @@
 // Opt-in integration probe against a real local Paseo daemon and logged-in agy.
-// Uses model quota. All commands run in a new disposable fixture directory.
+// Uses model quota. Commands run in a reusable dedicated fixture directory.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
