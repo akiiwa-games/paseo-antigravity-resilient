@@ -1,7 +1,6 @@
 # 安装与验证
 
-功能差异和当前验收限制以 [README](../README.md) 为准。0.2.0 提供 Git tag
-`v0.2.0`，已在两台 Windows 主机完成真实运行验收。
+功能差异见 [README](../README.md)。以下 Git 安装示例固定使用 `v0.2.1`。
 
 ## 安装条件
 
@@ -43,7 +42,7 @@ paseo plugin ls
 从已验收的 Git tag 安装：
 
 ```sh
-paseo plugin install github:akiiwa-games/paseo-antigravity-resilient --ref v0.2.0
+paseo plugin install github:akiiwa-games/paseo-antigravity-resilient --ref v0.2.1
 ```
 
 托管的 Git 安装使用 `paseo plugin update antigravity-resilient-provider` 更新。
@@ -89,3 +88,15 @@ AGENTCOMPASS_REMOTE_PASEO_HOME；兼容旧 ROUTE_MANAGER_REMOTE_* 名称。这�
 
 当前同步脚本要求远端分支 main，执行前必须核实远端分支与工作区状态。
 连接文件、登录、真实日志与验收证据应保存在私有外部目录。
+
+## 数据存放与许可证
+
+- 提示和工具结果通过本机 `agy` 发送给 Antigravity 服务。
+- 聊天回放数据保存在 `$PASEO_HOME/antigravity-resilient/conversations`（未设置
+  `PASEO_HOME` 时为 `~/.paseo`），可用 `providerOptions.storeDir` 修改。写入前会
+  过滤已知的凭据字段，但不能保证自由文本里的敏感信息都被去掉。
+- 额度查询会请求 `cloudcode-pa.googleapis.com`。
+
+上游代码来自 [getpaseo/paseo](https://github.com/getpaseo/paseo)，采用 Apache-2.0，
+原文见 [LICENSE.paseo](../LICENSE.paseo)。本仓库修改部分的许可证尚未确定，
+公开仓库本身不代表授予新的开源许可。详见 [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)。

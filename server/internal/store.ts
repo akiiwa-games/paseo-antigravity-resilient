@@ -398,6 +398,58 @@ export class ConversationStore {
     return path.join(this.brainDir, safeConversationKey(conversationId), ".system_generated", "logs", "transcript.jsonl");
   }
 
+  /** Positive completion proof when stdout has no terminal response state.
+   * Require a fresh request and the final, tool-free DONE in this conversation;
+   * text length and an earlier completed model/tool step are not proof. */
+  hasCompletedNativeResponse(
+    conversationId: string, afterStep: number, response: string, responseStep?: number,
+  ): boolean {
+    const finalResponse = (file: string): Record<string, unknown> | null => {
+      let fd: number | undefined;
+      try {
+        fd = this.fsOps.openSync(file, "r");
+        const size = this.fsOps.statSync(file).size;
+        const start = Math.max(0, size - 256 * 1024);
+        const raw = this.readRange(fd, start, size - start).toString("utf8");
+        // A partial last row may be a new error or an unfinished request.
+        if (!raw.endsWith("\n")) return null;
+        const lines = raw.split(/\r?\n/u);
+        if (start > 0) lines.shift();
+        const rows = new Map<number, Record<string, unknown>>();
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const row: unknown = JSON.parse(line);
+          if (!isRecord(row) || typeof row.step_index !== "number" || !Number.isSafeInteger(row.step_index)) return null;
+          if (row.step_index <= afterStep) continue;
+          if ((row.conversation_id !== undefined && row.conversation_id !== conversationId) ||
+              (row.conversationId !== undefined && row.conversationId !== conversationId)) return null;
+          rows.set(row.step_index, row);
+        }
+        const ordered = [...rows.values()].sort((a, b) => Number(a.step_index) - Number(b.step_index));
+        const last = ordered.at(-1);
+        if (!last || last.status !== "DONE" ||
+            !["PLANNER_RESPONSE", "AGENT_RESPONSE"].includes(String(last.type)) ||
+            typeof last.content !== "string" || !last.content.trim() ||
+            (responseStep !== undefined && last.step_index !== responseStep)) return null;
+        if (last.tool_calls != null && (!Array.isArray(last.tool_calls) || last.tool_calls.length !== 0)) return null;
+        if (!ordered.some(row => row.type === "USER_INPUT" && row.status === "DONE" &&
+            Number(row.step_index) < Number(last.step_index))) return null;
+        return last;
+      } catch { return null; }
+      finally { if (fd !== undefined) this.fsOps.closeSync(fd); }
+    };
+    const file = this.nativeTranscriptPath(conversationId);
+    let final = finalResponse(file);
+    if (!final) return false;
+    if (Array.isArray(final.truncated_fields) && final.truncated_fields.includes("content")) {
+      const full = finalResponse(path.join(path.dirname(file), "transcript_full.jsonl"));
+      if (!full || full.step_index !== final.step_index ||
+          (Array.isArray(full.truncated_fields) && full.truncated_fields.includes("content"))) return false;
+      final = full;
+    }
+    return response.trim().endsWith(String(final.content).trim());
+  }
+
   /**
    * Mirrors `agy` `printmode.postResponseFailure(turnSteps)`: returns true when
    * the native `transcript.jsonl` records an `ERROR_MESSAGE` (or `ERROR`-status)

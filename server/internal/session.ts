@@ -137,6 +137,7 @@ type ActiveTurn = {
   clientMessageId: string;
   id: string;
   lastResponseStepState: "ACTIVE" | "DONE" | "ERROR" | null;
+  lastResponseStepIndex: number | null;
   lastSignal: "assistant_message" | "reasoning" | "tool_call" | null;
   lastStepContextTokens: number;
   messageIndex: number;
@@ -186,6 +187,7 @@ function createTurn(
     activeMessageId: null,
     activeReasoningId: null,
     lastResponseStepState: null,
+    lastResponseStepIndex: null,
     lastSignal: null,
     messageIndex: 0,
     reasoningIndex: 0,
@@ -961,6 +963,13 @@ export class Session {
       if (!this.driver) {
         throw new Error("Antigravity CLI driver did not start");
       }
+      // Each recovery attempt needs its own native request boundary; never
+      // borrow a DONE written by the attempt whose stdout just failed.
+      if (this.conversationId) {
+        for (const row of this.store.readNativeCompaction(this.conversationId)) {
+          turn.nativeStartStep = Math.max(turn.nativeStartStep, row.step);
+        }
+      }
       await this.driver.sendLine(
         JSON.stringify({
           event: "user",
@@ -993,6 +1002,7 @@ export class Session {
     turn.activeMessageId = null;
     turn.activeReasoningId = null;
     turn.lastResponseStepState = null;
+    turn.lastResponseStepIndex = null;
     turn.lastSignal = null;
     turn.stderr = [];
     this.finishTools(turn, "canceled");
@@ -1273,9 +1283,13 @@ export class Session {
     // or missing finished_reason are not positive completion evidence.
     const completedCheckpoint = isCompactionTurn(turn) && turn.nativeCompacted;
     if (!completedCheckpoint) {
-      if (!responseText?.trim() || turn.lastResponseStepState !== "DONE" ||
-          turn.lastSignal !== "assistant_message") return false;
+      if (!responseText?.trim()) return false;
+      if (turn.lastResponseStepState === "ERROR") return false;
       if ([...turn.toolItems.values()].some(item => item.status === "running")) return false;
+      const streamedDone = turn.lastResponseStepState === "DONE" && turn.lastSignal === "assistant_message";
+      if (!streamedDone && !(this.conversationId && this.store.hasCompletedNativeResponse(
+        this.conversationId, turn.nativeStartStep, responseText, turn.lastResponseStepIndex ?? undefined,
+      ))) return false;
     }
     if (
       this.conversationId &&
@@ -1366,6 +1380,7 @@ export class Session {
           typeof frame.timestamp === "string" ? frame.timestamp : undefined;
         if (step.step_type === "agent_response") {
           turn.lastResponseStepState = step.state;
+          turn.lastResponseStepIndex = step.step_index;
           const delta =
             typeof step.text_delta === "string" ? step.text_delta : "";
           const merged = `${turn.text.get(id) ?? ""}${delta}`;
@@ -1518,6 +1533,7 @@ export class Session {
         turn.activeReasoningId = null;
         // Legacy message chunks carry text but no terminal step status.
         turn.lastResponseStepState = null;
+        turn.lastResponseStepIndex = null;
         turn.lastSignal = "assistant_message";
         const merged = `${turn.text.get(id) ?? ""}${content}`;
         turn.text.set(id, merged);

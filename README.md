@@ -31,7 +31,7 @@ Paseo 内置了 Antigravity（`agy` CLI）provider。本插件在它的基础上
 
 ### 3. 模型列表更稳定
 
-- 启动和获取模型列表的等待时间从官方的 30 秒放宽到 90 秒。实测第二台主机静默登录就超过了 30 秒。启动等待可用 `providerOptions.startupTimeoutMs` 调整。
+- 启动和获取模型列表的等待时间从官方的 30 秒放宽到 90 秒。启动等待可用 `providerOptions.startupTimeoutMs` 调整。
 - 获取模型列表超时或暂时失败时重试一次，仍失败则沿用上次的有效缓存。
 - agy 升级（可执行文件变化）后缓存自动失效；输出里夹杂的提示文字不会导致解析失败。
 
@@ -55,27 +55,3 @@ Paseo 内置了 Antigravity（`agy` CLI）provider。本插件在它的基础上
 - **进程切换**：重试或重启 CLI 时，忽略已退出进程的回调，等旧进程完全关闭后再启动新进程。
 
 以下是官方已有的能力，本插件只做了适配：图片临时文件、agy 最低版本检查、进程树清理、工具终态收尾、会话身份校验、full-access 模式。
-
-## 安装
-
-前提条件：Paseo >=0.11.2，并已启用插件；daemon 所在用户已安装并登录 `agy >=1.1.15`，且 PATH 中能找到它。
-
-```sh
-paseo plugin install github:akiiwa-games/paseo-antigravity-resilient --ref v0.2.0
-```
-
-安装后新建 agent 时选择 provider `antigravity-resilient`、模式 `full-access`。这个模式会传入 `--dangerously-skip-permissions`，CLI 执行操作前不会再询问。从本地目录安装、更新和验证的步骤见 [docs/INSTALL.md](docs/INSTALL.md)。
-
-## 数据存放
-
-- 提示和工具结果通过本机 `agy` 发送给 Antigravity 服务。
-- 聊天回放数据保存在 `$PASEO_HOME/antigravity-resilient/conversations`（未设置 `PASEO_HOME` 时为 `~/.paseo`），可用 `providerOptions.storeDir` 修改。写入前会过滤已知的凭据字段，但不能保证自由文本里的敏感信息都被去掉。
-- 额度查询会请求 `cloudcode-pa.googleapis.com`。
-
-## 验证情况
-
-版本 0.2.0。已在两台 Windows 主机的真实 Paseo + agy 1.4.12 环境中验证：流式输出、思考记录、续接、回放和取消；79 项自动化测试通过。macOS 和 Linux 尚未做端到端验证。
-
-## 许可证
-
-上游代码来自 [getpaseo/paseo](https://github.com/getpaseo/paseo)，采用 Apache-2.0，原文见 [LICENSE.paseo](LICENSE.paseo)。本仓库修改部分的许可证尚未确定，公开仓库本身不代表授予新的开源许可。详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
