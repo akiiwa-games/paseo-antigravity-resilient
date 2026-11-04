@@ -138,6 +138,8 @@ type ActiveTurn = {
   id: string;
   lastResponseStepState: "ACTIVE" | "DONE" | "ERROR" | null;
   lastResponseStepIndex: number | null;
+  lastStreamedStepIndex: number;
+  pendingThoughts: Map<number, { step: number; text: string; timestamp?: string }>;
   lastSignal: "assistant_message" | "reasoning" | "tool_call" | null;
   lastStepContextTokens: number;
   messageIndex: number;
@@ -188,6 +190,8 @@ function createTurn(
     activeReasoningId: null,
     lastResponseStepState: null,
     lastResponseStepIndex: null,
+    lastStreamedStepIndex: fields.nativeStartStep + 1,
+    pendingThoughts: new Map(),
     lastSignal: null,
     messageIndex: 0,
     reasoningIndex: 0,
@@ -968,6 +972,7 @@ export class Session {
       if (this.conversationId) {
         for (const row of this.store.readNativeCompaction(this.conversationId)) {
           turn.nativeStartStep = Math.max(turn.nativeStartStep, row.step);
+          turn.lastStreamedStepIndex = Math.max(turn.lastStreamedStepIndex, turn.nativeStartStep + 1);
         }
       }
       await this.driver.sendLine(
@@ -1238,11 +1243,18 @@ export class Session {
     poll();
   }
 
-  private readNativeReasoning(): void {
+  private readNativeReasoning(maxStep?: number): void {
     const turn = this.turn;
     if (!turn || !this.nativeReasoning) return;
     for (const thought of this.nativeReasoning.read()) {
       if (thought.step <= turn.nativeStartStep) continue;
+      turn.pendingThoughts.set(thought.step, thought);
+    }
+    const ceiling = maxStep ?? turn.lastStreamedStepIndex + 1;
+    const readySteps = [...turn.pendingThoughts.keys()].filter((step) => step <= ceiling).sort((a, b) => a - b);
+    for (const step of readySteps) {
+      const thought = turn.pendingThoughts.get(step)!;
+      turn.pendingThoughts.delete(step);
       const id = `${turn.id}:step:${thought.step}:reasoning`;
       if (turn.thinking.get(id) === thought.text) continue;
       turn.thinking.set(id, thought.text);
@@ -1251,7 +1263,7 @@ export class Session {
   }
 
   private stopNativeReasoning(): void {
-    this.readNativeReasoning();
+    this.readNativeReasoning(Infinity);
     if (this.nativeReasoningTimer !== null) clearTimeout(this.nativeReasoningTimer);
     this.nativeReasoningTimer = null;
     this.nativeReasoning = null;
@@ -1272,7 +1284,9 @@ export class Session {
     if (
       !errors.every(
         (entry) =>
-          isStreamInterruption(entry) || this.seenResultErrors.has(entry),
+          isStreamInterruption(entry) ||
+          this.seenResultErrors.has(entry) ||
+          Boolean(this.conversationId && this.store.isRecoveredNativeError(this.conversationId, entry)),
       )
     ) {
       return false;
@@ -1376,6 +1390,8 @@ export class Session {
           return;
         }
         const id = `${turn.id}:step:${step.step_index}`;
+        this.readNativeReasoning(step.step_index);
+        turn.lastStreamedStepIndex = Math.max(turn.lastStreamedStepIndex, step.step_index);
         const timestamp =
           typeof frame.timestamp === "string" ? frame.timestamp : undefined;
         if (step.step_type === "agent_response") {
@@ -1450,7 +1466,7 @@ export class Session {
           return;
         }
         if (step.step_type === "tool" || step.step_type === "subagent") {
-          this.readNativeReasoning();
+          // Native reasoning for <= step.step_index is flushed at step_update entry.
           turn.lastSignal = "tool_call";
           turn.activeMessageId = null;
           const name =
@@ -1664,6 +1680,7 @@ export class Session {
       return;
     }
     const responseText = resultResponse(frame);
+    if (isForegroundTurn(turn)) this.readNativeReasoning(Infinity);
     if (isForegroundTurn(turn) && responseText?.trim()) this.reconcileResponse(turn, responseText, frame.timestamp);
     this.emitUsage(turn, frame);
     this.completeTurn();
@@ -1704,7 +1721,7 @@ export class Session {
     if (this.isStickyRecoveredResultError(turn, frame, errors, responseText)) {
       return "sticky_recovered";
     }
-    if (!turn.nativeCompacted && !turn.retriedStreamInterrupt && resumable && isStreamInterruption(rawError)) {
+    if (!(isCompactionTurn(turn) && turn.nativeCompacted) && !turn.retriedStreamInterrupt && resumable && isStreamInterruption(rawError)) {
       return "retry_stream";
     }
     return "fail";
@@ -1714,7 +1731,7 @@ export class Session {
    * in the same result must still fail a later turn. */
   private markRecoveredErrors(errors: string[], recoverable: (entry: string) => boolean): void {
     for (const entry of errors) {
-      if (recoverable(entry)) this.seenResultErrors.add(entry);
+      if (recoverable(entry) || (this.conversationId && this.store.isRecoveredNativeError(this.conversationId, entry))) this.seenResultErrors.add(entry);
     }
   }
 
@@ -1723,7 +1740,7 @@ export class Session {
   private recoverFailedResult(turn: ActiveTurn, frame: ResultFrame): boolean {
     const errors = resultErrors(frame);
     const rawError = resultError(frame);
-    const hadProgress = turn.text.size > 0 || turn.tools.size > 0;
+    const hadProgress = turn.text.size > 0 || turn.tools.size > 0 || turn.nativeCompacted;
     switch (this.classifyResultFailure(turn, frame, errors, rawError, resultResponse(frame))) {
       case "retry_token_gap":
         turn.retriedTokenGap = true;
@@ -1742,6 +1759,7 @@ export class Session {
         void this.retryTurnAfterRecovery(turn, hadProgress, this.streamInterruptRetryDelayMs, "Transient stream interruption");
         return false;
       case "fail":
+        for (const entry of errors) this.seenResultErrors.add(entry);
         this.failTurn(diagnostic(rawError));
         return false;
     }

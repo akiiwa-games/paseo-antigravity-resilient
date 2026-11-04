@@ -230,11 +230,13 @@ export function resultFinishedReason(frame: ResultFrame): string | undefined {
 }
 
 /**
- * In `agy` (`jetski/cli/printmode.finishedReason`), `EmitFinal` sets no
- * `finished_reason` (`""`, omitted by `omitempty`), whereas `EmitError` sets
- * `"error"`, `"interrupted"`, or `"print_timeout"`. Any non-completion reason
- * proves the turn terminated early rather than completing after a prior
- * sticky trajectory error.
+ * In `agy` (`jetski/cli/printmode.finishedReason`), `finishedReason(err, status, sess)`
+ * returns `"print_timeout"` or `"interrupted"` only when `EmitError` terminates the
+ * turn early, whereas `"error"` is returned whenever `output.Status == "ERROR"`—including
+ * when `EmitFinal` (`err == nil`) completes a turn whose conversation trajectory still
+ * holds an earlier sticky `ERROR_MESSAGE` step. Thus `"error"` alone does not prove early
+ * termination; callers must verify completion via streamed/native response state and
+ * absence of trailing native errors.
  */
 export function isEarlyTerminationReason(reason: string | undefined): boolean {
   if (!reason) {
@@ -243,6 +245,7 @@ export function isEarlyTerminationReason(reason: string | undefined): boolean {
   const normalized = reason.trim().toLowerCase();
   return (
     normalized !== "" &&
+    normalized !== "error" &&
     normalized !== "stop" &&
     normalized !== "end_turn" &&
     normalized !== "success" &&

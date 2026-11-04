@@ -194,6 +194,102 @@ function isValidRecord(value: unknown): value is StoredTimelineRecord {
   );
 }
 
+type StepOrderKey = {
+  turnIndex: number;
+  stepIndex: number;
+  subOrder: number;
+};
+
+function extractStepOrderKey(record: StoredTimelineRecord): StepOrderKey | null {
+  const match =
+    /^turn-(\d+):(?:step:(\d+)(:reasoning)?|auto-compact:(\d+)|(reasoning|message):step-(\d+))$/.exec(
+      record.id,
+    );
+  if (!match) {
+    return null;
+  }
+  const turnIndex = Number.parseInt(match[1]!, 10);
+  const stepRaw = match[2] ?? match[4] ?? match[6];
+  if (!stepRaw) {
+    return null;
+  }
+  const stepIndex = Number.parseInt(stepRaw, 10);
+  if (!Number.isSafeInteger(turnIndex) || !Number.isSafeInteger(stepIndex)) {
+    return null;
+  }
+  const isReasoning =
+    Boolean(match[3]) ||
+    match[5] === "reasoning" ||
+    record.item.type === "reasoning";
+  return {
+    turnIndex,
+    stepIndex,
+    subOrder: isReasoning ? 0 : 1,
+  };
+}
+
+/**
+ * Normalizes `seq` ordering across native step-indexed items within each turn
+ * so `turn-T:step:S:reasoning` always precedes `turn-T:step:S` and `turn-T:step:S+1`
+ * even when stdout `step_update` frames and `transcript.jsonl` reasoning flushes
+ * arrive out of order.
+ */
+function normalizeTimelineStepOrder(
+  map: Map<string, StoredTimelineRecord>,
+): boolean {
+  if (map.size <= 1) {
+    return false;
+  }
+  const bySeq = [...map.values()].sort((a, b) => a.seq - b.seq);
+  const groups = new Map<
+    number,
+    Array<{ record: StoredTimelineRecord; key: StepOrderKey; origSeq: number }>
+  >();
+
+  for (const record of bySeq) {
+    const key = extractStepOrderKey(record);
+    if (!key) {
+      continue;
+    }
+    let group = groups.get(key.turnIndex);
+    if (!group) {
+      group = [];
+      groups.set(key.turnIndex, group);
+    }
+    group.push({ record, key, origSeq: record.seq });
+  }
+
+  let changed = false;
+  for (const group of groups.values()) {
+    if (group.length <= 1) {
+      continue;
+    }
+    const seqSlots = group.map((entry) => entry.origSeq).sort((a, b) => a - b);
+    const sorted = [...group].sort((a, b) => {
+      if (a.key.stepIndex !== b.key.stepIndex) {
+        return a.key.stepIndex - b.key.stepIndex;
+      }
+      if (a.key.subOrder !== b.key.subOrder) {
+        return a.key.subOrder - b.key.subOrder;
+      }
+      return a.origSeq - b.origSeq;
+    });
+    for (let i = 0; i < sorted.length; i++) {
+      const targetSeq = seqSlots[i]!;
+      const entry = sorted[i]!;
+      if (entry.record.seq !== targetSeq) {
+        const updated: StoredTimelineRecord = {
+          ...entry.record,
+          seq: targetSeq,
+        };
+        map.set(updated.id, updated);
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
 function extractUserRequestText(raw: string): string {
   const match = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/i.exec(raw);
   if (match && match[1]?.trim()) {
@@ -409,32 +505,51 @@ export class ConversationStore {
       try {
         fd = this.fsOps.openSync(file, "r");
         const size = this.fsOps.statSync(file).size;
-        const start = Math.max(0, size - 256 * 1024);
-        const raw = this.readRange(fd, start, size - start).toString("utf8");
-        // A partial last row may be a new error or an unfinished request.
-        if (!raw.endsWith("\n")) return null;
-        const lines = raw.split(/\r?\n/u);
-        if (start > 0) lines.shift();
-        const rows = new Map<number, Record<string, unknown>>();
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          const row: unknown = JSON.parse(line);
-          if (!isRecord(row) || typeof row.step_index !== "number" || !Number.isSafeInteger(row.step_index)) return null;
-          if (row.step_index <= afterStep) continue;
-          if ((row.conversation_id !== undefined && row.conversation_id !== conversationId) ||
-              (row.conversationId !== undefined && row.conversationId !== conversationId)) return null;
-          rows.set(row.step_index, row);
+        if (size <= 0) return null;
+        let windowBytes = 256 * 1024;
+        while (true) {
+          const start = Math.max(0, size - windowBytes);
+          const raw = this.readRange(fd, start, size - start).toString("utf8");
+          // A partial last row may be a new error or an unfinished request.
+          if (!raw.endsWith("\n")) return null;
+          const lines = raw.split(/\r?\n/u);
+          if (start > 0) lines.shift();
+          const rows = new Map<number, Record<string, unknown>>();
+          let minStep = Infinity;
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            const row: unknown = JSON.parse(line);
+            if (!isRecord(row) || typeof row.step_index !== "number" || !Number.isSafeInteger(row.step_index)) return null;
+            if (row.step_index < minStep) minStep = row.step_index;
+            if (row.step_index <= afterStep) continue;
+            if ((row.conversation_id !== undefined && row.conversation_id !== conversationId) ||
+                (row.conversationId !== undefined && row.conversationId !== conversationId)) return null;
+            rows.set(row.step_index, row);
+          }
+          const ordered = [...rows.values()].sort((a, b) => Number(a.step_index) - Number(b.step_index));
+          const last = ordered.at(-1);
+          if (!last) {
+            if (start > 0 && minStep === Infinity) {
+              windowBytes *= 2;
+              continue;
+            }
+            return null;
+          }
+          if (last.status !== "DONE" ||
+              !["PLANNER_RESPONSE", "AGENT_RESPONSE"].includes(String(last.type)) ||
+              typeof last.content !== "string" || !last.content.trim() ||
+              (responseStep !== undefined && last.step_index !== responseStep)) return null;
+          if (last.tool_calls != null && (!Array.isArray(last.tool_calls) || last.tool_calls.length !== 0)) return null;
+          if (!ordered.some(row => row.type === "USER_INPUT" && row.status === "DONE" &&
+              Number(row.step_index) < Number(last.step_index))) {
+            if (start > 0 && minStep > afterStep + 1) {
+              windowBytes *= 2;
+              continue;
+            }
+            return null;
+          }
+          return last;
         }
-        const ordered = [...rows.values()].sort((a, b) => Number(a.step_index) - Number(b.step_index));
-        const last = ordered.at(-1);
-        if (!last || last.status !== "DONE" ||
-            !["PLANNER_RESPONSE", "AGENT_RESPONSE"].includes(String(last.type)) ||
-            typeof last.content !== "string" || !last.content.trim() ||
-            (responseStep !== undefined && last.step_index !== responseStep)) return null;
-        if (last.tool_calls != null && (!Array.isArray(last.tool_calls) || last.tool_calls.length !== 0)) return null;
-        if (!ordered.some(row => row.type === "USER_INPUT" && row.status === "DONE" &&
-            Number(row.step_index) < Number(last.step_index))) return null;
-        return last;
       } catch { return null; }
       finally { if (fd !== undefined) this.fsOps.closeSync(fd); }
     };
@@ -451,10 +566,11 @@ export class ConversationStore {
   }
 
   /**
-   * Mirrors `agy` `printmode.postResponseFailure(turnSteps)`: returns true when
-   * the native `transcript.jsonl` records an `ERROR_MESSAGE` (or `ERROR`-status)
-   * step at an index greater than both `afterStep` and the last completed
-   * response-bearing step (`PLANNER_RESPONSE`, `AGENT_RESPONSE`, `CHECKPOINT`).
+   * Mirrors `agy` `printmode.postResponseFailure(turnSteps)` and
+   * `steps.LastRunErrorDetails`: returns true when the native `transcript.jsonl`
+   * records an `ERROR_MESSAGE` (or non-tool `ERROR`-status) step at an index
+   * greater than both `afterStep` and the last completed response-bearing step
+   * (`PLANNER_RESPONSE`, `AGENT_RESPONSE`, `CHECKPOINT`).
    */
   hasTrailingNativeError(conversationId: string, afterStep = -1): boolean {
     const file = this.nativeTranscriptPath(conversationId);
@@ -463,33 +579,128 @@ export class ConversationStore {
       const stat = this.fsOps.statSync(file);
       if (stat.size <= 0) return false;
       fd = this.fsOps.openSync(file, "r");
-      const tailBytes = Math.min(stat.size, 256 * 1024);
-      const start = stat.size - tailBytes;
-      const raw = this.readRange(fd, start, tailBytes).toString("utf8");
-      const lines = raw.split(/\r?\n/u);
-      if (start > 0 && lines.length > 1) lines.shift();
-      let lastResponseStep = -1;
-      let lastErrorStep = -1;
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith("{")) continue;
-        let row: unknown;
-        try { row = JSON.parse(trimmed); } catch { continue; }
-        if (!isRecord(row)) continue;
-        const step = row.step_index;
-        if (typeof step !== "number" || !Number.isSafeInteger(step) || step <= afterStep) continue;
-        const type = String(row.type ?? "").toUpperCase();
-        const status = String(row.status ?? row.state ?? "").toUpperCase();
-        if (type === "ERROR_MESSAGE" || status === "ERROR") {
-          if (step > lastErrorStep) lastErrorStep = step;
-        } else if (
-          (type === "PLANNER_RESPONSE" || type === "AGENT_RESPONSE" || type === "CHECKPOINT") &&
-          status === "DONE"
-        ) {
-          if (step > lastResponseStep) lastResponseStep = step;
+      let windowBytes = 256 * 1024;
+      while (true) {
+        const tailBytes = Math.min(stat.size, windowBytes);
+        const start = stat.size - tailBytes;
+        const raw = this.readRange(fd, start, tailBytes).toString("utf8");
+        const lines = raw.split(/\r?\n/u);
+        if (start > 0 && lines.length > 1) lines.shift();
+        let minStep = Infinity;
+        let lastResponseStep = -1;
+        let lastErrorStep = -1;
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("{")) continue;
+          let row: unknown;
+          try { row = JSON.parse(trimmed); } catch { continue; }
+          if (!isRecord(row)) continue;
+          const step = row.step_index;
+          if (typeof step !== "number" || !Number.isSafeInteger(step)) continue;
+          if (step < minStep) minStep = step;
+          if (step <= afterStep) continue;
+          const type = String(row.type ?? "").toUpperCase();
+          const status = String(row.status ?? row.state ?? "").toUpperCase();
+          if (type === "ERROR_MESSAGE" || (type !== "GENERIC" && status === "ERROR")) {
+            if (step > lastErrorStep) lastErrorStep = step;
+          } else if (
+            (type === "PLANNER_RESPONSE" || type === "AGENT_RESPONSE" || type === "CHECKPOINT") &&
+            status === "DONE"
+          ) {
+            if (step > lastResponseStep) lastResponseStep = step;
+          }
         }
+        if (start > 0 && lastResponseStep === -1 && lastErrorStep === -1 && minStep > afterStep + 1) {
+          windowBytes *= 2;
+          continue;
+        }
+        return lastErrorStep > afterStep && lastErrorStep > lastResponseStep;
       }
-      return lastErrorStep > afterStep && lastErrorStep > lastResponseStep;
+    } catch {
+      return false;
+    } finally {
+      if (fd !== undefined) {
+        try { this.fsOps.closeSync(fd); } catch { /* already closed */ }
+      }
+    }
+  }
+
+  /**
+   * Returns true when `errorText` matches an `ERROR_MESSAGE` (or non-tool `ERROR`)
+   * step recorded in `transcript.jsonl` that was superseded by a later completed
+   * response-bearing step (`PLANNER_RESPONSE`, `AGENT_RESPONSE`, `CHECKPOINT`).
+   * Because `agy` `steps.BuildJSONOutput(allSteps)` calls `steps.LastStepError(allSteps)`
+   * across the entire conversation history, any historical error (e.g. `503 UNAVAILABLE`,
+   * `Malformed function call`, `model output error`, or an earlier failed turn)
+   * stays attached to `result.error` on every subsequent turn in that conversation.
+   */
+  isRecoveredNativeError(conversationId: string, errorText: string): boolean {
+    const normalizeErr = (value: string): string =>
+      value.trim().replace(/^Error:\s*/i, "");
+    const needle = normalizeErr(errorText);
+    if (!needle) return false;
+    const file = this.nativeTranscriptPath(conversationId);
+    let fd: number | undefined;
+    try {
+      const stat = this.fsOps.statSync(file);
+      if (stat.size <= 0) return false;
+      fd = this.fsOps.openSync(file, "r");
+      let windowBytes = 256 * 1024;
+      while (true) {
+        const tailBytes = Math.min(stat.size, windowBytes);
+        const start = stat.size - tailBytes;
+        const raw = this.readRange(fd, start, tailBytes).toString("utf8");
+        const lines = raw.split(/\r?\n/u);
+        if (start > 0 && lines.length > 1) lines.shift();
+        let lastResponseStep = -1;
+        let lastErrorStep = -1;
+        let matchedErrorStep = -1;
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("{")) continue;
+          let row: unknown;
+          try { row = JSON.parse(trimmed); } catch { continue; }
+          if (!isRecord(row)) continue;
+          const step = row.step_index;
+          if (typeof step !== "number" || !Number.isSafeInteger(step)) continue;
+          const type = String(row.type ?? "").toUpperCase();
+          const status = String(row.status ?? row.state ?? "").toUpperCase();
+          if (type === "ERROR_MESSAGE" || (type !== "GENERIC" && status === "ERROR")) {
+            if (step > lastErrorStep) lastErrorStep = step;
+            const candidates = [
+              typeof row.error === "string" ? row.error : "",
+              typeof row.content === "string" ? row.content : "",
+            ];
+            if (
+              candidates.some(
+                (c) => c && (normalizeErr(c) === needle || c.trim() === errorText.trim()),
+              )
+            ) {
+              if (step > matchedErrorStep) matchedErrorStep = step;
+            }
+          } else if (
+            (type === "PLANNER_RESPONSE" || type === "AGENT_RESPONSE" || type === "CHECKPOINT") &&
+            status === "DONE"
+          ) {
+            if (step > lastResponseStep) lastResponseStep = step;
+          }
+        }
+        if (lastErrorStep > lastResponseStep && lastResponseStep !== -1) {
+          return false;
+        }
+        if (
+          matchedErrorStep !== -1 &&
+          lastResponseStep > matchedErrorStep &&
+          lastResponseStep > lastErrorStep
+        ) {
+          return true;
+        }
+        if (start > 0) {
+          windowBytes *= 2;
+          continue;
+        }
+        return false;
+      }
     } catch {
       return false;
     } finally {
@@ -711,6 +922,7 @@ export class ConversationStore {
 
   load(conversationId: string): StoredTimelineRecord[] {
     const map = this.ensureLoaded(conversationId);
+    normalizeTimelineStepOrder(map);
     return [...map.values()].sort((a, b) => a.seq - b.seq);
   }
 
@@ -763,8 +975,10 @@ export class ConversationStore {
       item: sanitized,
     };
     map.set(created.id, created);
-    this.appendJournalRecord(conversationId, created, map);
-    return created;
+    normalizeTimelineStepOrder(map);
+    const stored = map.get(created.id) ?? created;
+    this.appendJournalRecord(conversationId, stored, map);
+    return stored;
   }
 
   /**
@@ -1073,6 +1287,7 @@ export class ConversationStore {
     try {
       this.ensureStoreDir();
 
+      normalizeTimelineStepOrder(map);
       const sorted = [...map.values()].sort((a, b) => a.seq - b.seq);
       const snapshot: ConversationSnapshot = {
         version: 1,

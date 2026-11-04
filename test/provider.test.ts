@@ -605,7 +605,7 @@ test("idle timeout and SSE transport classification matches retryable stream err
 });
 
 test("mid-stream ACTIVE cutoff, early finished_reason, and trailing native ERROR_MESSAGE are not falsely marked sticky_recovered", async () => {
-  for (const mode of ["active_cutoff", "legacy_chunks", "finished_reason_error", "trailing_native_error"] as const) {
+  for (const mode of ["active_cutoff", "legacy_chunks", "finished_reason_print_timeout", "trailing_native_error"] as const) {
     const tempDir = mkdtempSync(path.join(tmpdir(), `agy-nonsticky-${mode}-`));
     let session: Session | undefined;
     try {
@@ -646,7 +646,7 @@ test("mid-stream ACTIVE cutoff, early finished_reason, and trailing native ERROR
               status: "ERROR",
               error: SSE_EOF_ERROR,
               response: "Intermediate output",
-              ...(mode === "finished_reason_error" ? { finished_reason: "error" } : {}),
+              finished_reason: mode === "finished_reason_print_timeout" ? "print_timeout" : "error",
             },
           });
         });
@@ -702,7 +702,7 @@ for (const scenario of [
           if (response) sendCompletedResponse(child, "conv-idle-timeout", response);
           child.sendFrame(scenario.nested ? {
             event: "result",
-            result: { status: "ERROR", error: IDLE_TIMEOUT_ERROR, response },
+            result: { status: "ERROR", finished_reason: "error", error: IDLE_TIMEOUT_ERROR, response },
           } : {
             event: "result",
             status: "error",

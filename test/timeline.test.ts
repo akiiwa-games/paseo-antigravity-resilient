@@ -82,3 +82,43 @@ test("reopening a persisted unfinished tool does not revive its spinner or rewri
     assert.equal(readFileSync(store.snapshotPath("conv-tool"), "utf8"), original);
   } finally { await session?.dispose(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+
+test("step-indexed block ordering normalizes reasoning before same-step message and subsequent tool calls", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agy-step-order-"));
+  try {
+    const store = new ConversationStore({ storeDir: dir });
+    store.upsert("conv-step-order", { id: "user:msg-1", type: "user_message", text: "Hello" });
+    // Pattern 1: assistant_message (turn-1:step:8) arrives ACTIVE before turn-1:step:8:reasoning
+    store.upsert("conv-step-order", { id: "turn-1:step:8", messageId: "turn-1:step:8", type: "assistant_message", text: "Answer" });
+    store.upsert("conv-step-order", { id: "turn-1:step:8:reasoning", type: "reasoning", text: "Thought for step 8" });
+    // Pattern 2: tool_call (turn-1:step:42) arrives before turn-1:step:41:reasoning
+    store.upsert("conv-step-order", { id: "turn-1:step:42", type: "tool_call", callId: "turn-1:step:42",
+      name: "read_file", detail: { type: "unknown", input: {}, output: null }, status: "completed", error: null });
+    store.upsert("conv-step-order", { id: "turn-1:step:41:reasoning", type: "reasoning", text: "Thought for step 41" });
+    // Pattern 3: bunched reasoning blocks (step 46:reasoning) arriving before earlier tool calls (step 43, 45)
+    store.upsert("conv-step-order", { id: "turn-1:step:46:reasoning", type: "reasoning", text: "Thought for step 46" });
+    store.upsert("conv-step-order", { id: "turn-1:step:43", type: "tool_call", callId: "turn-1:step:43",
+      name: "run_command", detail: { type: "unknown", input: {}, output: null }, status: "completed", error: null });
+    store.upsert("conv-step-order", { id: "turn-1:step:45", type: "tool_call", callId: "turn-1:step:45",
+      name: "run_command", detail: { type: "unknown", input: {}, output: null }, status: "completed", error: null });
+    store.upsert("conv-step-order", { id: "turn-1:step:47", type: "tool_call", callId: "turn-1:step:47",
+      name: "run_command", detail: { type: "unknown", input: {}, output: null }, status: "completed", error: null });
+    store.flush("conv-step-order");
+
+    const loaded = store.load("conv-step-order");
+    assert.deepEqual(loaded.map(r => r.id), [
+      "user:msg-1",
+      "turn-1:step:8:reasoning",
+      "turn-1:step:8",
+      "turn-1:step:41:reasoning",
+      "turn-1:step:42",
+      "turn-1:step:43",
+      "turn-1:step:45",
+      "turn-1:step:46:reasoning",
+      "turn-1:step:47",
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
