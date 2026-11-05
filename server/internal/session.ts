@@ -299,6 +299,7 @@ export class Session {
   private closed = false;
   private readonly contextWindowOverride: number | undefined;
   private conversationId?: string;
+  private readonly resumed: boolean;
   private migratingFromConversationId?: string;
   private driver: DriverProcess | null = null;
   private driverStopping: Promise<void> | null = null;
@@ -441,6 +442,7 @@ export class Session {
         ? persistedData.sessionKey.trim()
         : undefined;
     this.sessionKey = persistedSessionKey ?? sessionId;
+    this.resumed = persistedData !== undefined;
 
     const persistedConversationId =
       persistedData &&
@@ -587,7 +589,11 @@ export class Session {
       title: this.config.title,
     });
     this.emitConfig();
-    this.emitModeNotice();
+    // Paseo commits every notice as a new timeline row, and resumed sessions
+    // already carry the one recorded when the session began.
+    if (!this.resumed) {
+      this.emitModeNotice();
+    }
     this.emit({
       type: "session.commands",
       sessionId: this.sessionId,
@@ -638,6 +644,7 @@ export class Session {
     validateSelection: (model: string) => Promise<string | undefined>,
   ): Promise<void> {
     let restartDriver = false;
+    let modeChanged = false;
     if (changes.model !== undefined) {
       const nextModel = await validateSelection(changes.model ?? "");
       if (nextModel !== this.model) {
@@ -656,6 +663,7 @@ export class Session {
       if (nextMode !== this.mode) {
         this.mode = nextMode;
         restartDriver = true;
+        modeChanged = true;
       }
     }
 
@@ -664,7 +672,9 @@ export class Session {
     }
 
     this.emitConfig();
-    this.emitModeNotice();
+    if (modeChanged) {
+      this.emitModeNotice();
+    }
     this.emit({ type: "request.completed", requestId });
   }
 

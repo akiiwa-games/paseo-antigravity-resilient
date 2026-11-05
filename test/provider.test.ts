@@ -1177,6 +1177,37 @@ test("provider exposes only full-access mode and rejects unverified modes", asyn
   }
 });
 
+test("full-access notice is emitted once per new session, never on resume or unchanged config", async () => {
+  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-test-"));
+  try {
+    const isModeNotice = (e: ProviderEvent) =>
+      e.type === "session.notice" && e.notice.id === "antigravity-mode";
+
+    const freshEvents: ProviderEvent[] = [];
+    const fresh = new Session(
+      "s-notice-new", "agy", [], {}, makeConfig({ mode: "full-access" }), undefined,
+      TEST_CATALOG, (event) => freshEvents.push(event), { storeDir: tempDir },
+    );
+    fresh.open("req-open", ["prompt.message", "session.persistence"], "skip");
+    await fresh.configure("req-cfg", { mode: "full-access" }, async (model) => model);
+    assert.equal(freshEvents.filter(isModeNotice).length, 1);
+
+    const opened = freshEvents.find(
+      (e): e is Extract<ProviderEvent, { type: "session.opened" }> => e.type === "session.opened",
+    );
+    const resumedEvents: ProviderEvent[] = [];
+    const resumed = new Session(
+      "s-notice-resumed", "agy", [], {}, makeConfig({ mode: "full-access" }), opened?.persistence,
+      TEST_CATALOG, (event) => resumedEvents.push(event), { storeDir: tempDir },
+    );
+    resumed.open("req-open-resumed", ["prompt.message", "session.persistence"], "replay");
+    await resumed.configure("req-cfg-resumed", { mode: "full-access" }, async (model) => model);
+    assert.equal(resumedEvents.filter(isModeNotice).length, 0);
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("remote git sync safety evaluator enforces fail-closed fast-forward rules", () => {
   const parsed = parsePorcelainStatus(
     " M setup/router_gate_hook.py\n?? scratch/notes.txt\n?? paseo-antigravity-resilient/scripts/sync-safety.mjs\n",
