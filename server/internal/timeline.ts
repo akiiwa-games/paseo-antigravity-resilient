@@ -1,13 +1,29 @@
 import type { ProviderTimelineItem, ProviderToolCallDetail } from "@getpaseo/plugin/server/provider";
-import { isRecord, type ToolResultFrame } from "./wire.ts";
+import { isRecord, type StepUpdate, type ToolResultFrame } from "./wire.ts";
 
 /**
  * Paseo 0.11.2 treats every replayed notification as an opening notice and
  * appends it again when a durable timeline already exists. Compaction is a
  * native timeline event, not a notification. Migrate old snapshots on read
  * without rewriting their timestamps, IDs or chronological storage order.
+ * Also upgrades persisted `unknown` tool_call details (such as `read_file`,
+ * `write_file`, `edit_file` with `Path` arguments) on replay.
  */
 export function replayTimelineItem(item: ProviderTimelineItem): ProviderTimelineItem {
+  if (item.type === "tool_call" && item.detail.type === "unknown") {
+    if (!isRecord(item.detail.input) || Object.keys(item.detail.input).length === 0) {
+      return item;
+    }
+    const upgraded = toolDetail(
+      item.name,
+      item.detail.input,
+      typeof item.detail.output === "string" ? item.detail.output : undefined,
+    );
+    if (upgraded.type !== "unknown") {
+      return { ...item, detail: upgraded };
+    }
+    return item;
+  }
   if (item.type !== "notification" || !/^turn-\d+:auto-compact$/.test(item.id)) {
     return item;
   }
@@ -65,6 +81,7 @@ export function toolDetail(
   }
 
   const filePath = stringArg(args, [
+    "Path",
     "AbsolutePath",
     "TargetFile",
     "FilePath",
@@ -78,47 +95,96 @@ export function toolDetail(
       name === "read_file") &&
     filePath
   ) {
+    const startLine =
+      typeof args.StartLine === "number" && Number.isSafeInteger(args.StartLine)
+        ? args.StartLine
+        : undefined;
+    const endLine =
+      typeof args.EndLine === "number" && Number.isSafeInteger(args.EndLine)
+        ? args.EndLine
+        : undefined;
     return {
       type: "read",
       filePath,
+      ...(startLine !== undefined ? { offset: startLine } : {}),
+      ...(startLine !== undefined && endLine !== undefined && endLine >= startLine
+        ? { limit: endLine - startLine + 1 }
+        : {}),
       ...(output !== undefined ? { content: output } : {}),
     };
   }
-  if (name === "write_to_file" && filePath) {
+  if ((name === "write_to_file" || name === "write_file") && filePath) {
+    const content =
+      typeof args.Content === "string"
+        ? args.Content
+        : typeof args.CodeContent === "string"
+          ? args.CodeContent
+          : undefined;
     return {
       type: "write",
       filePath,
-      ...(typeof args.CodeContent === "string"
-        ? { content: args.CodeContent }
-        : {}),
+      ...(content !== undefined ? { content } : {}),
     };
   }
   if (
-    (name === "replace_file_content" || name === "multi_replace_file_content") &&
+    (name === "replace_file_content" ||
+      name === "multi_replace_file_content" ||
+      name === "edit_file") &&
     filePath
   ) {
+    const oldString =
+      typeof args.Target === "string"
+        ? args.Target
+        : typeof args.TargetContent === "string"
+          ? args.TargetContent
+          : undefined;
+    const newString =
+      typeof args.Replacement === "string"
+        ? args.Replacement
+        : typeof args.ReplacementContent === "string"
+          ? args.ReplacementContent
+          : undefined;
     return {
       type: "edit",
       filePath,
-      ...(typeof args.TargetContent === "string"
-        ? { oldString: args.TargetContent }
-        : {}),
-      ...(typeof args.ReplacementContent === "string"
-        ? { newString: args.ReplacementContent }
-        : {}),
+      ...(oldString !== undefined ? { oldString } : {}),
+      ...(newString !== undefined ? { newString } : {}),
     };
   }
 
-  const query = stringArg(args, ["Query", "query", "Pattern", "pattern"]);
+  if (name === "invoke_subagent") {
+    const subAgentType = stringArg(args, ["TypeName", "Role"]);
+    const description = stringArg(args, ["Prompt", "Role"]);
+    if (subAgentType || description) {
+      return {
+        type: "sub_agent",
+        ...(subAgentType ? { subAgentType } : {}),
+        ...(description ? { description } : {}),
+        log: output ?? "",
+      };
+    }
+  }
+
+  const query = stringArg(args, [
+    "Query",
+    "query",
+    "Pattern",
+    "pattern",
+    "SearchPath",
+    "SearchDirectory",
+    "DirectoryPath",
+  ]);
   if (
     name === "grep_search" ||
     name === "find_by_name" ||
     name === "search_web" ||
+    name === "list_dir" ||
+    name === "list_directory" ||
     query
   ) {
     return {
       type: "search",
-      query: query ?? name,
+      query: query ?? filePath ?? name,
       ...(output !== undefined ? { content: output } : {}),
     };
   }
@@ -137,4 +203,36 @@ export function toolDetail(
     input: input ?? null,
     output: output ?? null,
   };
+}
+
+export function stepToolDetail(step: StepUpdate): ProviderToolCallDetail {
+  if (step.subagent_info) {
+    const child = step.subagent_info.subagents[0];
+    if (child) {
+      return {
+        type: "sub_agent",
+        subAgentType: child.type_name,
+        description: child.initial_prompt,
+        childSessionId: child.conversation_id === null ? undefined : child.conversation_id,
+        log: child.log_uri ?? "",
+      };
+    }
+  }
+  const info = step.tool_info;
+  if (!info) {
+    return { type: "plain_text", label: step.tool_name, text: "" };
+  }
+  const detail = toolDetail(
+    step.tool_name || info.name || "Antigravity tool",
+    info.parameters ?? {},
+    info.output,
+  );
+  if (detail.type === "unknown") {
+    return {
+      type: "unknown",
+      input: info.parameters ?? null,
+      output: info.error || info.output || null,
+    };
+  }
+  return detail;
 }

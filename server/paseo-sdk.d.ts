@@ -539,6 +539,34 @@ declare module "@getpaseo/plugin/server/provider" {
         durationMs?: number;
       }
     | {
+        type: "worktree_setup";
+        worktreePath: string;
+        branchName: string;
+        log: string;
+        commands: Array<{
+          index: number;
+          command: string;
+          cwd: string;
+          log: string;
+          status: "running" | "completed" | "failed";
+          exitCode: number | null;
+          durationMs?: number;
+        }>;
+        truncated?: boolean;
+      }
+    | {
+        type: "sub_agent";
+        subAgentType?: string;
+        description?: string;
+        childSessionId?: string;
+        log: string;
+        actions?: Array<{
+          index: number;
+          toolName: string;
+          summary?: string;
+        }>;
+      }
+    | {
         type: "plain_text";
         label?: string;
         text?: string;

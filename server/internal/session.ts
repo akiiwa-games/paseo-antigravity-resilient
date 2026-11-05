@@ -28,12 +28,13 @@ import {
   reconcileNativeCompaction, recoverInterruptedCompacts, requestsSinceLastCompact,
   withinRapidRefillWindow, type CompactEvent,
 } from "./compaction.ts";
-import { replayTimelineItem, toolDetail, toolOutput } from "./timeline.ts";
+import { replayTimelineItem, stepToolDetail, toolDetail, toolOutput } from "./timeline.ts";
 import {
   diagnostic,
   frameConversationId,
   isEarlyTerminationReason,
   isRecord,
+  isResultInterrupted,
   isResultSuccess,
   isStreamInterruption,
   isTokenGap,
@@ -147,6 +148,7 @@ type ActiveTurn = {
   preCompactTokens: number;
   prompt: string;
   reasoningIndex: number;
+  retriedMigration: boolean;
   retriedStreamInterrupt: boolean;
   retriedTokenGap: boolean;
   startedAt: number;
@@ -168,6 +170,20 @@ function isForegroundTurn(turn: ActiveTurn): boolean {
   return turn.kind !== "idle_compact";
 }
 
+function extractToolStepIndex(itemId: string): number | null {
+  const match = /^turn-\d+:step:(\d+)$/.exec(itemId);
+  if (!match || !match[1]) return null;
+  const parsed = Number.parseInt(match[1], 10);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+function denialNoticeTitle(
+  actions: Array<{ action: string; display_name: string }>,
+): string {
+  if (actions.length > 1) return `${actions.length} actions denied`;
+  return actions[0]?.action === "command" ? "Shell command denied" : "Action denied";
+}
+
 function createTurn(
   kind: TurnKind,
   id: string,
@@ -184,6 +200,7 @@ function createTurn(
     nativeCompacted: false,
     pendingRapidRefills: 0,
     lastStepContextTokens: 0,
+    retriedMigration: false,
     retriedTokenGap: false,
     retriedStreamInterrupt: false,
     activeMessageId: null,
@@ -282,6 +299,7 @@ export class Session {
   private closed = false;
   private readonly contextWindowOverride: number | undefined;
   private conversationId?: string;
+  private migratingFromConversationId?: string;
   private driver: DriverProcess | null = null;
   private driverStopping: Promise<void> | null = null;
   private readonly promptFiles = new PromptFiles();
@@ -960,10 +978,47 @@ export class Session {
     promptOverride?: string,
   ): Promise<void> {
     try {
-      const payload = promptOverride ?? turn.prompt;
+      let payload = promptOverride ?? turn.prompt;
+      const currentUserItemId = turn.clientMessageId
+        ? `user:${turn.clientMessageId}`
+        : `user:${turn.id}`;
+      if (
+        !this.driver &&
+        this.conversationId &&
+        !this.store.hasNativeConversationDb(this.conversationId) &&
+        this.store.hasRecoverableHistory(this.conversationId, currentUserItemId)
+      ) {
+        const evictedId = this.conversationId;
+        this.migratingFromConversationId = evictedId;
+        this.conversationId = undefined;
+        turn.nativeStartStep = -1;
+        turn.lastStreamedStepIndex = 0;
+        console.warn(
+          `[antigravity-resilient] Native SQLite state for conversation ${evictedId} was evicted; migrating history into a new CLI trajectory`,
+        );
+      }
+      if (
+        this.migratingFromConversationId &&
+        !isCompactionTurn(turn) &&
+        !/^\s*\//.test(payload)
+      ) {
+        const preamble = this.store.buildRecoveryPreamble(
+          this.migratingFromConversationId,
+          currentUserItemId,
+        );
+        if (preamble && !payload.includes("<CONVERSATION_HISTORY_RECOVERY>")) {
+          payload = `${preamble}\n\n${payload}`;
+        }
+      }
       this.startNativeReasoning();
       await this.ensureDriver(slashCommandRequirement(payload, isCompactionTurn(turn)));
       if (this.turn !== turn || this.closed) return;
+      if (turn.retriedMigration && this.migratingFromConversationId) {
+        await this.stopDriver();
+        if (this.turn !== turn || this.closed) return;
+        await this.sendTurnPrompt(turn, promptOverride);
+        return;
+      }
       if (!this.driver) {
         throw new Error("Antigravity CLI driver did not start");
       }
@@ -984,6 +1039,13 @@ export class Session {
         }),
       );
       await this.driverReady;
+      if (this.turn !== turn || this.closed) return;
+      if (turn.retriedMigration && this.migratingFromConversationId) {
+        await this.stopDriver();
+        if (this.turn !== turn || this.closed) return;
+        await this.sendTurnPrompt(turn, promptOverride);
+        return;
+      }
     } catch (error) {
       if (this.turn === turn) {
         const message = diagnostic(
@@ -1149,9 +1211,32 @@ export class Session {
 
     driver.onStdoutLine((line) => {
       if (this.driver !== driver) return;
+      if (expectedConversationId && this.migratingFromConversationId === expectedConversationId) return;
       const frame = parseFrame(line);
       if (frame?.event === "init" && expectedConversationId &&
           frameConversationId(frame) && frameConversationId(frame) !== expectedConversationId) {
+        const activeTurn = this.turn;
+        const currentUserItemId = activeTurn
+          ? activeTurn.clientMessageId
+            ? `user:${activeTurn.clientMessageId}`
+            : `user:${activeTurn.id}`
+          : undefined;
+        if (
+          activeTurn &&
+          !activeTurn.retriedMigration &&
+          this.store.hasRecoverableHistory(expectedConversationId, currentUserItemId)
+        ) {
+          activeTurn.retriedMigration = true;
+          this.migratingFromConversationId = expectedConversationId;
+          this.conversationId = undefined;
+          activeTurn.nativeStartStep = -1;
+          activeTurn.lastStreamedStepIndex = 0;
+          console.warn(
+            `[antigravity-resilient] Antigravity CLI could not restore conversation ${expectedConversationId} (initialized ${frameConversationId(frame)} instead); recovering history into a new CLI trajectory`,
+          );
+          this.driverResolve?.();
+          return;
+        }
         this.failTurn("Antigravity restored a different conversation; refusing to mix histories");
         void this.stopDriver();
         return;
@@ -1160,6 +1245,7 @@ export class Session {
     });
     driver.onStderrLine((line) => {
       if (this.driver !== driver) return;
+      if (expectedConversationId && this.migratingFromConversationId === expectedConversationId) return;
       const trimmed = line.trim();
       if (trimmed) {
         this.turn?.stderr.push(trimmed);
@@ -1168,6 +1254,10 @@ export class Session {
     });
     driver.onError((error) => {
       if (this.driver !== driver) {
+        return;
+      }
+      if (expectedConversationId && this.migratingFromConversationId === expectedConversationId) {
+        this.driverResolve?.();
         return;
       }
       this.driverResolve?.();
@@ -1185,6 +1275,11 @@ export class Session {
     });
     driver.onClose((code, signal) => {
       if (this.driver !== driver) {
+        return;
+      }
+      if (expectedConversationId && this.migratingFromConversationId === expectedConversationId) {
+        this.driver = null;
+        this.driverResolve?.();
         return;
       }
       this.driver = null;
@@ -1243,6 +1338,19 @@ export class Session {
     poll();
   }
 
+  private hasEmittedAssistantStrictlyAfterStep(
+    turn: ActiveTurn,
+    stepIndex: number,
+  ): boolean {
+    for (const key of turn.text.keys()) {
+      const match = /^turn-\d+:step:(\d+)$/.exec(key);
+      if (match?.[1] && Number.parseInt(match[1], 10) > stepIndex) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private readNativeReasoning(maxStep?: number): void {
     const turn = this.turn;
     if (!turn || !this.nativeReasoning) return;
@@ -1253,12 +1361,25 @@ export class Session {
     const ceiling = maxStep ?? turn.lastStreamedStepIndex + 1;
     const readySteps = [...turn.pendingThoughts.keys()].filter((step) => step <= ceiling).sort((a, b) => a - b);
     for (const step of readySteps) {
+      const stepMsgId = `${turn.id}:step:${step}`;
+      if (
+        maxStep !== Infinity &&
+        turn.lastResponseStepIndex === step &&
+        turn.lastResponseStepState === "ACTIVE" &&
+        turn.text.has(stepMsgId)
+      ) {
+        continue;
+      }
       const thought = turn.pendingThoughts.get(step)!;
       turn.pendingThoughts.delete(step);
       const id = `${turn.id}:step:${thought.step}:reasoning`;
       if (turn.thinking.get(id) === thought.text) continue;
       turn.thinking.set(id, thought.text);
-      this.emitItem({ id, type: "reasoning", text: thought.text }, thought.timestamp);
+      if (this.hasEmittedAssistantStrictlyAfterStep(turn, thought.step)) {
+        this.persistItem({ id, type: "reasoning", text: thought.text }, thought.timestamp);
+      } else {
+        this.emitItem({ id, type: "reasoning", text: thought.text }, thought.timestamp);
+      }
     }
   }
 
@@ -1299,11 +1420,27 @@ export class Session {
     if (!completedCheckpoint) {
       if (!responseText?.trim()) return false;
       if (turn.lastResponseStepState === "ERROR") return false;
-      if ([...turn.toolItems.values()].some(item => item.status === "running")) return false;
-      const streamedDone = turn.lastResponseStepState === "DONE" && turn.lastSignal === "assistant_message";
-      if (!streamedDone && !(this.conversationId && this.store.hasCompletedNativeResponse(
-        this.conversationId, turn.nativeStartStep, responseText, turn.lastResponseStepIndex ?? undefined,
-      ))) return false;
+      const streamedDone =
+        turn.lastResponseStepState === "DONE" &&
+        turn.lastSignal === "assistant_message" &&
+        ![...turn.toolItems.values()].some((item) => item.status === "running");
+      if (!streamedDone) {
+        if (!this.conversationId) return false;
+        const nativeDoneStep = this.store.completedNativeResponseStep(
+          this.conversationId,
+          turn.nativeStartStep,
+          responseText,
+          turn.lastResponseStepIndex ?? undefined,
+          turn.lastStreamedStepIndex,
+        );
+        if (nativeDoneStep === null) return false;
+        const hasPendingToolAtOrAfterFinalStep = [...turn.toolItems.values()].some((item) => {
+          if (item.status !== "running") return false;
+          const toolStep = extractToolStepIndex(item.id);
+          return toolStep === null || toolStep >= nativeDoneStep;
+        });
+        if (hasPendingToolAtOrAfterFinalStep) return false;
+      }
     }
     if (
       this.conversationId &&
@@ -1338,6 +1475,20 @@ export class Session {
 
     const nextId = frameConversationId(frame);
     if (nextId) {
+      const migratedFrom = this.migratingFromConversationId;
+      if (migratedFrom && migratedFrom !== nextId) {
+        this.migratingFromConversationId = undefined;
+        this.store.migrateConversation(migratedFrom, nextId, this.sessionKey);
+        this.compaction.nativeStep = -1;
+        this.compaction.contextStep = -1;
+        this.compaction.modelRequests = 0;
+        this.compaction.lastContextTokens = 0;
+        this.compaction.compactedSinceLastTurn = false;
+        this.compaction.consecutiveCompactFailures = 0;
+        this.compaction.consecutiveRapidRefills = 0;
+        this.compaction.rapidRefillBreakerTripped = false;
+        this.store.saveCompaction(nextId, this.compaction);
+      }
       const changed = nextId !== this.conversationId;
       this.conversationId = nextId;
       this.store.bindSessionKey(this.sessionKey, nextId);
@@ -1390,17 +1541,33 @@ export class Session {
           return;
         }
         const id = `${turn.id}:step:${step.step_index}`;
-        this.readNativeReasoning(step.step_index);
+        if (step.step_type === "agent_response" && turn.text.has(id)) {
+          this.readNativeReasoning(step.step_index - 1);
+        } else {
+          this.readNativeReasoning(step.step_index);
+        }
         turn.lastStreamedStepIndex = Math.max(turn.lastStreamedStepIndex, step.step_index);
         const timestamp =
           typeof frame.timestamp === "string" ? frame.timestamp : undefined;
         if (step.step_type === "agent_response") {
           turn.lastResponseStepState = step.state;
           turn.lastResponseStepIndex = step.step_index;
+          const existing = turn.text.get(id) ?? "";
           const delta =
             typeof step.text_delta === "string" ? step.text_delta : "";
-          const merged = `${turn.text.get(id) ?? ""}${delta}`;
-          if (delta) {
+          let merged = `${existing}${delta}`;
+          const nativeStep =
+            step.state === "DONE" && this.conversationId
+              ? this.store.readNativeStep(this.conversationId, step.step_index)
+              : null;
+          if (
+            nativeStep?.content &&
+            nativeStep.content.length > merged.length &&
+            nativeStep.content.startsWith(existing.trimEnd())
+          ) {
+            merged = nativeStep.content;
+          }
+          if (merged.length > existing.length) {
             turn.activeMessageId = id;
             turn.lastSignal = "assistant_message";
             turn.text.set(id, merged);
@@ -1415,6 +1582,28 @@ export class Session {
             );
           } else if (step.state === "DONE" && turn.text.has(id)) {
             turn.lastSignal = "assistant_message";
+          }
+          if (step.state === "DONE") {
+            if (nativeStep?.thinking) {
+              const reasoningId = `${id}:reasoning`;
+              const prevThinking = turn.thinking.get(reasoningId);
+              turn.pendingThoughts.delete(step.step_index);
+              if (!prevThinking || nativeStep.thinking.length > prevThinking.length) {
+                turn.thinking.set(reasoningId, nativeStep.thinking);
+                if (this.hasEmittedAssistantStrictlyAfterStep(turn, step.step_index)) {
+                  this.persistItem(
+                    { id: reasoningId, type: "reasoning", text: nativeStep.thinking },
+                    nativeStep.timestamp ?? timestamp,
+                  );
+                } else {
+                  this.emitItem(
+                    { id: reasoningId, type: "reasoning", text: nativeStep.thinking },
+                    nativeStep.timestamp ?? timestamp,
+                  );
+                }
+              }
+            }
+            this.readNativeReasoning(step.step_index);
           }
           if (step.state === "DONE" && step.usage) {
             const stepTokens =
@@ -1472,8 +1661,10 @@ export class Session {
           const name =
             step.tool_name || step.tool_info?.name || "Antigravity tool";
           const params = step.tool_info?.parameters ?? {};
-          const output = step.tool_info?.output;
-          const detail = toolDetail(name, params, output);
+          const detail = stepToolDetail(step);
+          const metadata = step.subagent_info
+            ? { subagents: step.subagent_info.subagents }
+            : undefined;
           turn.tools.set(id, { name, input: params });
           if (step.state === "ERROR") {
             const errText =
@@ -1485,6 +1676,7 @@ export class Session {
                 callId: id,
                 name,
                 detail,
+                ...(metadata !== undefined ? { metadata } : {}),
                 status: "failed",
                 error: errText,
               },
@@ -1498,6 +1690,7 @@ export class Session {
                 callId: id,
                 name,
                 detail,
+                ...(metadata !== undefined ? { metadata } : {}),
                 status: step.state === "ACTIVE" ? "running" : "completed",
                 error: null,
               },
@@ -1671,8 +1864,8 @@ export class Session {
     for (const [key, count] of counts) this.reportedDenials.set(key, Math.max(count, this.reportedDenials.get(key) ?? 0));
     if (freshDenials.length) {
       this.emit({ type: "session.notice", sessionId: this.sessionId, notice: {
-        id: `${turn.id}:denied`, severity: "warning", title: `${freshDenials.length} actions denied`,
-        description: "Antigravity's own policy denied the action.",
+        id: `${turn.id}:denied`, severity: "warning", title: denialNoticeTitle(freshDenials),
+        description: "Antigravity's own policy denied it.",
       } });
     }
     this.reconcileCompactionHistory();
@@ -1680,18 +1873,141 @@ export class Session {
       return;
     }
     const responseText = resultResponse(frame);
-    if (isForegroundTurn(turn)) this.readNativeReasoning(Infinity);
+    if (isForegroundTurn(turn)) this.reconcileNativeTurnSteps(turn, frame.timestamp);
     if (isForegroundTurn(turn) && responseText?.trim()) this.reconcileResponse(turn, responseText, frame.timestamp);
     this.emitUsage(turn, frame);
     this.completeTurn();
+  }
+
+  private reconcileNativeTurnSteps(turn: ActiveTurn, fallbackTimestamp?: string): void {
+    if (!this.conversationId) {
+      this.readNativeReasoning(Infinity);
+      return;
+    }
+    const steps = this.store.readNativeTurnSteps(this.conversationId, turn.nativeStartStep);
+    if (steps.length === 0) {
+      this.readNativeReasoning(Infinity);
+      return;
+    }
+    for (const step of steps) {
+      this.readNativeReasoning(step.stepIndex - 1);
+      const stepId = `${turn.id}:step:${step.stepIndex}`;
+      if (step.content && turn.messageIndex === 0) {
+        const existingText = turn.text.get(stepId);
+        const unstreamed =
+          existingText === undefined && step.stepIndex >= turn.lastStreamedStepIndex;
+        const truncatedInStream =
+          existingText !== undefined &&
+          step.content.length > existingText.length &&
+          step.content.startsWith(existingText.trimEnd());
+        if (unstreamed || truncatedInStream) {
+          const canUpdateLiveTail =
+            unstreamed ||
+            (turn.activeMessageId === stepId &&
+              turn.lastSignal === "assistant_message");
+          turn.lastResponseStepIndex = Math.max(
+            turn.lastResponseStepIndex ?? -1,
+            step.stepIndex,
+          );
+          turn.lastResponseStepState = "DONE";
+          turn.text.set(stepId, step.content);
+          const item: ProviderTimelineItem = {
+            id: stepId,
+            messageId: stepId,
+            type: "assistant_message",
+            text: step.content,
+          };
+          if (canUpdateLiveTail) {
+            turn.activeMessageId = stepId;
+            turn.lastSignal = "assistant_message";
+            this.emitItem(item, step.timestamp ?? fallbackTimestamp);
+          } else {
+            this.persistItem(item, step.timestamp ?? fallbackTimestamp);
+          }
+        }
+      }
+      if (step.thinking) {
+        const reasoningId = `${stepId}:reasoning`;
+        const prevThinking = turn.thinking.get(reasoningId);
+        turn.pendingThoughts.delete(step.stepIndex);
+        if (!prevThinking || step.thinking.length > prevThinking.length) {
+          turn.thinking.set(reasoningId, step.thinking);
+          if (this.hasEmittedAssistantStrictlyAfterStep(turn, step.stepIndex)) {
+            this.persistItem(
+              { id: reasoningId, type: "reasoning", text: step.thinking },
+              step.timestamp ?? fallbackTimestamp,
+            );
+          } else {
+            this.emitItem(
+              { id: reasoningId, type: "reasoning", text: step.thinking },
+              step.timestamp ?? fallbackTimestamp,
+            );
+          }
+        }
+      }
+      this.readNativeReasoning(step.stepIndex);
+      for (const tc of step.toolCalls) {
+        this.readNativeReasoning(tc.stepIndex);
+        const toolId = `${turn.id}:step:${tc.stepIndex}`;
+        const existingTool = turn.toolItems.get(toolId);
+        if (existingTool === undefined && tc.stepIndex > turn.lastStreamedStepIndex) {
+          turn.lastSignal = "tool_call";
+          turn.activeMessageId = null;
+          const detail = toolDetail(tc.name, tc.args, tc.output);
+          turn.tools.set(toolId, { name: tc.name, input: tc.args });
+          if (tc.status === "failed") {
+            this.emitItem(
+              {
+                id: toolId,
+                type: "tool_call",
+                callId: toolId,
+                name: tc.name,
+                detail,
+                status: "failed",
+                error: tc.output || "Antigravity tool failed",
+              },
+              tc.timestamp ?? step.timestamp ?? fallbackTimestamp,
+            );
+          } else {
+            this.emitItem(
+              {
+                id: toolId,
+                type: "tool_call",
+                callId: toolId,
+                name: tc.name,
+                detail,
+                status: "completed",
+                error: null,
+              },
+              tc.timestamp ?? step.timestamp ?? fallbackTimestamp,
+            );
+          }
+        }
+      }
+    }
+    this.readNativeReasoning(Infinity);
   }
 
   private reconcileResponse(turn: ActiveTurn, response: string, timestamp?: string): void {
     // Current agy returns the concatenation of this turn's assistant steps,
     // not just the final message. Repair a lost tail without duplicating the
     // streamed pre-tool commentary or discarding an unstreamed final answer.
-    const streamed = [...turn.text.values()].join("");
-    if (response === streamed || [...turn.text.values()].includes(response)) return;
+    const values = [...turn.text.values()];
+    const streamed = values.join("");
+    const trimmedResponse = response.trimEnd();
+    if (
+      response === streamed ||
+      (trimmedResponse.length > 0 && streamed.startsWith(trimmedResponse)) ||
+      values.some(
+        (val) => val === response || (trimmedResponse.length > 0 && val.startsWith(trimmedResponse)),
+      ) ||
+      (values.length > 0 &&
+        trimmedResponse
+          .split(/\r?\n/u)
+          .every((line) => !line.trim() || values.some((val) => val.includes(line.trim()))))
+    ) {
+      return;
+    }
     const suffix = response.startsWith(streamed) ? response.slice(streamed.length) : response;
     const previousId = response.startsWith(streamed) && turn.lastSignal === "assistant_message"
       ? turn.activeMessageId : null;
@@ -1760,6 +2076,10 @@ export class Session {
         return false;
       case "fail":
         for (const entry of errors) this.seenResultErrors.add(entry);
+        if (isResultInterrupted(frame)) {
+          this.endTurn("canceled", diagnostic(rawError));
+          return false;
+        }
         this.failTurn(diagnostic(rawError));
         return false;
     }
@@ -1869,7 +2189,7 @@ export class Session {
     this.store.flush(this.conversationId);
   }
 
-  private emitItem(item: ProviderTimelineItem, timestamp?: string): void {
+  private persistItem(item: ProviderTimelineItem, timestamp?: string): void {
     if (item.type === "tool_call") this.turn?.toolItems.set(item.id, item);
     const ts = timestamp ?? new Date().toISOString();
     if (this.conversationId) {
@@ -1888,7 +2208,11 @@ export class Session {
         this.pendingItems.push({ item, timestamp: ts });
       }
     }
+  }
 
+  private emitItem(item: ProviderTimelineItem, timestamp?: string): void {
+    const ts = timestamp ?? new Date().toISOString();
+    this.persistItem(item, ts);
     this.emit({
       type: "timeline.item",
       sessionId: this.sessionId,
@@ -1946,7 +2270,7 @@ export class Session {
 
   /** Detaches the active turn, settles its compaction, persists, and reports
    * the outcome to the client. Background compacts never emit `session.turn`. */
-  private endTurn(outcome: "completed" | "failed", message?: string): ActiveTurn | null {
+  private endTurn(outcome: "completed" | "failed" | "canceled", message?: string): ActiveTurn | null {
     const turn = this.turn;
     if (!turn) return null;
     this.stopNativeReasoning();

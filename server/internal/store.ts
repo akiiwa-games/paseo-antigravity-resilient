@@ -298,39 +298,122 @@ function extractUserRequestText(raw: string): string {
   return raw.trim();
 }
 
+export type NativeTurnToolCall = {
+  stepIndex: number;
+  callId?: string;
+  name: string;
+  args: unknown;
+  output?: string;
+  status: "completed" | "failed";
+  timestamp?: string;
+};
+
+export type NativeTurnPlannerStep = {
+  stepIndex: number;
+  timestamp?: string;
+  thinking?: string;
+  content?: string;
+  toolCalls: NativeTurnToolCall[];
+};
+
+export type NativeSingleStep = {
+  stepIndex: number;
+  timestamp?: string;
+  thinking?: string;
+  content?: string;
+};
+
+export function matchesNativeFinalContent(
+  response: string,
+  finalContent: string,
+): boolean {
+  const trimmedResponse = response.trim();
+  const trimmedFinal = finalContent.trim();
+  if (!trimmedResponse || !trimmedFinal) {
+    return false;
+  }
+  if (trimmedResponse.endsWith(trimmedFinal)) {
+    return true;
+  }
+  // In `agy`, an unclosed literal `<thought>` tag in markdown causes the stdout
+  // filter to strip from the chunk containing `<thought` to the end of the
+  // streamed text and `result.response`, while `transcript_full.jsonl` records
+  // the complete `content`.
+  let searchFrom = 0;
+  while (searchFrom < trimmedFinal.length) {
+    const idx = trimmedFinal.indexOf("<thought", searchFrom);
+    if (idx === -1) break;
+    if (idx >= 8) {
+      const minCut = Math.max(1, idx - 2);
+      const maxCut = Math.min(trimmedFinal.length, idx + "<thought>".length);
+      for (let cut = minCut; cut <= maxCut; cut++) {
+        const prefix = trimmedFinal.slice(0, cut).trimEnd();
+        if (prefix.length >= 8 && trimmedResponse.endsWith(prefix)) {
+          return true;
+        }
+      }
+    }
+    searchFrom = idx + 8;
+  }
+  return false;
+}
+
 export function parseNativeTranscript(
   transcriptPath: string,
 ): StoredTimelineRecord[] {
-  if (!existsSync(transcriptPath)) {
+  const candidateFull =
+    path.basename(transcriptPath) === "transcript.jsonl"
+      ? path.join(path.dirname(transcriptPath), "transcript_full.jsonl")
+      : transcriptPath;
+  const resolvedPath = existsSync(candidateFull) ? candidateFull : transcriptPath;
+  if (!existsSync(resolvedPath)) {
     return [];
   }
   let raw = "";
   try {
-    raw = readFileSync(transcriptPath, "utf8");
+    raw = readFileSync(resolvedPath, "utf8");
   } catch {
     return [];
+  }
+
+  const parsedSteps: Record<string, unknown>[] = [];
+  const genericByStep = new Map<
+    number,
+    { content?: string; status?: string; timestamp?: string }
+  >();
+  for (const line of raw.split(/\r?\n/u)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) {
+      continue;
+    }
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      if (!isRecord(parsed)) {
+        continue;
+      }
+      parsedSteps.push(parsed);
+      if (
+        parsed.type === "GENERIC" &&
+        typeof parsed.step_index === "number" &&
+        Number.isSafeInteger(parsed.step_index)
+      ) {
+        genericByStep.set(parsed.step_index, {
+          content: typeof parsed.content === "string" ? parsed.content : undefined,
+          status: typeof parsed.status === "string" ? parsed.status : undefined,
+          timestamp:
+            typeof parsed.created_at === "string" ? parsed.created_at : undefined,
+        });
+      }
+    } catch {
+      continue;
+    }
   }
 
   const records: StoredTimelineRecord[] = [];
   let seq = 0;
   let turnNumber = 0;
 
-  for (const line of raw.split(/\r?\n/u)) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("{")) {
-      continue;
-    }
-    let step: Record<string, unknown>;
-    try {
-      const parsed: unknown = JSON.parse(trimmed);
-      if (!isRecord(parsed)) {
-        continue;
-      }
-      step = parsed;
-    } catch {
-      continue;
-    }
-
+  for (const step of parsedSteps) {
     const stepIndex =
       typeof step.step_index === "number" ? step.step_index : seq;
     const timestamp =
@@ -359,7 +442,7 @@ export function parseNativeTranscript(
       continue;
     }
 
-    if (stepType === "PLANNER_RESPONSE") {
+    if (stepType === "PLANNER_RESPONSE" || stepType === "AGENT_RESPONSE") {
       if (turnNumber === 0) {
         turnNumber = 1;
       }
@@ -383,24 +466,39 @@ export function parseNativeTranscript(
             continue;
           }
           const name = typeof tc.name === "string" && tc.name ? tc.name : "tool";
+          const toolStep = stepIndex + 1 + idx;
+          const generic = genericByStep.get(toolStep);
           const callId =
             typeof tc.id === "string" && tc.id
               ? tc.id
               : `turn-${turnNumber}:tool:step-${stepIndex}-${idx + 1}`;
           const id = `tool:${callId}`;
+          const failed = generic?.status === "ERROR";
           records.push({
             id,
             seq: ++seq,
-            timestamp,
-            item: sanitizeTimelineItem({
-              id,
-              type: "tool_call",
-              callId,
-              name,
-              status: "completed",
-              detail: toolDetail(name, tc.args ?? tc.arguments),
-              error: null,
-            }),
+            timestamp: generic?.timestamp ?? timestamp,
+            item: sanitizeTimelineItem(
+              failed
+                ? {
+                    id,
+                    type: "tool_call",
+                    callId,
+                    name,
+                    status: "failed",
+                    detail: toolDetail(name, tc.args ?? tc.arguments, generic?.content),
+                    error: generic?.content || "Antigravity tool failed",
+                  }
+                : {
+                    id,
+                    type: "tool_call",
+                    callId,
+                    name,
+                    status: "completed",
+                    detail: toolDetail(name, tc.args ?? tc.arguments, generic?.content),
+                    error: null,
+                  },
+            ),
           });
         }
       }
@@ -494,12 +592,212 @@ export class ConversationStore {
     return path.join(this.brainDir, safeConversationKey(conversationId), ".system_generated", "logs", "transcript.jsonl");
   }
 
+  nativeFullTranscriptPath(conversationId: string): string {
+    return path.join(this.brainDir, safeConversationKey(conversationId), ".system_generated", "logs", "transcript_full.jsonl");
+  }
+
+  nativeConversationsDir(): string {
+    return path.join(path.dirname(this.brainDir), "conversations");
+  }
+
+  /**
+   * Returns false only when the native `conversations/` directory exists on
+   * disk (real `agy` installation or explicit test fixture) and neither
+   * `<conversationId>.db` nor `<conversationId>.pb` exists in it or in the
+   * legacy `~/.gemini/antigravity/conversations` import directory.
+   *
+   * `agy` enforces a hard 500-conversation cap in `conversations/` and
+   * deletes older `.db` files during startup summary reconciliation while
+   * Paseo's durable timeline store (`~/.paseo/antigravity-resilient/conversations/`)
+   * and `brain/<conversationId>/` still retain the full conversation history.
+   */
+  hasNativeConversationDb(conversationId: string): boolean {
+    const key = safeConversationKey(conversationId);
+    const brainConvDir = path.join(this.brainDir, key);
+    const dir = this.nativeConversationsDir();
+    if (!this.fsOps.existsSync(brainConvDir) || !this.fsOps.existsSync(dir)) {
+      return true;
+    }
+    for (const ext of [".db", ".pb"]) {
+      if (this.fsOps.existsSync(path.join(dir, `${key}${ext}`))) {
+        return true;
+      }
+    }
+    const fallbackDir = path.join(homedir(), ".gemini", "antigravity", "conversations");
+    if (this.fsOps.existsSync(fallbackDir)) {
+      for (const ext of [".db", ".pb"]) {
+        if (this.fsOps.existsSync(path.join(fallbackDir, `${key}${ext}`))) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  hasRecoverableHistory(conversationId: string, excludeItemId?: string): boolean {
+    const records = this.load(conversationId).filter(
+      (rec) => rec.id !== excludeItemId,
+    );
+    if (records.length > 0) {
+      return true;
+    }
+    return (
+      this.fsOps.existsSync(this.nativeFullTranscriptPath(conversationId)) ||
+      this.fsOps.existsSync(this.nativeTranscriptPath(conversationId))
+    );
+  }
+
+  buildRecoveryPreamble(
+    conversationId: string,
+    excludeItemId?: string,
+  ): string | null {
+    const records = this.load(conversationId).filter(
+      (rec) => rec.id !== excludeItemId,
+    );
+    let latestCheckpointSummary = "";
+    for (const file of [
+      this.nativeFullTranscriptPath(conversationId),
+      this.nativeTranscriptPath(conversationId),
+    ]) {
+      if (!this.fsOps.existsSync(file)) continue;
+      try {
+        const raw = this.fsOps.readFileSync(file, "utf8");
+        for (const line of raw.split(/\r?\n/u)) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("{")) continue;
+          try {
+            const parsed: unknown = JSON.parse(trimmed);
+            if (
+              isRecord(parsed) &&
+              parsed.type === "CHECKPOINT" &&
+              parsed.status === "DONE" &&
+              typeof parsed.content === "string" &&
+              parsed.content.trim()
+            ) {
+              latestCheckpointSummary = parsed.content.trim();
+            }
+          } catch {
+            continue;
+          }
+        }
+        if (latestCheckpointSummary) break;
+      } catch {
+        continue;
+      }
+    }
+
+    const entries: string[] = [];
+    for (const rec of records) {
+      const item = rec.item;
+      if (item.type === "user_message" && item.text.trim()) {
+        entries.push(`[User]: ${item.text.trim()}`);
+      } else if (item.type === "assistant_message" && item.text.trim()) {
+        entries.push(`[Assistant]: ${item.text.trim()}`);
+      } else if (item.type === "tool_call") {
+        entries.push(`[Tool ${item.name}]: ${item.status}`);
+      }
+    }
+
+    if (!latestCheckpointSummary && entries.length === 0) {
+      return null;
+    }
+
+    const maxEntriesChars = 28_000;
+    const selectedEntries: string[] = [];
+    let usedChars = 0;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i]!;
+      const cappedEntry =
+        entry.length > 8_000 ? `${entry.slice(0, 8_000)}\n...[truncated]` : entry;
+      if (usedChars + cappedEntry.length > maxEntriesChars && selectedEntries.length > 0) {
+        break;
+      }
+      selectedEntries.unshift(cappedEntry);
+      usedChars += cappedEntry.length + 2;
+    }
+
+    const sections: string[] = [
+      "<CONVERSATION_HISTORY_RECOVERY>",
+      `Antigravity CLI evicted the local SQLite state for prior conversation \`${conversationId}\`, so this session is continuing in a new CLI trajectory. Use the recovered conversation history below as your prior context and respond directly to the user's new request that follows.`,
+    ];
+    if (latestCheckpointSummary) {
+      const cappedSummary =
+        latestCheckpointSummary.length > 20_000
+          ? `${latestCheckpointSummary.slice(0, 20_000)}\n...[truncated]`
+          : latestCheckpointSummary;
+      sections.push(`## Prior Checkpoint Summary\n${cappedSummary}`);
+    }
+    if (selectedEntries.length > 0) {
+      sections.push(`## Recent Conversation Timeline\n${selectedEntries.join("\n\n")}`);
+    }
+    sections.push("</CONVERSATION_HISTORY_RECOVERY>");
+    return sections.join("\n\n");
+  }
+
+  migrateConversation(
+    fromConversationId: string,
+    toConversationId: string,
+    sessionKey?: string,
+  ): void {
+    const cleanFrom = fromConversationId.trim();
+    const cleanTo = toConversationId.trim();
+    if (!cleanFrom || !cleanTo || cleanFrom === cleanTo) {
+      return;
+    }
+    const fromRecords = this.load(cleanFrom);
+    const toMap = this.ensureLoaded(cleanTo);
+    let maxSeq = this.seqCounters.get(cleanTo) ?? 0;
+    for (const rec of fromRecords) {
+      const existing = toMap.get(rec.id);
+      const seq = existing ? existing.seq : rec.seq;
+      if (seq > maxSeq) {
+        maxSeq = seq;
+      }
+      toMap.set(rec.id, {
+        id: rec.id,
+        seq,
+        timestamp: existing?.timestamp || rec.timestamp,
+        item: sanitizeTimelineItem(rec.item),
+      });
+    }
+    this.seqCounters.set(cleanTo, maxSeq);
+    if (toMap.size > 0) {
+      this.dirtyConversations.add(cleanTo);
+      this.flush(cleanTo);
+    }
+    if (sessionKey) {
+      this.bindSessionKey(sessionKey, cleanTo);
+    }
+  }
+
   /** Positive completion proof when stdout has no terminal response state.
    * Require a fresh request and the final, tool-free DONE in this conversation;
    * text length and an earlier completed model/tool step are not proof. */
   hasCompletedNativeResponse(
-    conversationId: string, afterStep: number, response: string, responseStep?: number,
+    conversationId: string,
+    afterStep: number,
+    response: string,
+    responseStep?: number,
+    lastStreamedStepIndex?: number,
   ): boolean {
+    return (
+      this.completedNativeResponseStep(
+        conversationId,
+        afterStep,
+        response,
+        responseStep,
+        lastStreamedStepIndex,
+      ) !== null
+    );
+  }
+
+  completedNativeResponseStep(
+    conversationId: string,
+    afterStep: number,
+    response: string,
+    responseStep?: number,
+    lastStreamedStepIndex?: number,
+  ): number | null {
     const finalResponse = (file: string): Record<string, unknown> | null => {
       let fd: number | undefined;
       try {
@@ -535,13 +833,22 @@ export class ConversationStore {
             }
             return null;
           }
+          const lastStep = Number(last.step_index);
+          const minRequiredStep = Math.max(responseStep ?? -1, lastStreamedStepIndex ?? -1);
+          if (minRequiredStep !== -1 && lastStep < minRequiredStep) return null;
+          if (
+            responseStep !== undefined &&
+            lastStep !== responseStep &&
+            (lastStreamedStepIndex === undefined || lastStep <= lastStreamedStepIndex)
+          ) {
+            return null;
+          }
           if (last.status !== "DONE" ||
               !["PLANNER_RESPONSE", "AGENT_RESPONSE"].includes(String(last.type)) ||
-              typeof last.content !== "string" || !last.content.trim() ||
-              (responseStep !== undefined && last.step_index !== responseStep)) return null;
+              typeof last.content !== "string" || !last.content.trim()) return null;
           if (last.tool_calls != null && (!Array.isArray(last.tool_calls) || last.tool_calls.length !== 0)) return null;
           if (!ordered.some(row => row.type === "USER_INPUT" && row.status === "DONE" &&
-              Number(row.step_index) < Number(last.step_index))) {
+              Number(row.step_index) < lastStep)) {
             if (start > 0 && minStep > afterStep + 1) {
               windowBytes *= 2;
               continue;
@@ -555,14 +862,271 @@ export class ConversationStore {
     };
     const file = this.nativeTranscriptPath(conversationId);
     let final = finalResponse(file);
-    if (!final) return false;
+    if (!final) return null;
     if (Array.isArray(final.truncated_fields) && final.truncated_fields.includes("content")) {
       const full = finalResponse(path.join(path.dirname(file), "transcript_full.jsonl"));
       if (!full || full.step_index !== final.step_index ||
-          (Array.isArray(full.truncated_fields) && full.truncated_fields.includes("content"))) return false;
+          (Array.isArray(full.truncated_fields) && full.truncated_fields.includes("content"))) return null;
       final = full;
     }
-    return response.trim().endsWith(String(final.content).trim());
+    return matchesNativeFinalContent(response, String(final.content))
+      ? Number(final.step_index)
+      : null;
+  }
+
+  /**
+   * Reads completed `PLANNER_RESPONSE` / `AGENT_RESPONSE` steps and their
+   * associated `GENERIC` tool outputs for the current turn (`step_index > afterStep`),
+   * preferring `transcript_full.jsonl` over `transcript.jsonl` so `<thought>`-truncated
+   * stdout messages, compact-truncated thoughts, and steps omitted when `agy`'s
+   * stdout `stepTracker` stalls behind a `RUNNING` background tool are recovered.
+   */
+  readNativeTurnSteps(
+    conversationId: string,
+    afterStep: number,
+  ): NativeTurnPlannerStep[] {
+    const readTurnRows = (file: string): Map<number, Record<string, unknown>> | null => {
+      let fd: number | undefined;
+      try {
+        if (!this.fsOps.existsSync(file)) return null;
+        const size = this.fsOps.statSync(file).size;
+        if (size <= 0) return null;
+        fd = this.fsOps.openSync(file, "r");
+        let windowBytes = 256 * 1024;
+        while (true) {
+          const start = Math.max(0, size - windowBytes);
+          const raw = this.readRange(fd, start, size - start).toString("utf8");
+          if (!raw.endsWith("\n")) return null;
+          const lines = raw.split(/\r?\n/u);
+          if (start > 0) lines.shift();
+          const rows = new Map<number, Record<string, unknown>>();
+          let minStep = Infinity;
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith("{")) continue;
+            const row: unknown = JSON.parse(trimmed);
+            if (!isRecord(row) || typeof row.step_index !== "number" || !Number.isSafeInteger(row.step_index)) {
+              continue;
+            }
+            if (row.step_index < minStep) minStep = row.step_index;
+            if (row.step_index <= afterStep) continue;
+            if (
+              (row.conversation_id !== undefined && row.conversation_id !== conversationId) ||
+              (row.conversationId !== undefined && row.conversationId !== conversationId)
+            ) {
+              return null;
+            }
+            rows.set(row.step_index, row);
+          }
+          if (start > 0 && minStep > afterStep + 1) {
+            windowBytes *= 2;
+            continue;
+          }
+          return rows;
+        }
+      } catch {
+        return null;
+      } finally {
+        if (fd !== undefined) {
+          try { this.fsOps.closeSync(fd); } catch { /* already closed */ }
+        }
+      }
+    };
+
+    const compactFile = this.nativeTranscriptPath(conversationId);
+    const fullFile = this.nativeFullTranscriptPath(conversationId);
+    const compactRows = readTurnRows(compactFile);
+    const fullRows = readTurnRows(fullFile);
+    if (!compactRows && !fullRows) {
+      return [];
+    }
+    const merged = new Map<number, Record<string, unknown>>();
+    if (compactRows) {
+      for (const [step, row] of compactRows) {
+        merged.set(step, row);
+      }
+    }
+    if (fullRows) {
+      for (const [step, row] of fullRows) {
+        merged.set(step, row);
+      }
+    }
+
+    const ordered = [...merged.values()].sort(
+      (a, b) => Number(a.step_index) - Number(b.step_index),
+    );
+    const firstUser = ordered.find(
+      (row) => row.type === "USER_INPUT" && row.status === "DONE",
+    );
+    if (!firstUser) {
+      return [];
+    }
+    const minTurnStep = Number(firstUser.step_index);
+
+    const genericByStep = new Map<
+      number,
+      { status: string; content?: string; timestamp?: string }
+    >();
+    for (const row of ordered) {
+      const stepIndex = Number(row.step_index);
+      if (stepIndex <= minTurnStep) continue;
+      if (
+        row.type === "GENERIC" &&
+        (row.status === "DONE" || row.status === "ERROR")
+      ) {
+        genericByStep.set(stepIndex, {
+          status: String(row.status),
+          ...(typeof row.content === "string" ? { content: row.content } : {}),
+          ...(typeof row.created_at === "string" ? { timestamp: row.created_at } : {}),
+        });
+      }
+    }
+
+    const plannerSteps: NativeTurnPlannerStep[] = [];
+    for (const row of ordered) {
+      const stepIndex = Number(row.step_index);
+      if (stepIndex <= minTurnStep) continue;
+      const type = String(row.type ?? "");
+      if (
+        (type !== "PLANNER_RESPONSE" && type !== "AGENT_RESPONSE") ||
+        row.status !== "DONE"
+      ) {
+        continue;
+      }
+      const timestamp =
+        typeof row.created_at === "string" && row.created_at
+          ? row.created_at
+          : undefined;
+      const thinking =
+        typeof row.thinking === "string" && row.thinking.trim()
+          ? row.thinking
+          : undefined;
+      const content =
+        typeof row.content === "string" && row.content.trim()
+          ? row.content
+          : undefined;
+      const toolCalls: NativeTurnToolCall[] = [];
+      if (Array.isArray(row.tool_calls)) {
+        for (let idx = 0; idx < row.tool_calls.length; idx++) {
+          const tc = row.tool_calls[idx];
+          if (!isRecord(tc)) continue;
+          const toolStep = stepIndex + 1 + idx;
+          const generic = genericByStep.get(toolStep);
+          if (!generic) continue;
+          const name =
+            typeof tc.name === "string" && tc.name.trim()
+              ? tc.name.trim()
+              : "Antigravity tool";
+          toolCalls.push({
+            stepIndex: toolStep,
+            ...(typeof tc.id === "string" && tc.id.trim()
+              ? { callId: tc.id.trim() }
+              : {}),
+            name,
+            args: tc.args ?? tc.arguments ?? {},
+            ...(generic.content !== undefined ? { output: generic.content } : {}),
+            status: generic.status === "ERROR" ? "failed" : "completed",
+            timestamp: generic.timestamp ?? timestamp,
+          });
+        }
+      }
+      plannerSteps.push({
+        stepIndex,
+        ...(timestamp !== undefined ? { timestamp } : {}),
+        ...(thinking !== undefined ? { thinking } : {}),
+        ...(content !== undefined ? { content } : {}),
+        toolCalls,
+      });
+    }
+    return plannerSteps;
+  }
+
+  readNativeStep(
+    conversationId: string,
+    stepIndex: number,
+  ): NativeSingleStep | null {
+    const findInFile = (file: string): NativeSingleStep | null => {
+      let fd: number | undefined;
+      try {
+        if (!this.fsOps.existsSync(file)) return null;
+        const size = this.fsOps.statSync(file).size;
+        if (size <= 0) return null;
+        fd = this.fsOps.openSync(file, "r");
+        let windowBytes = 256 * 1024;
+        while (true) {
+          const start = Math.max(0, size - windowBytes);
+          const raw = this.readRange(fd, start, size - start).toString("utf8");
+          if (!raw.endsWith("\n")) return null;
+          const lines = raw.split(/\r?\n/u);
+          if (start > 0) lines.shift();
+          let minStep = Infinity;
+          let matched: Record<string, unknown> | null = null;
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith("{")) continue;
+            const row: unknown = JSON.parse(trimmed);
+            if (!isRecord(row) || typeof row.step_index !== "number" || !Number.isSafeInteger(row.step_index)) {
+              continue;
+            }
+            if (row.step_index < minStep) minStep = row.step_index;
+            if (row.step_index === stepIndex) {
+              matched = row;
+            }
+          }
+          if (matched) {
+            const type = String(matched.type ?? "");
+            if (
+              (type !== "PLANNER_RESPONSE" && type !== "AGENT_RESPONSE") ||
+              matched.status !== "DONE"
+            ) {
+              return null;
+            }
+            const truncated = Array.isArray(matched.truncated_fields)
+              ? matched.truncated_fields
+              : [];
+            if (
+              file === this.nativeTranscriptPath(conversationId) &&
+              (truncated.includes("content") || truncated.includes("thinking"))
+            ) {
+              return null;
+            }
+            const timestamp =
+              typeof matched.created_at === "string" && matched.created_at
+                ? matched.created_at
+                : undefined;
+            const thinking =
+              typeof matched.thinking === "string" && matched.thinking.trim()
+                ? matched.thinking
+                : undefined;
+            const content =
+              typeof matched.content === "string" && matched.content.trim()
+                ? matched.content
+                : undefined;
+            return {
+              stepIndex,
+              ...(timestamp !== undefined ? { timestamp } : {}),
+              ...(thinking !== undefined ? { thinking } : {}),
+              ...(content !== undefined ? { content } : {}),
+            };
+          }
+          if (start > 0 && minStep > stepIndex) {
+            windowBytes *= 2;
+            continue;
+          }
+          return null;
+        }
+      } catch {
+        return null;
+      } finally {
+        if (fd !== undefined) {
+          try { this.fsOps.closeSync(fd); } catch { /* already closed */ }
+        }
+      }
+    };
+    return (
+      findInFile(this.nativeFullTranscriptPath(conversationId)) ??
+      findInFile(this.nativeTranscriptPath(conversationId))
+    );
   }
 
   /**

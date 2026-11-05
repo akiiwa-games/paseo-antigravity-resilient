@@ -7,7 +7,7 @@ import type { ProviderEvent, ProviderTimelineItem } from "@getpaseo/plugin/serve
 import { DEFAULT_MODE, MODES } from "../server/internal/catalog.ts";
 import { Session } from "../server/internal/session.ts";
 import { ConversationStore } from "../server/internal/store.ts";
-import { replayTimelineItem } from "../server/internal/timeline.ts";
+import { replayTimelineItem, stepToolDetail, toolDetail } from "../server/internal/timeline.ts";
 
 const legacy: ProviderTimelineItem = {
   id: "turn-3:auto-compact", type: "notification", level: "info",
@@ -120,5 +120,83 @@ test("step-indexed block ordering normalizes reasoning before same-step message 
     ]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("agy 1.4.12 read_file, write_file, edit_file, and subagent_info map to canonical Paseo tool details", () => {
+  assert.deepEqual(
+    toolDetail("read_file", { Path: "/repo/src/index.ts", StartLine: 10, EndLine: 29 }, "line 10..29"),
+    { type: "read", filePath: "/repo/src/index.ts", offset: 10, limit: 20, content: "line 10..29" },
+  );
+  assert.deepEqual(
+    toolDetail("write_file", { Path: "/repo/src/new.ts", Content: "export const x = 1;\n" }),
+    { type: "write", filePath: "/repo/src/new.ts", content: "export const x = 1;\n" },
+  );
+  assert.deepEqual(
+    toolDetail("edit_file", {
+      Path: "/repo/src/index.ts",
+      Target: "const oldVal = 1;",
+      Replacement: "const newVal = 2;",
+    }),
+    {
+      type: "edit",
+      filePath: "/repo/src/index.ts",
+      oldString: "const oldVal = 1;",
+      newString: "const newVal = 2;",
+    },
+  );
+  assert.deepEqual(
+    stepToolDetail({
+      step_index: 7,
+      state: "DONE",
+      step_type: "subagent",
+      tool_name: "invoke_subagent",
+      subagent_info: {
+        subagents: [
+          {
+            type_name: "research",
+            initial_prompt: "Audit all sessions",
+            conversation_id: "child-conv-1",
+            log_uri: "file:///logs/child.jsonl",
+          },
+        ],
+      },
+    }),
+    {
+      type: "sub_agent",
+      subAgentType: "research",
+      description: "Audit all sessions",
+      childSessionId: "child-conv-1",
+      log: "file:///logs/child.jsonl",
+    },
+  );
+  assert.deepEqual(
+    stepToolDetail({
+      step_index: 8,
+      state: "ACTIVE",
+      step_type: "tool",
+      tool_name: "custom_banner",
+    }),
+    { type: "plain_text", label: "custom_banner", text: "" },
+  );
+
+  // replayTimelineItem upgrades persisted unknown read_file/write_file/edit_file items on read
+  const legacyUnknownRead: ProviderTimelineItem = {
+    id: "turn-1:step:2",
+    type: "tool_call",
+    callId: "turn-1:step:2",
+    name: "read_file",
+    detail: { type: "unknown", input: { Path: "/repo/README.md" }, output: "# Readme" },
+    status: "completed",
+    error: null,
+  };
+  const upgradedRead = replayTimelineItem(legacyUnknownRead);
+  assert.equal(upgradedRead.type, "tool_call");
+  if (upgradedRead.type === "tool_call") {
+    assert.deepEqual(upgradedRead.detail, {
+      type: "read",
+      filePath: "/repo/README.md",
+      content: "# Readme",
+    });
   }
 });

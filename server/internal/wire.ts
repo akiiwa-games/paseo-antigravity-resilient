@@ -205,6 +205,13 @@ export function isResultSuccess(frame: ResultFrame): boolean {
   return true;
 }
 
+export function isResultInterrupted(frame: ResultFrame): boolean {
+  return (
+    typeof frame.result?.error === "string" &&
+    frame.result.error.trim().toLowerCase() === "interrupted"
+  );
+}
+
 export function resultResponse(frame: ResultFrame): string | undefined {
   if (frame.result && typeof frame.result.response === "string") {
     return frame.result.response;

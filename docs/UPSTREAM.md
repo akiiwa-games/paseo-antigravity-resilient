@@ -8,12 +8,12 @@ repository path.
 
 ## Audited upstream pin
 
-Checked on 2026-11-02:
+Checked on 2026-11-05:
 
 - Repository: `https://github.com/getpaseo/paseo`
 - Branch inspected: `main`
-- Full repository commit: `da8d58bfee5279369c1a733cf5cf4ddc3bd56bb8`
-- Commit timestamp: `2026-11-02T05:04:23Z`
+- Full repository commit: `b920243c74e25ec06e523019fb154f78ea9870be`
+- Commit timestamp: `2026-11-05T11:00:04+07:00`
 - Provider directory tree: `9678d16761c22cebd71a39adaaa13d75ccd8b78c`
 - Most recent commit affecting that directory:
   `9760292650216e4cb93fa787085251029c882130` (2026-10-05),
@@ -41,10 +41,12 @@ would remove those behaviors. The release integration is split as follows:
 | Minimum CLI version | `provider.status()` accepts readable `agy` versions at least `1.1.15`, retaining the fork's probe diagnostics and timeout. |
 | Startup deadline and stdin failure | `Session.ensureDriver()` bounds initialization to 90 seconds, configurable with `providerOptions.startupTimeoutMs`. The upstream 30-second default timed out during successful silent authentication on the second test host. `spawnDriver()` forwards stdin failures. |
 | Child process tree cleanup | `spawnDriver().stop()` uses the host SDK's Windows tree termination and dedicated POSIX groups. Retired-driver callbacks are ignored and overlapping shutdown is awaited. |
-| Terminal tool status | `Session.finishTools()` finalizes running tools as completed, failed or canceled at the turn boundary. Recovery cancels the retired attempt's tools. |
+| Terminal tool status | `Session.finishTools()` finalizes running tools as completed, failed or canceled at the turn boundary. Recovery cancels the retired attempt's tools. `result.error === "interrupted"` settles tools and the turn as `canceled`. |
 | Resume identity | The init handler rejects a restored CLI conversation that differs from the requested conversation. |
 | Idle process failure | Driver close/error handlers report `session.runtime_failed` when idle. |
-| Cumulative denied actions | `Session.handleResult()` counts native denial occurrences and surfaces only newly observed policy denials. |
+| Cumulative denied actions | `Session.handleResult()` counts native denial occurrences, formats single command/action titles via `denialNoticeTitle()`, and surfaces only newly observed policy denials. |
+| Subagent & canonical tool details | `stepToolDetail()` and `toolDetail()` map `subagent_info` (`type: "sub_agent"` + `metadata.subagents`), `plain_text` fallbacks, and `agy` 1.4.12 `read_file`/`write_file`/`edit_file` (`Path`, `StartLine`, `EndLine`, `Content`, `Target`, `Replacement`) tool parameters, plus read-time `replayTimelineItem()` upgrades for persisted `unknown` tool records. |
+| Untruncated native transcript reconciliation | `NativeReasoningTail`, `parseNativeTranscript()`, and `Session.reconcileNativeTurnSteps()` read `transcript_full.jsonl` (falling back to `transcript.jsonl`) so thoughts > 4,116 chars, assistant messages truncated by literal `<thought>` tags on stdout, and steps omitted when `agy`'s stdout `stepTracker` stalls behind a `RUNNING` background tool are preserved without truncation. |
 
 The local streaming layer also reconciles the final response and tails new native
 reasoning rows, which the audited upstream does not provide. It also handles agy
