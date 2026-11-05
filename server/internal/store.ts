@@ -230,9 +230,16 @@ function extractStepOrderKey(record: StoredTimelineRecord): StepOrderKey | null 
 
 /**
  * Normalizes `seq` ordering across native step-indexed items within each turn
- * so `turn-T:step:S:reasoning` always precedes `turn-T:step:S` and `turn-T:step:S+1`
- * even when stdout `step_update` frames and `transcript.jsonl` reasoning flushes
- * arrive out of order.
+ * so:
+ * 1. `turn-T:step:S:reasoning` always precedes `turn-T:step:S` and `turn-T:step:S+1`
+ *    even when stdout `step_update` frames and `transcript.jsonl` reasoning flushes
+ *    arrive out of order.
+ * 2. Late-arriving or backfilled items for an earlier turn `turn-T` stay
+ *    contiguously inside `turn-T` (at `turn-T`'s anchor position before
+ *    subsequent turns and their user messages) instead of overflowing into
+ *    `seq` slots after later turns.
+ * 3. Mid-turn `native-checkpoint:S` items stay at their step position `S`
+ *    within the enclosing turn `turn-T`.
  */
 function normalizeTimelineStepOrder(
   map: Map<string, StoredTimelineRecord>,
@@ -244,6 +251,10 @@ function normalizeTimelineStepOrder(
   const groups = new Map<
     number,
     Array<{ record: StoredTimelineRecord; key: StepOrderKey; origSeq: number }>
+  >();
+  const turnBounds = new Map<
+    number,
+    { minStep: number; maxStep: number; minOrigSeq: number; maxOrigSeq: number }
   >();
 
   for (const record of bySeq) {
@@ -257,14 +268,69 @@ function normalizeTimelineStepOrder(
       groups.set(key.turnIndex, group);
     }
     group.push({ record, key, origSeq: record.seq });
+    const bounds = turnBounds.get(key.turnIndex);
+    if (!bounds) {
+      turnBounds.set(key.turnIndex, {
+        minStep: key.stepIndex,
+        maxStep: key.stepIndex,
+        minOrigSeq: record.seq,
+        maxOrigSeq: record.seq,
+      });
+    } else {
+      if (key.stepIndex < bounds.minStep) bounds.minStep = key.stepIndex;
+      if (key.stepIndex > bounds.maxStep) bounds.maxStep = key.stepIndex;
+      if (record.seq < bounds.minOrigSeq) bounds.minOrigSeq = record.seq;
+      if (record.seq > bounds.maxOrigSeq) bounds.maxOrigSeq = record.seq;
+    }
   }
 
-  let changed = false;
-  for (const group of groups.values()) {
-    if (group.length <= 1) {
+  if (groups.size === 0) {
+    return false;
+  }
+
+  for (const record of bySeq) {
+    const cpMatch = /^native-checkpoint:(\d+)$/.exec(record.id);
+    if (!cpMatch || !cpMatch[1]) {
       continue;
     }
-    const seqSlots = group.map((entry) => entry.origSeq).sort((a, b) => a - b);
+    const stepIndex = Number.parseInt(cpMatch[1], 10);
+    if (!Number.isSafeInteger(stepIndex)) {
+      continue;
+    }
+    let matchedTurn: number | null = null;
+    let bestSeqDistance = Number.POSITIVE_INFINITY;
+    for (const [turnIndex, bounds] of turnBounds.entries()) {
+      if (
+        record.seq >= bounds.minOrigSeq &&
+        stepIndex >= bounds.minStep &&
+        stepIndex <= bounds.maxStep
+      ) {
+        const dist =
+          record.seq > bounds.maxOrigSeq ? record.seq - bounds.maxOrigSeq : 0;
+        if (dist < bestSeqDistance) {
+          bestSeqDistance = dist;
+          matchedTurn = turnIndex;
+        }
+      }
+    }
+    if (matchedTurn !== null) {
+      groups.get(matchedTurn)?.push({
+        record,
+        key: { turnIndex: matchedTurn, stepIndex, subOrder: 1 },
+        origSeq: record.seq,
+      });
+    }
+  }
+
+  const recordTurnMap = new Map<string, number>();
+  const sortedGroups = new Map<
+    number,
+    Array<{ record: StoredTimelineRecord; key: StepOrderKey; origSeq: number }>
+  >();
+  for (const [turnIndex, group] of groups.entries()) {
+    for (const entry of group) {
+      recordTurnMap.set(entry.record.id, turnIndex);
+    }
     const sorted = [...group].sort((a, b) => {
       if (a.key.stepIndex !== b.key.stepIndex) {
         return a.key.stepIndex - b.key.stepIndex;
@@ -274,17 +340,49 @@ function normalizeTimelineStepOrder(
       }
       return a.origSeq - b.origSeq;
     });
-    for (let i = 0; i < sorted.length; i++) {
-      const targetSeq = seqSlots[i]!;
-      const entry = sorted[i]!;
-      if (entry.record.seq !== targetSeq) {
-        const updated: StoredTimelineRecord = {
-          ...entry.record,
-          seq: targetSeq,
-        };
-        map.set(updated.id, updated);
-        changed = true;
+    sortedGroups.set(turnIndex, sorted);
+  }
+
+  const emittedTurns = new Set<number>();
+  const normalized: StoredTimelineRecord[] = [];
+  for (const record of bySeq) {
+    const turnIndex = recordTurnMap.get(record.id);
+    if (turnIndex === undefined) {
+      normalized.push(record);
+      continue;
+    }
+    if (emittedTurns.has(turnIndex)) {
+      continue;
+    }
+    emittedTurns.add(turnIndex);
+    const sortedGroup = sortedGroups.get(turnIndex);
+    if (sortedGroup) {
+      for (const entry of sortedGroup) {
+        normalized.push(entry.record);
       }
+    }
+  }
+
+  const orderChanged = normalized.some(
+    (rec, idx) => rec.id !== bySeq[idx]?.id,
+  );
+  const seqCollision = bySeq.some(
+    (rec, idx) => idx > 0 && rec.seq <= bySeq[idx - 1]!.seq,
+  );
+  if (!orderChanged && !seqCollision) {
+    return false;
+  }
+
+  let changed = false;
+  for (let i = 0; i < normalized.length; i++) {
+    const targetSeq = i + 1;
+    const rec = normalized[i]!;
+    if (rec.seq !== targetSeq) {
+      map.set(rec.id, {
+        ...rec,
+        seq: targetSeq,
+      });
+      changed = true;
     }
   }
   return changed;
@@ -746,19 +844,41 @@ export class ConversationStore {
     }
     const fromRecords = this.load(cleanFrom);
     const toMap = this.ensureLoaded(cleanTo);
-    let maxSeq = this.seqCounters.get(cleanTo) ?? 0;
+    const toExisting = [...toMap.values()].sort((a, b) => a.seq - b.seq);
+    const fromIds = new Set(fromRecords.map((rec) => rec.id));
+    const combined: StoredTimelineRecord[] = [];
+
     for (const rec of fromRecords) {
       const existing = toMap.get(rec.id);
-      const seq = existing ? existing.seq : rec.seq;
-      if (seq > maxSeq) {
-        maxSeq = seq;
-      }
-      toMap.set(rec.id, {
+      combined.push({
         id: rec.id,
-        seq,
+        seq: combined.length + 1,
         timestamp: existing?.timestamp || rec.timestamp,
+        item: sanitizeTimelineItem(existing?.item ?? rec.item),
+      });
+    }
+    for (const rec of toExisting) {
+      if (fromIds.has(rec.id)) {
+        continue;
+      }
+      combined.push({
+        id: rec.id,
+        seq: combined.length + 1,
+        timestamp: rec.timestamp,
         item: sanitizeTimelineItem(rec.item),
       });
+    }
+
+    toMap.clear();
+    for (const rec of combined) {
+      toMap.set(rec.id, rec);
+    }
+    normalizeTimelineStepOrder(toMap);
+    let maxSeq = 0;
+    for (const rec of toMap.values()) {
+      if (rec.seq > maxSeq) {
+        maxSeq = rec.seq;
+      }
     }
     this.seqCounters.set(cleanTo, maxSeq);
     if (toMap.size > 0) {

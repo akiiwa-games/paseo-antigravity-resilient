@@ -123,6 +123,89 @@ test("step-indexed block ordering normalizes reasoning before same-step message 
   }
 });
 
+test("late reasoning upserts for earlier turns stay inside their own turns and never push assistant messages after later turns", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agy-cross-turn-order-"));
+  try {
+    const store = new ConversationStore({ storeDir: dir });
+    // Turn 5 originally persisted without some reasoning steps
+    store.upsert("conv-cross-turn", { id: "turn-5:step:2", type: "tool_call", callId: "turn-5:step:2",
+      name: "read_file", detail: { type: "unknown", input: {}, output: null }, status: "completed", error: null });
+    store.upsert("conv-cross-turn", { id: "turn-5:step:28", type: "tool_call", callId: "turn-5:step:28",
+      name: "edit_file", detail: { type: "unknown", input: {}, output: null }, status: "completed", error: null });
+    store.upsert("conv-cross-turn", { id: "turn-5:step:39", messageId: "turn-5:step:39", type: "assistant_message", text: "Turn 5 final answer" });
+
+    // Turn 6
+    store.upsert("conv-cross-turn", { id: "user:msg-turn-6", type: "user_message", text: "Turn 6 question" });
+    store.upsert("conv-cross-turn", { id: "turn-6:step:41", messageId: "turn-6:step:41", type: "assistant_message", text: "Turn 6 final answer" });
+
+    // Turn 7
+    store.upsert("conv-cross-turn", { id: "user:msg-turn-7", type: "user_message", text: "Turn 7 question" });
+    store.upsert("conv-cross-turn", { id: "turn-7:step:44:reasoning", type: "reasoning", text: "Turn 7 thought" });
+    store.upsert("conv-cross-turn", { id: "turn-7:step:45", type: "tool_call", callId: "turn-7:step:45",
+      name: "read_file", detail: { type: "unknown", input: {}, output: null }, status: "completed", error: null });
+    store.upsert("conv-cross-turn", { id: "turn-7:step:55", messageId: "turn-7:step:55", type: "assistant_message", text: "Turn 7 final answer" });
+
+    // Now backfill reasoning steps for turn 5 (including around a mid-turn native checkpoint) and turn 6
+    store.upsert("conv-cross-turn", { id: "native-checkpoint:27", type: "compaction", status: "completed", trigger: "auto" });
+    store.upsert("conv-cross-turn", { id: "turn-5:step:1:reasoning", type: "reasoning", text: "Turn 5 initial thought" });
+    store.upsert("conv-cross-turn", { id: "turn-5:step:39:reasoning", type: "reasoning", text: "Turn 5 final thought" });
+    store.upsert("conv-cross-turn", { id: "turn-6:step:41:reasoning", type: "reasoning", text: "Turn 6 thought" });
+    store.flush("conv-cross-turn");
+
+    const loaded = store.load("conv-cross-turn");
+    assert.deepEqual(loaded.map(r => r.id), [
+      "turn-5:step:1:reasoning",
+      "turn-5:step:2",
+      "native-checkpoint:27",
+      "turn-5:step:28",
+      "turn-5:step:39:reasoning",
+      "turn-5:step:39",
+      "user:msg-turn-6",
+      "turn-6:step:41:reasoning",
+      "turn-6:step:41",
+      "user:msg-turn-7",
+      "turn-7:step:44:reasoning",
+      "turn-7:step:45",
+      "turn-7:step:55",
+    ]);
+    assert.deepEqual(loaded.map(r => r.seq), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("migrateConversation prepends predecessor turns without seq collisions when target conversation already has later turns", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agy-migrate-order-"));
+  try {
+    const store = new ConversationStore({ storeDir: dir });
+    store.upsert("conv-prev", { id: "user:msg-turn-1", type: "user_message", text: "Turn 1 prompt" });
+    store.upsert("conv-prev", { id: "turn-1:step:2", messageId: "turn-1:step:2", type: "assistant_message", text: "Turn 1 reply" });
+    store.upsert("conv-prev", { id: "user:msg-turn-2", type: "user_message", text: "Turn 2 prompt" });
+    store.flush("conv-prev");
+
+    store.upsert("conv-next", { id: "turn-2:step:1:reasoning", type: "reasoning", text: "Turn 2 thought" });
+    store.upsert("conv-next", { id: "turn-2:step:2", messageId: "turn-2:step:2", type: "assistant_message", text: "Turn 2 reply" });
+    store.upsert("conv-next", { id: "user:msg-turn-3", type: "user_message", text: "Turn 3 prompt" });
+    store.upsert("conv-next", { id: "turn-3:step:4", messageId: "turn-3:step:4", type: "assistant_message", text: "Turn 3 reply" });
+    store.flush("conv-next");
+
+    store.migrateConversation("conv-prev", "conv-next", "sess-1");
+    const merged = store.load("conv-next");
+    assert.deepEqual(merged.map(r => r.id), [
+      "user:msg-turn-1",
+      "turn-1:step:2",
+      "user:msg-turn-2",
+      "turn-2:step:1:reasoning",
+      "turn-2:step:2",
+      "user:msg-turn-3",
+      "turn-3:step:4",
+    ]);
+    assert.deepEqual(merged.map(r => r.seq), [1, 2, 3, 4, 5, 6, 7]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("agy 1.4.12 read_file, write_file, edit_file, and subagent_info map to canonical Paseo tool details", () => {
   assert.deepEqual(
     toolDetail("read_file", { Path: "/repo/src/index.ts", StartLine: 10, EndLine: 29 }, "line 10..29"),
