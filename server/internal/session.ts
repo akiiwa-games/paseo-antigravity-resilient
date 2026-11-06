@@ -104,6 +104,26 @@ export function isCompactPromptText(text: string): boolean {
   return /^\/compact(?:\s|$)/i.test(text.trim());
 }
 
+/**
+ * `agy`'s native `/goal` keeps forcing continuations inside one native turn
+ * (one stream-json `result`) until the objective is met.
+ */
+export function isGoalPromptText(text: string): boolean {
+  return /^\/goal(?:\s|$)/i.test(text.trim());
+}
+
+export const SESSION_COMMANDS = [
+  {
+    name: "compact",
+    description: "Compact conversation context into a checkpoint summary",
+  },
+  {
+    name: "goal",
+    description: "Keep working until an objective is complete",
+    argumentHint: "<objective>",
+  },
+];
+
 export type SessionOptions = {
   autoCompactEnabled?: boolean;
   autoCompactLeadMs?: number;
@@ -224,13 +244,13 @@ function createTurn(
 /**
  * `agy` expands a leading `/name` into a slash command or skill unless it
  * runs with `--disable-slash-commands` ("pass --disable-slash-commands to send
- * /%s to the model as literal text"). Compaction needs expansion; any other
+ * /%s to the model as literal text"). Compaction and `/goal` need expansion; any other
  * payload with a leading slash must reach the model literally. Every other
  * payload is indifferent (`null`), so one resident process serves ordinary
  * turns and `/compact` alike without being respawned.
  */
 export function slashCommandRequirement(payload: string, compaction: boolean): boolean | null {
-  if (compaction) return true;
+  if (compaction || isGoalPromptText(payload)) return true;
   return /^\s*\//.test(payload) ? false : null;
 }
 
@@ -597,12 +617,7 @@ export class Session {
     this.emit({
       type: "session.commands",
       sessionId: this.sessionId,
-      commands: [
-        {
-          name: "compact",
-          description: "Compact conversation context into a checkpoint summary",
-        },
-      ],
+      commands: SESSION_COMMANDS,
     });
 
     if (history === "replay" && this.conversationId) {

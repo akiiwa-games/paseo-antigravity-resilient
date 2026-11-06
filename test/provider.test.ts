@@ -40,6 +40,7 @@ import {
   DEFAULT_AUTO_COMPACT_TOKEN_THRESHOLD,
   DEFAULT_HOT_CACHE_TTL_MS,
   isCompactPromptText,
+  isGoalPromptText,
   MAX_CONSECUTIVE_COMPACT_FAILURES,
   MIN_ENV_AUTO_COMPACT_TOKEN_THRESHOLD,
   RAPID_REFILL_BREAKER_LIMIT,
@@ -2729,5 +2730,58 @@ test("defaultStoreDir preserves existing ~/.paseo history when PASEO_HOME lacks 
     if (prevPaseoHome === undefined) delete process.env.PASEO_HOME;
     else process.env.PASEO_HOME = prevPaseoHome;
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("publishes /goal and runs it on a slash-expanding driver while literal slash messages stay literal", async () => {
+  assert.equal(isGoalPromptText("/goal ship it"), true);
+  assert.equal(isGoalPromptText("/goal"), true);
+  assert.equal(isGoalPromptText("/goals are nice"), false);
+  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-goal-"));
+  try {
+    const events: ProviderEvent[] = [];
+    const invocations: Array<{ args: readonly string[]; content: string; spawn: number }> = [];
+    let spawns = 0;
+    const spawn: SpawnFunction = (_cmd, args) => {
+      const spawnIndex = ++spawns;
+      const child = new FakeChildProcess(args, (prompt, proc) => {
+        invocations.push({ args: [...args], content: prompt.content, spawn: spawnIndex });
+        proc.sendFrame({ event: "result", conversation_id: "conv-goal", status: "success", response: "OK" });
+      });
+      queueMicrotask(() => child.sendFrame({ event: "init", conversation_id: "conv-goal" }));
+      return child as unknown as ReturnType<SpawnFunction>;
+    };
+    const session = new Session("sess-goal", "agy", [], {}, makeConfig({ systemPrompt: "System rules here" }),
+      undefined, TEST_CATALOG, (event) => events.push(event), { spawn, storeDir: tempDir, brainDir: tempDir });
+    session.open("open", [], "skip");
+    const commands = events.find((event) => event.type === "session.commands");
+    assert.deepEqual(
+      commands?.type === "session.commands" ? (commands.commands as Array<{ name: string }>).map((command) => command.name) : [],
+      ["compact", "goal"],
+    );
+
+    await session.prompt({
+      clientMessageId: "m-goal",
+      delivery: "auto",
+      input: { type: "command", name: "goal", arguments: "ship the release" },
+    });
+    await waitForTurnEnd(events);
+    events.length = 0;
+    await session.prompt(userPrompt("HELLO", "m-hello"));
+    await waitForTurnEnd(events);
+    events.length = 0;
+    await session.prompt(userPrompt("/etc/hosts looks wrong", "m-literal"));
+    await waitForTurnEnd(events);
+
+    assert.equal(invocations[0]?.content, "/goal ship the release", "the command keeps its leading slash");
+    assert.equal(invocations[0]?.args.includes("--disable-slash-commands"), false);
+    assert.match(invocations[1]?.content ?? "", /^System rules here\n\n[\s\S]*HELLO$/, "the next message carries the system prompt");
+    assert.equal(invocations[1]?.spawn, invocations[0]?.spawn, "an ordinary message reuses the expanding driver");
+    assert.ok(invocations[2]?.spawn !== invocations[1]?.spawn, "a literal slash message respawns without expansion");
+    assert.equal(invocations[2]?.content, "/etc/hosts looks wrong");
+    assert.equal(invocations[2]?.args.includes("--disable-slash-commands"), true);
+    await session.dispose();
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
   }
 });
