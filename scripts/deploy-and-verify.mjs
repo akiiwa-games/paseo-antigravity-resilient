@@ -152,6 +152,27 @@ async function closeTerminalSafely(client, terminalId) {
   }
 }
 
+// Newer daemons reject create_terminal without a workspaceId. Prefer the workspace rooted at the
+// checkout; the terminal cwd stays explicit, so any workspace works as the owner otherwise.
+let remoteWorkspaceIdPromise = null;
+function remoteWorkspaceId(client) {
+  remoteWorkspaceIdPromise ??= client.fetchWorkspaces({}).then((res) => {
+    const entries = res?.entries ?? res?.workspaces ?? [];
+    const norm = (p) => String(p ?? "").replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
+    const match = entries.find((w) => norm(w.workspaceDirectory) === norm(REMOTE_REPO_ROOT)) ?? entries[0];
+    return match?.id;
+  });
+  return remoteWorkspaceIdPromise;
+}
+
+async function createRemotePowerShellTerminal(client, cwd, name, psCommand) {
+  return client.createTerminal(cwd, name, undefined, {
+    workspaceId: await remoteWorkspaceId(client),
+    command: "powershell.exe",
+    args: ["-NoProfile", "-NonInteractive", "-Command", psCommand],
+  });
+}
+
 async function runRemotePowerShellAndCaptureMarker(client, cwd, name, psCommand, _markerPrefix, timeoutMs = 30_000) {
   const nonce = randomUUID();
   const relOutDir = "setup/host_sync/out";
@@ -172,10 +193,7 @@ async function runRemotePowerShellAndCaptureMarker(client, cwd, name, psCommand,
     `}`,
   ].join("; ");
 
-  const termResp = await client.createTerminal(cwd, name, undefined, {
-    command: "powershell.exe",
-    args: ["-NoProfile", "-NonInteractive", "-Command", wrappedPs],
-  });
+  const termResp = await createRemotePowerShellTerminal(client, cwd, name, wrappedPs);
   const terminalId = termResp?.terminal?.id ?? termResp?.terminalId ?? termResp?.id;
 
   try {
@@ -280,10 +298,7 @@ async function cleanupRemoteBundleAndCandidateRef(client, remoteBundlePath) {
     `git -C '${REMOTE_REPO_ROOT}' update-ref -d refs/remotes/origin/bundle-candidate`,
     `Remove-Item -Force -ErrorAction SilentlyContinue '${remoteBundlePath}'`,
   ].join("; ");
-  const termResp = await client.createTerminal(REMOTE_REPO_ROOT, "git-bundle-cleanup", undefined, {
-    command: "powershell.exe",
-    args: ["-NoProfile", "-NonInteractive", "-Command", cleanupPs],
-  });
+  const termResp = await createRemotePowerShellTerminal(client, REMOTE_REPO_ROOT, "git-bundle-cleanup", cleanupPs);
   const terminalId = termResp?.terminal?.id ?? termResp?.terminalId ?? termResp?.id;
   await new Promise((resolve) => setTimeout(resolve, 1_500));
   await closeTerminalSafely(client, terminalId);
@@ -375,10 +390,7 @@ async function syncRemoteCheckoutViaBundle(client, { dryRun = false } = {}) {
       `Remove-Item -Force -ErrorAction SilentlyContinue '${remoteBundlePath}'`,
     ].join("; ");
 
-    const termResp = await client.createTerminal(REMOTE_REPO_ROOT, "git-bundle-ff", undefined, {
-      command: "powershell.exe",
-      args: ["-NoProfile", "-NonInteractive", "-Command", ffPs],
-    });
+    const termResp = await createRemotePowerShellTerminal(client, REMOTE_REPO_ROOT, "git-bundle-ff", ffPs);
     const terminalId = termResp?.terminal?.id ?? termResp?.terminalId ?? termResp?.id;
 
     let remoteHead = null;
