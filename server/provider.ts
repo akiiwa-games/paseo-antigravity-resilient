@@ -16,7 +16,7 @@ import {
   SUPPORTED_CAPABILITIES,
   type ProviderDiscovery,
 } from "./internal/catalog.ts";
-import { probe } from "./internal/process.ts";
+import { LAUNCH_RETRY_DELAYS_MS, probe } from "./internal/process.ts";
 import { Session } from "./internal/session.ts";
 import {
   isAbortError,
@@ -56,6 +56,81 @@ function failRequest(
   });
 }
 
+type StatusResult = Awaited<ReturnType<NonNullable<ProviderDefinition["status"]>>>;
+
+/** One `agy --version` check. `transient` marks failures worth re-checking. */
+async function checkAgyVersionOnce(
+  run: typeof probe,
+  command: string,
+  args: string[],
+  env: Record<string, string> | undefined,
+): Promise<StatusResult & { transient?: boolean }> {
+  try {
+    const result = await run(command, [...args, "--version"], env, DISCOVERY_TIMEOUT_MS);
+    if (result.timedOut) {
+      return { available: false, transient: true, diagnostic: "Antigravity CLI version check timed out" };
+    }
+    if (result.exitCode !== 0) {
+      return {
+        available: false,
+        transient: true,
+        diagnostic: diagnostic(
+          result.stderr.trim() ||
+            result.stdout.trim() ||
+            `agy --version exited with code ${result.exitCode ?? "unknown"}`,
+        ),
+      };
+    }
+    const version = result.stdout.trim();
+    if (!/^\d+\.\d+\.\d+$/.test(version)) {
+      return {
+        available: false,
+        diagnostic: "Could not read the Antigravity version. Update agy to 1.1.15 or later.",
+      };
+    }
+    const [major, minor, patch] = version.split(".").map(Number);
+    if (!(major > 1 || (major === 1 && (minor > 1 || (minor === 1 && patch >= 15))))) {
+      return {
+        available: false,
+        diagnostic: `Antigravity ${version} is unsupported. Update agy to 1.1.15 or later.`,
+      };
+    }
+    return { available: true, diagnostic: version };
+  } catch (error) {
+    return {
+      available: false,
+      transient: true,
+      diagnostic: diagnostic(error instanceof Error ? error.message : String(error)),
+    };
+  }
+}
+
+/**
+ * The daemon asks for status before every resume, command list and timeline
+ * fetch, and treats one failure as "provider unavailable". agy self-updates
+ * by swapping its binary in place, so a single failed check is re-run before
+ * it is reported.
+ */
+export async function checkAgyStatus(
+  command: string,
+  args: string[],
+  env: Record<string, string> | undefined,
+  options: { probe?: typeof probe; retryDelaysMs?: readonly number[] } = {},
+): Promise<StatusResult> {
+  const run = options.probe ?? probe;
+  const delays = options.retryDelaysMs ?? LAUNCH_RETRY_DELAYS_MS;
+  // A slow check already costs up to DISCOVERY_TIMEOUT_MS; don't stack many.
+  const deadline = Date.now() + DISCOVERY_TIMEOUT_MS + 10_000;
+  for (let i = 0; ; i += 1) {
+    const { transient, ...result } = await checkAgyVersionOnce(run, command, args, env);
+    if (result.available || !transient || i >= delays.length || Date.now() >= deadline) return result;
+    console.warn(
+      `[antigravity-resilient] agy --version check failed (${result.diagnostic}); re-checking in ${delays[i]}ms`,
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, delays[i]));
+  }
+}
+
 export const antigravityResilientProvider: ProviderDefinition = {
   id: PROVIDER_ID,
   label: "Antigravity (Resilient)",
@@ -72,59 +147,7 @@ export const antigravityResilientProvider: ProviderDefinition = {
           "agy not found on PATH. Install Antigravity, then run `agy` and sign in.",
       };
     }
-    const command = ctx.launch.command;
-    const args = ctx.launch.args;
-    const env = ctx.launch.env;
-    try {
-      const result = await probe(
-        command,
-        [...args, "--version"],
-        env,
-        DISCOVERY_TIMEOUT_MS,
-      );
-      if (result.timedOut) {
-        return {
-          available: false,
-          diagnostic: "Antigravity CLI version check timed out",
-        };
-      }
-      if (result.exitCode !== 0) {
-        return {
-          available: false,
-          diagnostic: diagnostic(
-            result.stderr.trim() ||
-              result.stdout.trim() ||
-              `agy --version exited with code ${result.exitCode ?? "unknown"}`,
-          ),
-        };
-      }
-      const version = result.stdout.trim();
-      const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
-      if (!match) {
-        return {
-          available: false,
-          diagnostic: "Could not read the Antigravity version. Update agy to 1.1.15 or later.",
-        };
-      }
-      const [, major, minor, patch] = match.map(Number);
-      if (!(major > 1 || (major === 1 && (minor > 1 || (minor === 1 && patch >= 15))))) {
-        return {
-          available: false,
-          diagnostic: `Antigravity ${version} is unsupported. Update agy to 1.1.15 or later.`,
-        };
-      }
-      return {
-        available: true,
-        diagnostic: version,
-      };
-    } catch (error) {
-      return {
-        available: false,
-        diagnostic: diagnostic(
-          error instanceof Error ? error.message : String(error),
-        ),
-      };
-    }
+    return checkAgyStatus(ctx.launch.command, ctx.launch.args, ctx.launch.env);
   },
 
   getCatalogCacheKey(ctx) {

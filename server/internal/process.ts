@@ -9,7 +9,51 @@ import {
   ProviderActionError,
 } from "./signals.ts";
 
+/**
+ * agy's updater renames the running `agy.EXE` aside and writes the new one in
+ * place. A launch that lands in that window fails with UNKNOWN/EBUSY/EPERM/
+ * EACCES (file locked mid-write) or ENOENT (not written yet); it succeeds a
+ * few seconds later, so these are retried rather than reported.
+ */
+const TRANSIENT_LAUNCH_CODES = new Set(["UNKNOWN", "EBUSY", "EPERM", "EACCES", "ETXTBSY", "EAGAIN", "ENOENT"]);
+export const LAUNCH_RETRY_DELAYS_MS = [1_000, 2_000, 4_000];
+
+export function isTransientLaunchError(error: unknown): boolean {
+  const err = error as NodeJS.ErrnoException | null;
+  if (!err || typeof err !== "object") return false;
+  const code = typeof err.code === "string" ? err.code : "";
+  const launch = (typeof err.syscall === "string" && err.syscall.startsWith("spawn")) ||
+    /^spawn\b/.test(String(err.message ?? ""));
+  return launch && TRANSIENT_LAUNCH_CODES.has(code);
+}
+
+/** Runs `attempt` again after each delay while it fails with `retryable`. */
+export async function withLaunchRetry<T>(
+  attempt: () => Promise<T>,
+  retryable: (error: unknown) => boolean,
+  delaysMs: readonly number[] = LAUNCH_RETRY_DELAYS_MS,
+  shouldStop: () => boolean = () => false,
+): Promise<T> {
+  for (let i = 0; ; i += 1) {
+    try {
+      return await attempt();
+    } catch (error) {
+      if (i >= delaysMs.length || shouldStop() || !retryable(error)) throw error;
+      console.warn(
+        `[antigravity-resilient] Antigravity CLI launch failed (${(error as Error)?.message ?? error}); retrying in ${delaysMs[i]}ms`,
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, delaysMs[i]));
+    }
+  }
+}
+
 export type DriverProcess = {
+  /**
+   * Null when the OS process already exists. Otherwise the launch failed and
+   * this rejects with the queued error; listeners must attach synchronously
+   * on success, so callers only await it in that case.
+   */
+  spawned: Promise<void> | null;
   onClose: (
     listener: (code: number | null, signal: string | null) => void,
   ) => void;
@@ -118,6 +162,16 @@ export function spawnDriver(input: {
     crlfDelay: Infinity,
   });
 
+  // Node assigns the pid synchronously on success; without one the launch
+  // failed and an 'error' event is already queued.
+  const spawned = child.pid !== undefined
+    ? null
+    : new Promise<void>((resolve, reject) => {
+      child.once("spawn", () => resolve());
+      child.once("error", reject);
+    });
+  spawned?.catch(() => undefined);
+
   const closeInterfaces = () => {
     stdoutInterface?.close();
     stderrInterface?.close();
@@ -137,6 +191,7 @@ export function spawnDriver(input: {
   };
 
   return {
+    spawned,
     sendLine(line) {
       return new Promise((resolve, reject) => {
         if (!child.stdin.writable || child.stdin.destroyed) {

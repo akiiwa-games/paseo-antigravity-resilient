@@ -14,7 +14,10 @@ import {
   type ProviderDiscovery,
 } from "./catalog.ts";
 import {
+  isTransientLaunchError,
+  LAUNCH_RETRY_DELAYS_MS,
   spawnDriver,
+  withLaunchRetry,
   type DriverProcess,
   type SpawnFunction,
 } from "./process.ts";
@@ -131,6 +134,7 @@ export type SessionOptions = {
   autoCompactTokenThreshold?: number;
   brainDir?: string;
   hotCacheTtlMs?: number;
+  launchRetryDelaysMs?: readonly number[];
   now?: () => number;
   spawn?: SpawnFunction;
   store?: ConversationStore;
@@ -346,6 +350,7 @@ export class Session {
   private readonly seenResultErrors = new Set<string>();
   private readonly reportedDenials = new Map<string, number>();
   private readonly spawnImpl?: SpawnFunction;
+  private readonly launchRetryDelaysMs: readonly number[];
   private readonly store: ConversationStore;
   private readonly streamInterruptRetryDelayMs: number;
   private systemPromptInjected = false;
@@ -383,6 +388,7 @@ export class Session {
     }
     this.mode = requestedMode;
     this.spawnImpl = options.spawn;
+    this.launchRetryDelaysMs = options.launchRetryDelaysMs ?? LAUNCH_RETRY_DELAYS_MS;
 
     const providerOpts = isRecord(config.providerOptions)
       ? config.providerOptions
@@ -1215,7 +1221,7 @@ export class Session {
       resolveInit = null;
     };
 
-    const driver = spawnDriver({
+    const launch = () => spawnDriver({
       command: this.command,
       args: this.buildDriverArgs(enableSlashCommands),
       cwd: this.config.cwd,
@@ -1225,6 +1231,30 @@ export class Session {
       },
       spawn: this.spawnImpl,
     });
+    // A healthy launch stays synchronous so no stdout line can arrive before
+    // the listeners below attach; only a failed one waits and retries.
+    let driver: DriverProcess;
+    try {
+      driver = launch();
+      if (driver.spawned) await driver.spawned;
+    } catch (error) {
+      const [firstDelay, ...laterDelays] = this.launchRetryDelaysMs;
+      if (firstDelay === undefined || !isTransientLaunchError(error)) throw error;
+      console.warn(
+        `[antigravity-resilient] Antigravity CLI launch failed (${(error as Error)?.message ?? error}); retrying in ${firstDelay}ms`,
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, firstDelay));
+      if (this.closed) return;
+      driver = await withLaunchRetry(async () => {
+        const candidate = launch();
+        if (candidate.spawned) await candidate.spawned;
+        return candidate;
+      }, isTransientLaunchError, laterDelays, () => this.closed);
+    }
+    if (this.closed) {
+      void driver.stop();
+      return;
+    }
     this.driver = driver;
     this.driverSlashCommandsEnabled = enableSlashCommands;
     this.driverStartupTimer = setTimeout(() => {

@@ -31,7 +31,7 @@ import {
   resolveContextWindowMaxTokens,
   type ProviderDiscovery,
 } from "../server/internal/catalog.ts";
-import type { SpawnFunction } from "../server/internal/process.ts";
+import { isTransientLaunchError, type SpawnFunction } from "../server/internal/process.ts";
 import {
   AUTOCOMPACT_THRASHING_MESSAGE,
   CONTEXT_OUTPUT_GUIDANCE,
@@ -60,7 +60,7 @@ import {
   isStreamInterruption,
   isTokenGap,
 } from "../server/internal/wire.ts";
-import { antigravityResilientProvider, PROVIDER_ID } from "../server/provider.ts";
+import { antigravityResilientProvider, checkAgyStatus, PROVIDER_ID } from "../server/provider.ts";
 import {
   beginBusinessTurn, beginCompact, emptyCompactionState, finishCompact, POST_COMPACT_SUMMARY_TOKENS,
 } from "../server/internal/compaction.ts";
@@ -2784,4 +2784,83 @@ test("publishes /goal and runs it on a slash-expanding driver while literal slas
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
   }
+});
+
+function launchError(code: string, async = false): NodeJS.ErrnoException {
+  const error = new Error(`spawn${async ? " agy" : ""} ${code}`) as NodeJS.ErrnoException;
+  error.code = code;
+  error.syscall = async ? "spawn agy" : "spawn";
+  return error;
+}
+
+test("retries a launch that lands in agy's self-update binary swap, sync or async", async () => {
+  assert.equal(isTransientLaunchError(launchError("UNKNOWN")), true);
+  assert.equal(isTransientLaunchError(launchError("ENOENT", true)), true);
+  assert.equal(isTransientLaunchError(Object.assign(new Error("boom"), { code: "UNKNOWN" })), false);
+  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-launch-"));
+  try {
+    const events: ProviderEvent[] = [];
+    let attempts = 0;
+    const spawn: SpawnFunction = (_cmd, args) => {
+      attempts += 1;
+      if (attempts === 1) throw launchError("UNKNOWN");
+      const child = new FakeChildProcess(args, (_prompt, proc) => {
+        sendCompletedResponse(proc, "conv-launch", "OK");
+        proc.sendFrame({ event: "result", conversation_id: "conv-launch", status: "success", response: "OK" });
+      });
+      if (attempts === 2) {
+        // Node reports ENOENT/EACCES asynchronously and never assigns a pid.
+        (child as { pid?: number }).pid = undefined;
+        queueMicrotask(() => child.emit("error", launchError("ENOENT", true)));
+      } else {
+        setTimeout(() => child.sendFrame({ event: "init", conversation_id: "conv-launch" }), 5);
+      }
+      return child as unknown as ReturnType<SpawnFunction>;
+    };
+    const session = new Session("sess-launch", "agy", [], {}, makeConfig(), undefined, TEST_CATALOG,
+      (event) => events.push(event), { spawn, storeDir: tempDir, brainDir: tempDir, launchRetryDelaysMs: [1, 1, 1] });
+    session.open("open", [], "skip");
+    await session.prompt(userPrompt("HELLO"));
+    const end = await waitForTurnEnd(events);
+    assert.equal(end.state, "completed");
+    assert.equal(attempts, 3);
+    await session.dispose();
+
+    const failing = new Session("sess-launch-fail", "agy", [], {}, makeConfig(), undefined, TEST_CATALOG,
+      (event) => events.push(event), {
+        spawn: () => { throw launchError("EBUSY"); }, storeDir: tempDir, brainDir: tempDir, launchRetryDelaysMs: [1],
+      });
+    events.length = 0;
+    failing.open("open", [], "skip");
+    await failing.prompt(userPrompt("HELLO", "m-2"));
+    assert.equal((await waitForTurnEnd(events)).state, "failed", "persistent launch failures still fail the turn");
+    await failing.dispose();
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("availability re-checks transient agy --version failures but not unsupported or unreadable versions", async () => {
+  const outcomes = [
+    { exitCode: 1, stdout: "", stderr: "spawn UNKNOWN" },
+    { exitCode: null, stdout: "", stderr: "", timedOut: true },
+    { exitCode: 0, stdout: "1.5.3\n", stderr: "" },
+  ];
+  let calls = 0;
+  const flaky = async () => outcomes[calls++]!;
+  const status = await checkAgyStatus("agy", [], undefined, { probe: flaky, retryDelaysMs: [1, 1, 1] });
+  assert.deepEqual(status, { available: true, diagnostic: "1.5.3" });
+  assert.equal(calls, 3);
+
+  calls = 0;
+  const old = async () => { calls += 1; return { exitCode: 0, stdout: "1.1.2\n", stderr: "" }; };
+  const unsupported = await checkAgyStatus("agy", [], undefined, { probe: old, retryDelaysMs: [1, 1, 1] });
+  assert.equal(unsupported.available, false);
+  assert.equal(calls, 1, "an unsupported version is final");
+
+  calls = 0;
+  const down = async () => { calls += 1; return { exitCode: 1, stdout: "", stderr: "broken" }; };
+  const gone = await checkAgyStatus("agy", [], undefined, { probe: down, retryDelaysMs: [1, 1] });
+  assert.deepEqual(gone, { available: false, diagnostic: "broken" });
+  assert.equal(calls, 3);
 });
