@@ -356,6 +356,85 @@ test("failed probes retry on a short backoff that changes the key, and only the 
   assert.ok(((await read()) as ProviderDiscovery).models.every((model) => model.metadata?.catalogStale === true));
 });
 
+test("one outage seen by concurrent refreshes and the daemon is one probe and one strike", async () => {
+  const env = { AGY_TEST: "concurrent" };
+  const t0 = Date.UTC(2026, 10, 9, 12, 0, 0);
+  const minute = 60_000;
+  let clock = t0;
+  let healthy = true;
+  let probes = 0;
+  const probeImpl = async () => {
+    probes += 1;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    return healthy
+      ? { exitCode: 0, stdout: MODELS_WITH_ARGON, stderr: "" }
+      : { exitCode: 1, stdout: "", stderr: "authentication failed or timed out" };
+  };
+  const catalog = holder(await getCatalog(undefined, "agy", [], env, { probeImpl, now: () => clock }));
+  const availability = createModelAvailability(undefined, "agy", [], env, catalog, {
+    probeImpl,
+    retryDelayMs: 1,
+    now: () => clock,
+  });
+
+  healthy = false;
+  clock = t0 + 5 * minute;
+  probes = 0;
+  availability.rejected("gemini-4-argon-high");
+  availability.rejected("gemini-4-argon-high");
+  const daemon = await getCatalog(undefined, "agy", [], env, {
+    fallbackCatalog: catalog.get(),
+    probeImpl,
+    retryDelayMs: 1,
+    now: () => clock,
+  });
+  assert.equal(probes, 1, "concurrent callers share one agy models run");
+  assert.deepEqual(daemon.models.map((model) => model.id), ["gemini-3.8-flash-high", "claude-opus-5-5-high"]);
+  assert.ok(daemon.models.every((model) => model.metadata?.catalogStale === true));
+
+  // One strike: the retry is 2 minutes out, not 8.
+  const key = getCatalogCacheKey("agy", [], env, t0 + 5 * minute + 30_000);
+  assert.equal(getCatalogCacheKey("agy", [], env, t0 + 6 * minute + 59_000), key);
+  assert.ok(getCatalogCacheKey("agy", [], env, t0 + 7 * minute) !== key);
+});
+
+test("a timed-out withdrawal check does not count toward agy being unavailable", async () => {
+  const env = { AGY_TEST: "confirm-timeout" };
+  const t0 = Date.UTC(2026, 10, 9, 12, 0, 0);
+  const minute = 60_000;
+  let clock = t0;
+  let down = false;
+  // Healthy but slow: past the 20 s confirmation deadline, within the 90 s discovery allowance.
+  const probeImpl = async (_command: string, _args: string[], _env?: Record<string, string>, timeoutMs = 0) => {
+    if (down) return { exitCode: 1, stdout: "", stderr: "authentication failed or timed out" };
+    if (timeoutMs < 35_000) return { exitCode: null, stdout: "", stderr: "", timedOut: true };
+    return { exitCode: 0, stdout: MODELS_WITH_ARGON, stderr: "" };
+  };
+  const catalog = holder(await getCatalog(undefined, "agy", [], env, { probeImpl, now: () => clock }));
+  const availability = createModelAvailability(undefined, "agy", [], env, catalog, {
+    probeImpl,
+    retryDelayMs: 1,
+    now: () => clock,
+  });
+
+  clock = t0 + 5 * minute;
+  assert.equal(await availability.confirmMissing("gemini-4-argon-high"), null);
+  clock = t0 + 5 * minute + 30_000;
+  assert.equal(await availability.confirmMissing("gemini-4-argon-high"), null);
+  const key = getCatalogCacheKey("agy", [], env, clock);
+  assert.equal(getCatalogCacheKey("agy", [], env, t0 + 20 * minute), key, "no retry was scheduled");
+
+  // agy's first real failure is strike one: stale, not reported.
+  down = true;
+  const listed = await getCatalog(undefined, "agy", [], env, {
+    fallbackCatalog: catalog.get(),
+    probeImpl,
+    retryDelayMs: 1,
+    now: () => t0 + 20 * minute,
+  });
+  assert.ok(listed.models.every((model) => model.metadata?.catalogStale === true));
+});
+
 test("a sign-in prompt is reported at once and schedules no retry", async () => {
   const env = { AGY_TEST: "sign-in" };
   const t0 = Date.UTC(2026, 10, 9, 12, 0, 0);

@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
 import path from "node:path";
 import { probe } from "./process.ts";
-import { isAbortError, ProviderActionError } from "./signals.ts";
+import { createAbortError, ProviderActionError } from "./signals.ts";
 import { diagnostic } from "./wire.ts";
 
 export type ProviderDiscovery = ProviderCatalog;
@@ -124,6 +124,8 @@ type CatalogState = {
   failures: number;
   /** When the next retry of a failed probe is due, if one is pending. */
   retryAt: number | null;
+  /** The `agy models` run in progress, per probe timeout. */
+  inflight: Map<number, Promise<DiscoveryOutcome>>;
 };
 
 const catalogStates = new Map<string, CatalogState>();
@@ -131,7 +133,7 @@ const catalogStates = new Map<string, CatalogState>();
 function catalogState(identity: string): CatalogState {
   let state = catalogStates.get(identity);
   if (!state) {
-    state = { generation: 0, rejected: new Set(), lastGood: null, failures: 0, retryAt: null };
+    state = { generation: 0, rejected: new Set(), lastGood: null, failures: 0, retryAt: null, inflight: new Map() };
     catalogStates.set(identity, state);
   }
   return state;
@@ -393,6 +395,12 @@ export type GetCatalogOptions = {
   /** When false, a failed probe throws instead of serving a stale catalogue. */
   allowStale?: boolean;
   bypassCache?: boolean;
+  /**
+   * When false, a timed-out probe is not counted toward agy being
+   * unavailable: a short-deadline check that times out says nothing about
+   * agy within its normal discovery allowance.
+   */
+  countTimeouts?: boolean;
   fallbackCatalog?: ProviderDiscovery | null;
   now?: () => number;
   probeImpl?: typeof probe;
@@ -416,10 +424,6 @@ export async function getCatalog(
     return withWindows(excludeModels(cached, state.rejected));
   }
 
-  const probeFn = options.probeImpl ?? probe;
-  const timeoutMs = options.probeTimeoutMs ?? MODEL_DISCOVERY_TIMEOUT_MS;
-  const retryDelayMs = options.retryDelayMs ?? DISCOVERY_RETRY_DELAY_MS;
-  const signal = options.signal;
   const fallbackSource =
     options.allowStale === false
       ? null
@@ -431,48 +435,95 @@ export async function getCatalog(
     ? markStale(excludeModels(fallbackSource, state.rejected))
     : null;
 
-  /**
-   * The daemon keeps a failed fetch under its catalogue key and never retries
-   * that key, so a failure schedules a retry (which changes the key) and,
-   * below the threshold, serves the last good catalogue marked stale.
-   */
-  const failed = (error: ProviderActionError): ProviderDiscovery => {
-    state.failures += 1;
-    state.retryAt = now() + catalogRetryDelayMs(state.failures);
-    if (fallback && state.failures < CATALOG_FAILURES_BEFORE_UNAVAILABLE) {
-      console.warn(
-        `[antigravity-resilient] Model discovery failed (${state.failures}/${CATALOG_FAILURES_BEFORE_UNAVAILABLE}: ${error.message}); using last valid cached catalog, retrying in ${catalogRetryDelayMs(state.failures) / 1000}s`,
-      );
-      return withWindows(fallback);
+  const outcome = await untilAborted(
+    discover(state, {
+      probeFn: options.probeImpl ?? probe,
+      command,
+      args,
+      env,
+      timeoutMs: options.probeTimeoutMs ?? MODEL_DISCOVERY_TIMEOUT_MS,
+      retryDelayMs: options.retryDelayMs ?? DISCOVERY_RETRY_DELAY_MS,
+      now,
+      countTimeouts: options.countTimeouts ?? true,
+    }),
+    options.signal,
+  );
+  if ("catalog" in outcome) {
+    if (host) {
+      await host.writeCatalogCache(cacheKey, outcome.catalog);
     }
-    throw error;
+    return outcome.catalog;
+  }
+  // Signing in needs the user, so it is reported at once and not retried.
+  if (!outcome.reportNow && fallback && state.failures < CATALOG_FAILURES_BEFORE_UNAVAILABLE) {
+    console.warn(
+      `[antigravity-resilient] Model discovery failed (${state.failures}/${CATALOG_FAILURES_BEFORE_UNAVAILABLE}: ${outcome.error.message}); using last valid cached catalog`,
+    );
+    return withWindows(fallback);
+  }
+  throw outcome.error;
+}
+
+type DiscoveryOutcome =
+  | { catalog: ProviderDiscovery }
+  | { error: ProviderActionError; reportNow?: boolean };
+
+type DiscoverInput = {
+  probeFn: typeof probe;
+  command: string;
+  args: string[];
+  env?: Record<string, string>;
+  timeoutMs: number;
+  retryDelayMs: number;
+  now: () => number;
+  countTimeouts: boolean;
+};
+
+/**
+ * One `agy models` run per launch identity and timeout, shared by every
+ * concurrent caller (the daemon's catalog request, sessions' refreshes after
+ * a rejection, `validateSelection`), so one outage is one probe and one
+ * failure. Not tied to any caller's abort signal: other callers still wait
+ * on it.
+ */
+function discover(state: CatalogState, input: DiscoverInput): Promise<DiscoveryOutcome> {
+  const existing = state.inflight.get(input.timeoutMs);
+  if (existing) return existing;
+  const flight = runDiscovery(state, input).finally(() => {
+    state.inflight.delete(input.timeoutMs);
+  });
+  state.inflight.set(input.timeoutMs, flight);
+  return flight;
+}
+
+async function runDiscovery(state: CatalogState, input: DiscoverInput): Promise<DiscoveryOutcome> {
+  const { probeFn, command, args, env, timeoutMs, retryDelayMs, now } = input;
+  /**
+   * Failures count retry rounds, not probes: while a scheduled retry is still
+   * pending, another failure neither counts nor pushes the retry back. The
+   * daemon keeps a failed fetch under its catalogue key and never retries
+   * that key, so the scheduled retry is what changes the key.
+   */
+  const failed = (error: ProviderActionError, counts = true): DiscoveryOutcome => {
+    const retryPending = state.retryAt !== null && now() < state.retryAt;
+    if (counts && !retryPending) {
+      state.failures += 1;
+      state.retryAt = now() + catalogRetryDelayMs(state.failures);
+    }
+    return { error };
   };
 
   let result: Awaited<ReturnType<typeof probe>>;
   try {
-    result = await probeFn(
-      command,
-      [...args, "models"],
-      env,
-      timeoutMs,
-      signal,
-    );
-
-    if (result.exitCode !== 0 && isTransientDiscoveryFailure(result) && !signal?.aborted) {
+    result = await probeFn(command, [...args, "models"], env, timeoutMs);
+    if (result.exitCode !== 0 && isTransientDiscoveryFailure(result)) {
       console.warn(
         `[antigravity-resilient] Model discovery failed transiently (${result.timedOut ? "timeout" : `exit=${result.exitCode}`}); retrying once in ${retryDelayMs}ms`,
       );
-      await sleep(retryDelayMs, signal);
-      result = await probeFn(
-        command,
-        [...args, "models"],
-        env,
-        timeoutMs,
-        signal,
-      );
+      await sleep(retryDelayMs);
+      result = await probeFn(command, [...args, "models"], env, timeoutMs);
     }
   } catch (error) {
-    if (isAbortError(error)) throw error;
     // e.g. BINARY_NOT_FOUND while agy swaps its binary during a self-update.
     return failed(
       error instanceof ProviderActionError
@@ -482,7 +533,10 @@ export async function getCatalog(
   }
 
   if (result.timedOut) {
-    return failed(new ProviderActionError("PROBE_TIMEOUT", "Antigravity discovery timed out"));
+    return failed(
+      new ProviderActionError("PROBE_TIMEOUT", "Antigravity discovery timed out"),
+      input.countTimeouts,
+    );
   }
 
   if (result.exitCode !== 0) {
@@ -492,8 +546,7 @@ export async function getCatalog(
         `agy models exited with code ${result.exitCode ?? "unknown"}`,
     );
     const error = new ProviderActionError("DISCOVERY_FAILED", detail, detail);
-    // Signing in needs the user, so it is reported at once and not retried.
-    if (isSignInRequired(result)) throw error;
+    if (isSignInRequired(result)) return { error, reportNow: true };
     return failed(error);
   }
 
@@ -514,12 +567,33 @@ export async function getCatalog(
   // `agy models` is authoritative: a model it lists again is usable again.
   state.rejected.clear();
   state.lastGood = catalog;
+  // The daemon may hold a stale list or the error under the current key, and
+  // clearing the retry would leave it there: change the key instead.
+  if (state.failures > 0 || state.retryAt !== null) {
+    state.generation += 1;
+  }
   state.failures = 0;
   state.retryAt = null;
-  if (host) {
-    await host.writeCatalogCache(cacheKey, catalog);
-  }
-  return catalog;
+  return { catalog };
+}
+
+function untilAborted<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(createAbortError());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(createAbortError());
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 /** How a session reports agy refusing its model back to the catalogue. */
@@ -542,7 +616,7 @@ export function createModelAvailability(
     get(): ProviderDiscovery | null;
     set(next: ProviderDiscovery): void;
   },
-  options: Pick<GetCatalogOptions, "probeImpl" | "retryDelayMs"> = {},
+  options: Pick<GetCatalogOptions, "now" | "probeImpl" | "retryDelayMs"> = {},
 ): ModelAvailability {
   const refresh = (
     extra: GetCatalogOptions,
@@ -572,7 +646,8 @@ export function createModelAvailability(
     async confirmMissing(model) {
       let fresh: ProviderDiscovery;
       try {
-        fresh = await refresh({ allowStale: false, probeTimeoutMs: DISCOVERY_TIMEOUT_MS });
+        // Confirms a withdrawal; it does not judge whether agy is available.
+        fresh = await refresh({ allowStale: false, countTimeouts: false, probeTimeoutMs: DISCOVERY_TIMEOUT_MS });
       } catch {
         return null;
       }
