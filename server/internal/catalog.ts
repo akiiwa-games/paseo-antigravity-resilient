@@ -20,6 +20,11 @@ export const DISCOVERY_TIMEOUT_MS = 20_000;
 // it the same startup allowance as a conversation, while --version stays fast.
 export const MODEL_DISCOVERY_TIMEOUT_MS = 90_000;
 export const DISCOVERY_RETRY_DELAY_MS = 1_500;
+// agy's model list is server-driven and changes without a binary update (a
+// model can be withdrawn and restored the same day), so a catalogue is only
+// trusted this long. The daemon keeps its own copy per catalogue key and
+// re-reads the key on every warm-up, so the key carries the TTL window.
+export const CATALOG_TTL_MS = 30 * 60_000;
 
 export const SUPPORTED_CAPABILITIES: ProviderCapability[] = [
   "prompt.message",
@@ -74,7 +79,7 @@ export function resolveCommandFingerprint(
   return command;
 }
 
-export function getCatalogCacheKey(
+function launchIdentity(
   command: string,
   args: string[],
   env?: Record<string, string>,
@@ -93,6 +98,133 @@ export function getCatalogCacheKey(
       ]),
     )
     .digest("hex");
+}
+
+type CatalogState = {
+  /** Bumped whenever agy rejects a model the catalogue still listed. */
+  generation: number;
+  /** Models agy rejected since the last successful `agy models`. */
+  rejected: Set<string>;
+  lastGood: ProviderDiscovery | null;
+};
+
+const catalogStates = new Map<string, CatalogState>();
+
+function catalogState(identity: string): CatalogState {
+  let state = catalogStates.get(identity);
+  if (!state) {
+    state = { generation: 0, rejected: new Set(), lastGood: null };
+    catalogStates.set(identity, state);
+  }
+  return state;
+}
+
+/**
+ * Changes when the agy binary changes, when the TTL window rolls over, and
+ * when a model is invalidated, so neither the daemon's catalogue nor the host
+ * cache outlives what agy currently offers.
+ */
+export function getCatalogCacheKey(
+  command: string,
+  args: string[],
+  env?: Record<string, string>,
+  now: number = Date.now(),
+): string {
+  const identity = launchIdentity(command, args, env);
+  const { generation } = catalogState(identity);
+  return createHash("sha256")
+    .update(JSON.stringify([identity, Math.floor(now / CATALOG_TTL_MS), generation]))
+    .digest("hex");
+}
+
+/**
+ * Records that agy refused `model`: the next catalogue key differs, and any
+ * fallback catalogue omits the model until `agy models` lists it again.
+ */
+export function invalidateModel(
+  command: string,
+  args: string[],
+  env: Record<string, string> | undefined,
+  model: string,
+): void {
+  const state = catalogState(launchIdentity(command, args, env));
+  state.generation += 1;
+  state.rejected.add(model);
+}
+
+/** Drops `models` from a catalogue, moving the default if it was dropped. */
+export function excludeModels(
+  catalog: ProviderDiscovery,
+  models: Iterable<string>,
+): ProviderDiscovery {
+  const drop = new Set(models);
+  if (!catalog.models.some((model) => drop.has(model.id))) {
+    return catalog;
+  }
+  const kept = catalog.models.filter((model) => !drop.has(model.id));
+  const defaultModel =
+    catalog.defaultModel && !drop.has(catalog.defaultModel)
+      ? catalog.defaultModel
+      : kept[0]?.id;
+  return {
+    ...catalog,
+    models: kept.map((model) => ({ ...model, isDefault: model.id === defaultModel })),
+    defaultModel,
+  };
+}
+
+/** Marks a catalogue served after `agy models` failed as possibly outdated. */
+function markStale(catalog: ProviderDiscovery): ProviderDiscovery {
+  return {
+    ...catalog,
+    models: catalog.models.map((model) => ({
+      ...model,
+      metadata: { ...model.metadata, catalogStale: true },
+    })),
+  };
+}
+
+/**
+ * agy rejects an unknown `--model` before starting a conversation and exits
+ * with code 1. The turn error recorded by the daemon in the 2026-11-09
+ * incident (agy 1.1.x) was, verbatim:
+ *
+ *   invalid model selection (--model "gemini-4-argon-high" --effort ""): model gemini-4-argon-high is not recognized as a known model or custom model in settings
+ *   Available models:
+ *     Gemini 3.8 Flash (High)
+ *     ...
+ *
+ * The indentation survived, so it arrived as one failed-result error string
+ * (the stderr path trims each line); stderr is parsed the same way in case a
+ * build prints it there. The list holds display labels, not ids. Returns
+ * null for any other text.
+ */
+export function parseInvalidModelSelection(
+  text: string,
+): { model: string; available: string[] } | null {
+  const match =
+    /invalid model selection \(--model "([^"]*)"[^)]*\): model (\S+) is not recognized as a known model/u.exec(
+      text,
+    );
+  if (!match) {
+    return null;
+  }
+  const available: string[] = [];
+  const listStart = text.indexOf("Available models:", match.index);
+  if (listStart >= 0) {
+    const lines = text.slice(listStart).split(/\r?\n/u).slice(1);
+    const indented = /^\s/u.test(lines[0] ?? "");
+    for (const line of lines) {
+      if (!line.trim() || (indented && !/^\s/u.test(line)) || /:\s*$/u.test(line)) break;
+      available.push(line.trim());
+    }
+  }
+  return { model: match[1] || match[2], available };
+}
+
+/** gRPC NOT_FOUND as agy reports it in a failed result. */
+export function isNotFoundError(text: string): boolean {
+  return /\bNOT_FOUND \(code 404\)/u.test(text);
 }
 
 /**
@@ -215,6 +347,8 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 export type GetCatalogOptions = {
+  /** When false, a failed probe throws instead of serving a stale catalogue. */
+  allowStale?: boolean;
   bypassCache?: boolean;
   fallbackCatalog?: ProviderDiscovery | null;
   probeImpl?: typeof probe;
@@ -230,20 +364,27 @@ export async function getCatalog(
   env?: Record<string, string>,
   options: GetCatalogOptions = {},
 ): Promise<ProviderDiscovery> {
+  const state = catalogState(launchIdentity(command, args, env));
   const cacheKey = getCatalogCacheKey(command, args, env);
   const cached = host ? await host.readCatalogCache(cacheKey) : null;
   if (!options.bypassCache && cached && cached.models.length > 0) {
-    return withWindows(cached);
+    return withWindows(excludeModels(cached, state.rejected));
   }
 
   const probeFn = options.probeImpl ?? probe;
   const timeoutMs = options.probeTimeoutMs ?? MODEL_DISCOVERY_TIMEOUT_MS;
   const retryDelayMs = options.retryDelayMs ?? DISCOVERY_RETRY_DELAY_MS;
   const signal = options.signal;
-  const fallback =
-    (options.fallbackCatalog && options.fallbackCatalog.models.length > 0
-      ? options.fallbackCatalog
-      : null) ?? (cached && cached.models.length > 0 ? cached : null);
+  const fallbackSource =
+    options.allowStale === false
+      ? null
+      : [options.fallbackCatalog, cached, state.lastGood].find(
+          (candidate): candidate is ProviderDiscovery =>
+            Boolean(candidate && candidate.models.length > 0),
+        ) ?? null;
+  const fallback = fallbackSource
+    ? markStale(excludeModels(fallbackSource, state.rejected))
+    : null;
 
   let result = await probeFn(
     command,
@@ -313,10 +454,75 @@ export async function getCatalog(
     defaultModel: models[0]?.id,
     defaultMode: DEFAULT_MODE,
   };
+  // `agy models` is authoritative: a model it lists again is usable again.
+  state.rejected.clear();
+  state.lastGood = catalog;
   if (host) {
     await host.writeCatalogCache(cacheKey, catalog);
   }
   return catalog;
+}
+
+/** How a session reports agy refusing its model back to the catalogue. */
+export type ModelAvailability = {
+  /** agy refused `model` outright: drop it now and re-probe in the background. */
+  rejected(model: string): void;
+  /**
+   * Re-probes `agy models`. Returns the fresh catalogue when it no longer
+   * lists `model`, or null when it still does or the probe failed.
+   */
+  confirmMissing(model: string): Promise<ProviderDiscovery | null>;
+};
+
+export function createModelAvailability(
+  host: ProviderHost | undefined,
+  command: string,
+  args: string[],
+  env: Record<string, string> | undefined,
+  catalog: {
+    get(): ProviderDiscovery | null;
+    set(next: ProviderDiscovery): void;
+  },
+  options: Pick<GetCatalogOptions, "probeImpl" | "retryDelayMs"> = {},
+): ModelAvailability {
+  const refresh = (
+    extra: GetCatalogOptions,
+  ): Promise<ProviderDiscovery> =>
+    getCatalog(host, command, args, env, {
+      ...options,
+      bypassCache: true,
+      fallbackCatalog: catalog.get(),
+      ...extra,
+    });
+  return {
+    rejected(model) {
+      invalidateModel(command, args, env, model);
+      const current = catalog.get();
+      if (current) catalog.set(excludeModels(current, [model]));
+      void refresh({}).then(
+        (next) => catalog.set(next),
+        (error: unknown) => {
+          console.warn(
+            `[antigravity-resilient] Model list refresh after agy rejected ${model} failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        },
+      );
+    },
+    async confirmMissing(model) {
+      let fresh: ProviderDiscovery;
+      try {
+        fresh = await refresh({ allowStale: false, probeTimeoutMs: DISCOVERY_TIMEOUT_MS });
+      } catch {
+        return null;
+      }
+      catalog.set(fresh);
+      if (fresh.models.some((entry) => entry.id === model)) return null;
+      invalidateModel(command, args, env, model);
+      return fresh;
+    },
+  };
 }
 
 function withWindows(catalog: ProviderDiscovery): ProviderDiscovery {

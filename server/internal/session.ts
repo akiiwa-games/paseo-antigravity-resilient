@@ -9,8 +9,12 @@ import type {
 } from "@getpaseo/plugin/server/provider";
 import {
   DEFAULT_MODE,
+  excludeModels,
+  isNotFoundError,
   MODES,
+  parseInvalidModelSelection,
   resolveContextWindowMaxTokens,
+  type ModelAvailability,
   type ProviderDiscovery,
 } from "./catalog.ts";
 import {
@@ -135,6 +139,7 @@ export type SessionOptions = {
   brainDir?: string;
   hotCacheTtlMs?: number;
   launchRetryDelaysMs?: readonly number[];
+  modelAvailability?: ModelAvailability;
   now?: () => number;
   spawn?: SpawnFunction;
   store?: ConversationStore;
@@ -310,7 +315,10 @@ export class Session {
   private readonly baseArgs: string[];
   private readonly baseEnv: Record<string, string> | undefined;
   private readonly config: ProviderSessionConfig;
-  private readonly catalog: ProviderDiscovery;
+  private catalog: ProviderDiscovery;
+  private readonly modelAvailability?: ModelAvailability;
+  /** Turn whose NOT_FOUND is being checked against `agy models`. */
+  private modelCheckTurn: ActiveTurn | null = null;
   private readonly emit: (event: ProviderEvent) => void;
   private readonly autoCompactEnabled: boolean;
   private readonly autoCompactLeadMs: number;
@@ -388,6 +396,7 @@ export class Session {
     }
     this.mode = requestedMode;
     this.spawnImpl = options.spawn;
+    this.modelAvailability = options.modelAvailability;
     this.launchRetryDelaysMs = options.launchRetryDelaysMs ?? LAUNCH_RETRY_DELAYS_MS;
 
     const providerOpts = isRecord(config.providerOptions)
@@ -1339,8 +1348,15 @@ export class Session {
       }
       this.driver = null;
       this.driverResolve?.();
+      // agy exits (code 3) right after a NOT_FOUND result; the check decides.
+      if (this.turn && this.turn === this.modelCheckTurn) return;
       if (this.turn && !this.closed) {
         const stderr = this.turn.stderr.join("\n").trim();
+        if (this.failRejectedModel(stderr)) return;
+        if (isNotFoundError(stderr) && this.model && this.modelAvailability) {
+          void this.failNotFound(this.turn, this.model, stderr);
+          return;
+        }
         const reason =
           stderr ||
           `Antigravity CLI exited unexpectedly (${
@@ -2135,6 +2151,11 @@ export class Session {
           this.endTurn("canceled", diagnostic(rawError));
           return false;
         }
+        if (this.failRejectedModel(rawError)) return false;
+        if (isNotFoundError(rawError) && this.model && this.modelAvailability) {
+          void this.failNotFound(turn, this.model, rawError);
+          return false;
+        }
         this.failTurn(diagnostic(rawError));
         return false;
     }
@@ -2325,7 +2346,11 @@ export class Session {
 
   /** Detaches the active turn, settles its compaction, persists, and reports
    * the outcome to the client. Background compacts never emit `session.turn`. */
-  private endTurn(outcome: "completed" | "failed" | "canceled", message?: string): ActiveTurn | null {
+  private endTurn(
+    outcome: "completed" | "failed" | "canceled",
+    message?: string,
+    detail?: { code: string; diagnostic?: string },
+  ): ActiveTurn | null {
     const turn = this.turn;
     if (!turn) return null;
     this.stopNativeReasoning();
@@ -2340,7 +2365,7 @@ export class Session {
         sessionId: this.sessionId,
         turnId: turn.id,
         state: outcome,
-        ...(message !== undefined ? { error: { message } } : {}),
+        ...(message !== undefined ? { error: { message, ...detail } } : {}),
       });
     }
     return turn;
@@ -2366,8 +2391,63 @@ export class Session {
     this.scheduleAutoCompactIfNeeded();
   }
 
-  private failTurn(message: string): void {
-    const turn = this.endTurn("failed", message);
+  /**
+   * agy refusing `--model` is a structured "model unavailable", not a crash:
+   * the turn fails with INVALID_MODEL (never retried) and the catalogue drops
+   * the model. Returns false when `text` is not that refusal.
+   */
+  private failRejectedModel(text: string): boolean {
+    const rejection = parseInvalidModelSelection(text);
+    if (!rejection) return false;
+    this.modelAvailability?.rejected(rejection.model);
+    const before = this.catalog;
+    this.catalog = excludeModels(this.catalog, [rejection.model]);
+    // agy lists display labels; report ids where the catalogue knows them.
+    const available = rejection.available.map(
+      (label) => before.models.find((model) => model.label === label)?.id ?? label,
+    );
+    this.failInvalidModel(rejection.model, available, text);
+    return true;
+  }
+
+  /**
+   * NOT_FOUND is gRPC's generic "entity missing", so on its own it does not
+   * prove the model was withdrawn. It becomes INVALID_MODEL only when a fresh
+   * `agy models` no longer lists the model; otherwise it fails as before.
+   */
+  private async failNotFound(turn: ActiveTurn, model: string, rawError: string): Promise<void> {
+    let current: ProviderDiscovery | null = null;
+    this.modelCheckTurn = turn;
+    try {
+      current = (await this.modelAvailability?.confirmMissing(model)) ?? null;
+    } catch {
+      current = null;
+    } finally {
+      if (this.modelCheckTurn === turn) this.modelCheckTurn = null;
+    }
+    if (this.turn !== turn || this.closed) return;
+    if (!current) {
+      this.failTurn(diagnostic(rawError));
+      return;
+    }
+    this.catalog = current;
+    this.failInvalidModel(model, current.models.map((entry) => entry.id), rawError);
+  }
+
+  private failInvalidModel(model: string, available: string[], rawError: string): void {
+    const error = new ProviderActionError(
+      "INVALID_MODEL",
+      `Antigravity does not offer model ${model} right now.${
+        available.length > 0 ? ` Available models: ${available.join(", ")}` : ""
+      }`,
+      diagnostic(rawError),
+    );
+    this.failTurn(error.message, { code: error.code, diagnostic: error.diagnostic });
+    this.emitConfig();
+  }
+
+  private failTurn(message: string, detail?: { code: string; diagnostic?: string }): void {
+    const turn = this.endTurn("failed", message, detail);
     if (!turn || isForegroundTurn(turn)) return;
     if (this.compaction.consecutiveCompactFailures >= MAX_CONSECUTIVE_COMPACT_FAILURES) {
       console.warn(

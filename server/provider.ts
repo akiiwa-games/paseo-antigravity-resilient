@@ -8,6 +8,7 @@ import {
   type ProviderInput,
 } from "@getpaseo/plugin/server/provider";
 import {
+  createModelAvailability,
   DEFAULT_MODE,
   DISCOVERY_TIMEOUT_MS,
   getCatalog,
@@ -194,6 +195,12 @@ export const antigravityResilientProvider: ProviderDefinition = {
     }
     let discovered: ProviderDiscovery | null = null;
     let closed = false;
+    const modelAvailability = createModelAvailability(ctx.host, command, args, env, {
+      get: () => discovered,
+      set: (next) => {
+        if (!closed) discovered = next;
+      },
+    });
 
     const emit = (event: ProviderEvent): void => {
       if (closed) {
@@ -312,6 +319,7 @@ export const antigravityResilientProvider: ProviderDefinition = {
                 input.persistence,
                 discovered,
                 emit,
+                { modelAvailability },
               );
               sessions.set(input.sessionId, session);
               session.open(
