@@ -7,6 +7,8 @@ import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import type { ProviderEvent } from "@getpaseo/plugin/server/provider";
 import {
+  CATALOG_FAILURES_BEFORE_UNAVAILABLE,
+  CATALOG_RETRY_BASE_MS,
   createModelAvailability,
   DEFAULT_MODE,
   getCatalog,
@@ -17,6 +19,7 @@ import {
 } from "../server/internal/catalog.ts";
 import type { SpawnFunction } from "../server/internal/process.ts";
 import { Session } from "../server/internal/session.ts";
+import { ProviderActionError } from "../server/internal/signals.ts";
 
 // Verbatim from the 2026-11-09 daemon log (agy's stderr, exit code 1).
 const AGY_INVALID_MODEL = [
@@ -133,16 +136,24 @@ for (const via of ["result", "stderr"] as const) test(`agy refusing the model ($
       launches += 1;
       const child = new FakeChild();
       queueMicrotask(() => {
+        // Real agy (upstream fixture model-switch-invalid.*, agy 1.2.13): a
+        // nested ERROR result on stdout, the same text on stderr prefixed
+        // "error: ", then exit 1 without an init frame.
         if (via === "result") {
-          // The incident's shape: one multi-line error string, indentation intact.
           child.stdout.write(`${JSON.stringify({
             event: "result",
-            status: "error",
-            errors: [AGY_INVALID_MODEL.join("\n")],
+            result: {
+              conversation_id: "",
+              status: "ERROR",
+              response: "",
+              error: AGY_INVALID_MODEL.join("\n"),
+              duration_seconds: 0,
+              num_turns: 0,
+              usage: { input_tokens: 0, output_tokens: 0, thinking_tokens: 0, cache_read_tokens: 0, total_tokens: 0 },
+            },
           })}\n`);
-        } else {
-          child.stderr.write(`${AGY_INVALID_MODEL.join("\n")}\n`);
         }
+        child.stderr.write(`error: ${AGY_INVALID_MODEL.join("\n")}\n`);
         child.exit(1);
       });
       return child as unknown as ReturnType<SpawnFunction>;
@@ -192,11 +203,17 @@ for (const via of ["result", "stderr"] as const) test(`agy refusing the model ($
   }
 });
 
-test("NOT_FOUND becomes INVALID_MODEL only when a fresh agy models no longer lists the model", async () => {
-  for (const { stdout, expectedCode } of [
-    { stdout: MODELS_WITHOUT_ARGON, expectedCode: "INVALID_MODEL" },
-    { stdout: MODELS_WITH_ARGON, expectedCode: undefined },
-  ]) {
+// Both verbatim from the 2026-11-09 daemon log, on gemini-4-argon-high turns.
+const LOOKUP_FAILURES = [
+  "NOT_FOUND (code 404): Requested entity was not found.",
+  "agent executor error: generating and executing: unknown model key MODEL_PLACEHOLDER_M417: model not found",
+];
+
+test("model-lookup failures become INVALID_MODEL only when a fresh agy models no longer lists the model", async () => {
+  for (const [failure, stdout, expectedCode] of LOOKUP_FAILURES.flatMap((failure) => [
+    [failure, MODELS_WITHOUT_ARGON, "INVALID_MODEL"],
+    [failure, MODELS_WITH_ARGON, undefined],
+  ] as const)) {
     const tempDir = mkdtempSync(path.join(tmpdir(), "agy-not-found-"));
     try {
       const env = { AGY_TEST: tempDir };
@@ -217,9 +234,7 @@ test("NOT_FOUND becomes INVALID_MODEL only when a fresh agy models no longer lis
         child.stdin.once("data", () => {
           child.stdout.write(`${JSON.stringify({
             event: "result",
-            conversation_id: "conv-not-found",
-            status: "error",
-            errors: ["NOT_FOUND (code 404): Requested entity was not found."],
+            result: { conversation_id: "conv-not-found", status: "ERROR", response: "", error: failure },
           })}\n`);
           child.exit(3);
         });
@@ -235,7 +250,7 @@ test("NOT_FOUND becomes INVALID_MODEL only when a fresh agy models no longer lis
 
       const error = turnFailure(events);
       assert.equal(error?.code, expectedCode);
-      assert.match(error?.diagnostic ?? error?.message ?? "", /NOT_FOUND \(code 404\)/);
+      assert.equal(error?.diagnostic ?? error?.message, failure);
       assert.equal(launches, 1);
       if (expectedCode) {
         assert.ok(getCatalogCacheKey("agy", [], env) !== keyBefore);
@@ -248,6 +263,117 @@ test("NOT_FOUND becomes INVALID_MODEL only when a fresh agy models no longer lis
       rmSync(tempDir, { recursive: true, force: true });
     }
   }
+});
+
+test("a failed agy models serves the last good catalogue as stale; only a sign-in prompt is surfaced", async () => {
+  const env = { AGY_TEST: "fallback" };
+  const fallbackCatalog = catalogWithArgon();
+  const failures: Array<[string, () => Promise<{ exitCode: number; stdout: string; stderr: string }>]> = [
+    ["auth failure, exit 1", async () => ({ exitCode: 1, stdout: "", stderr: "authentication failed or timed out" })],
+    ["binary missing mid self-update", async () => {
+      throw new ProviderActionError("BINARY_NOT_FOUND", "Antigravity CLI not found: agy");
+    }],
+  ];
+  for (const [name, probeImpl] of failures) {
+    const listed = await getCatalog(undefined, "agy", [], env, { fallbackCatalog, probeImpl, bypassCache: true });
+    assert.deepEqual(listed.models.map((model) => model.id), fallbackCatalog.models.map((model) => model.id), name);
+    assert.ok(listed.models.every((model) => model.metadata?.catalogStale === true), name);
+  }
+
+  // Upstream fixture models-unauthenticated.stderr.ndjson (agy 1.2.13).
+  await assert.rejects(
+    getCatalog(undefined, "agy", [], env, {
+      fallbackCatalog,
+      bypassCache: true,
+      probeImpl: async () => ({
+        exitCode: 1,
+        stdout: "",
+        stderr: "Fetching available models...\nError: Please sign in to view available models. Launch the CLI without arguments to sign in.",
+      }),
+    }),
+    (error: unknown) => error instanceof ProviderActionError && error.code === "DISCOVERY_FAILED",
+  );
+});
+
+test("failed probes retry on a short backoff that changes the key, and only the third straight failure is reported", async () => {
+  const env = { AGY_TEST: "backoff" };
+  const t0 = Date.UTC(2026, 10, 9, 12, 0, 0);
+  let clock = t0;
+  const at = (ms: number) => { clock = t0 + ms; };
+  const minute = 60_000;
+  let healthy = true;
+  const probeImpl = async () =>
+    healthy
+      ? { exitCode: 0, stdout: MODELS_WITH_ARGON, stderr: "" }
+      : { exitCode: 1, stdout: "", stderr: "authentication failed or timed out" };
+  // What the daemon does on a read: resolve the key, fetch only when it changed.
+  let heldKey = "";
+  let fetches = 0;
+  const read = async () => {
+    const key = getCatalogCacheKey("agy", [], env, clock);
+    if (key === heldKey) return "cached";
+    heldKey = key;
+    fetches += 1;
+    return getCatalog(undefined, "agy", [], env, { probeImpl, retryDelayMs: 1, now: () => clock });
+  };
+
+  assert.equal(CATALOG_RETRY_BASE_MS, 2 * minute);
+  assert.equal(CATALOG_FAILURES_BEFORE_UNAVAILABLE, 3);
+  assert.equal(((await read()) as ProviderDiscovery).models.length, 3);
+
+  // The probe at the 30-minute rollover fails: stale catalogue, retry in 2 minutes.
+  healthy = false;
+  at(31 * minute);
+  const stale = (await read()) as ProviderDiscovery;
+  assert.ok(stale.models.every((model) => model.metadata?.catalogStale === true));
+  at(32 * minute);
+  assert.equal(await read(), "cached", "no retry before the backoff elapses");
+  at(33 * minute);
+  healthy = true;
+  const recovered = (await read()) as ProviderDiscovery;
+  assert.equal(fetches, 3, "the due retry changed the key, so the daemon fetched again");
+  assert.ok(recovered.models.every((model) => model.metadata?.catalogStale !== true));
+
+  // The counter was reset: two more failures stay stale, the third is reported.
+  healthy = false;
+  at(61 * minute);
+  assert.ok(((await read()) as ProviderDiscovery).models.every((model) => model.metadata?.catalogStale === true));
+  at(63 * minute);
+  assert.ok(((await read()) as ProviderDiscovery).models.every((model) => model.metadata?.catalogStale === true));
+  at(66 * minute);
+  assert.equal(await read(), "cached", "the second retry waits 4 minutes");
+  at(67 * minute);
+  await assert.rejects(read(), (error: unknown) => error instanceof ProviderActionError && error.code === "DISCOVERY_FAILED");
+
+  // Still retrying after being reported (8 minutes), and one success clears it.
+  at(74 * minute);
+  assert.equal(await read(), "cached");
+  at(75 * minute);
+  healthy = true;
+  assert.ok(((await read()) as ProviderDiscovery).models.every((model) => model.metadata?.catalogStale !== true));
+  healthy = false;
+  at(91 * minute);
+  assert.ok(((await read()) as ProviderDiscovery).models.every((model) => model.metadata?.catalogStale === true));
+});
+
+test("a sign-in prompt is reported at once and schedules no retry", async () => {
+  const env = { AGY_TEST: "sign-in" };
+  const t0 = Date.UTC(2026, 10, 9, 12, 0, 0);
+  const signIn = async () => ({
+    exitCode: 1,
+    stdout: "",
+    stderr: "Fetching available models...\nError: Please sign in to view available models. Launch the CLI without arguments to sign in.",
+  });
+  await getCatalog(undefined, "agy", [], env, {
+    now: () => t0,
+    probeImpl: async () => ({ exitCode: 0, stdout: MODELS_WITH_ARGON, stderr: "" }),
+  });
+  const key = getCatalogCacheKey("agy", [], env, t0 + 60_000);
+  await assert.rejects(
+    getCatalog(undefined, "agy", [], env, { now: () => t0 + 60_000, probeImpl: signIn, bypassCache: true }),
+    (error: unknown) => error instanceof ProviderActionError && error.code === "DISCOVERY_FAILED",
+  );
+  assert.equal(getCatalogCacheKey("agy", [], env, t0 + 10 * 60_000), key);
 });
 
 test("catalogue key rolls over with the TTL window", () => {

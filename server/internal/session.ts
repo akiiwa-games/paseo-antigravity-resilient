@@ -10,7 +10,7 @@ import type {
 import {
   DEFAULT_MODE,
   excludeModels,
-  isNotFoundError,
+  isModelLookupFailure,
   MODES,
   parseInvalidModelSelection,
   resolveContextWindowMaxTokens,
@@ -317,7 +317,7 @@ export class Session {
   private readonly config: ProviderSessionConfig;
   private catalog: ProviderDiscovery;
   private readonly modelAvailability?: ModelAvailability;
-  /** Turn whose NOT_FOUND is being checked against `agy models`. */
+  /** Turn whose model-lookup failure is being checked against `agy models`. */
   private modelCheckTurn: ActiveTurn | null = null;
   private readonly emit: (event: ProviderEvent) => void;
   private readonly autoCompactEnabled: boolean;
@@ -1348,13 +1348,13 @@ export class Session {
       }
       this.driver = null;
       this.driverResolve?.();
-      // agy exits (code 3) right after a NOT_FOUND result; the check decides.
+      // agy exits (code 3) right after such a failed result; the check decides.
       if (this.turn && this.turn === this.modelCheckTurn) return;
       if (this.turn && !this.closed) {
         const stderr = this.turn.stderr.join("\n").trim();
         if (this.failRejectedModel(stderr)) return;
-        if (isNotFoundError(stderr) && this.model && this.modelAvailability) {
-          void this.failNotFound(this.turn, this.model, stderr);
+        if (isModelLookupFailure(stderr) && this.model && this.modelAvailability) {
+          void this.failModelLookup(this.turn, this.model, stderr);
           return;
         }
         const reason =
@@ -2152,8 +2152,8 @@ export class Session {
           return false;
         }
         if (this.failRejectedModel(rawError)) return false;
-        if (isNotFoundError(rawError) && this.model && this.modelAvailability) {
-          void this.failNotFound(turn, this.model, rawError);
+        if (isModelLookupFailure(rawError) && this.model && this.modelAvailability) {
+          void this.failModelLookup(turn, this.model, rawError);
           return false;
         }
         this.failTurn(diagnostic(rawError));
@@ -2411,11 +2411,12 @@ export class Session {
   }
 
   /**
-   * NOT_FOUND is gRPC's generic "entity missing", so on its own it does not
-   * prove the model was withdrawn. It becomes INVALID_MODEL only when a fresh
-   * `agy models` no longer lists the model; otherwise it fails as before.
+   * NOT_FOUND and "unknown model key" do not name the session's model, so on
+   * their own they do not prove it was withdrawn. They become INVALID_MODEL
+   * only when a fresh `agy models` no longer lists the model; otherwise the
+   * turn fails as before.
    */
-  private async failNotFound(turn: ActiveTurn, model: string, rawError: string): Promise<void> {
+  private async failModelLookup(turn: ActiveTurn, model: string, rawError: string): Promise<void> {
     let current: ProviderDiscovery | null = null;
     this.modelCheckTurn = turn;
     try {

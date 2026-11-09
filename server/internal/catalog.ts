@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
 import path from "node:path";
 import { probe } from "./process.ts";
-import { ProviderActionError } from "./signals.ts";
+import { isAbortError, ProviderActionError } from "./signals.ts";
 import { diagnostic } from "./wire.ts";
 
 export type ProviderDiscovery = ProviderCatalog;
@@ -100,12 +100,30 @@ function launchIdentity(
     .digest("hex");
 }
 
+// A failed `agy models` is retried sooner than the next TTL window: 2 minutes,
+// doubling, capped at the TTL (the AgentCompass collector's backoff). 2 minutes
+// lets a blip at a window boundary heal quickly without re-running agy's
+// sign-in and network discovery every few seconds.
+export const CATALOG_RETRY_BASE_MS = 2 * 60_000;
+// Consecutive failed probes before agy counts as really unavailable and the
+// error reaches Paseo instead of the stale catalogue: with the backoff above,
+// about 6 minutes of failures (t, t+2m, t+6m).
+export const CATALOG_FAILURES_BEFORE_UNAVAILABLE = 3;
+
 type CatalogState = {
-  /** Bumped whenever agy rejects a model the catalogue still listed. */
+  /**
+   * Bumped when agy rejects a model the catalogue still listed and when a
+   * retry of a failed probe comes due: the daemon never re-fetches a key it
+   * already holds a result (or an error) for.
+   */
   generation: number;
   /** Models agy rejected since the last successful `agy models`. */
   rejected: Set<string>;
   lastGood: ProviderDiscovery | null;
+  /** Consecutive failed probes since the last successful one. */
+  failures: number;
+  /** When the next retry of a failed probe is due, if one is pending. */
+  retryAt: number | null;
 };
 
 const catalogStates = new Map<string, CatalogState>();
@@ -113,16 +131,21 @@ const catalogStates = new Map<string, CatalogState>();
 function catalogState(identity: string): CatalogState {
   let state = catalogStates.get(identity);
   if (!state) {
-    state = { generation: 0, rejected: new Set(), lastGood: null };
+    state = { generation: 0, rejected: new Set(), lastGood: null, failures: 0, retryAt: null };
     catalogStates.set(identity, state);
   }
   return state;
 }
 
+export function catalogRetryDelayMs(failures: number): number {
+  return Math.min(CATALOG_RETRY_BASE_MS * 2 ** Math.max(failures - 1, 0), CATALOG_TTL_MS);
+}
+
 /**
- * Changes when the agy binary changes, when the TTL window rolls over, and
- * when a model is invalidated, so neither the daemon's catalogue nor the host
- * cache outlives what agy currently offers.
+ * Changes when the agy binary changes, when the TTL window rolls over, when a
+ * model is invalidated, and when a retry of a failed probe comes due, so
+ * neither the daemon's catalogue nor the host cache outlives what agy
+ * currently offers.
  */
 export function getCatalogCacheKey(
   command: string,
@@ -131,7 +154,12 @@ export function getCatalogCacheKey(
   now: number = Date.now(),
 ): string {
   const identity = launchIdentity(command, args, env);
-  const { generation } = catalogState(identity);
+  const state = catalogState(identity);
+  if (state.retryAt !== null && now >= state.retryAt) {
+    state.retryAt = null;
+    state.generation += 1;
+  }
+  const { generation } = state;
   return createHash("sha256")
     .update(JSON.stringify([identity, Math.floor(now / CATALOG_TTL_MS), generation]))
     .digest("hex");
@@ -222,9 +250,24 @@ export function parseInvalidModelSelection(
   return { model: match[1] || match[2], available };
 }
 
-/** gRPC NOT_FOUND as agy reports it in a failed result. */
-export function isNotFoundError(text: string): boolean {
-  return /\bNOT_FOUND \(code 404\)/u.test(text);
+/**
+ * Failures that may mean agy's backend no longer serves the model, but do not
+ * name it: gRPC `NOT_FOUND (code 404): Requested entity was not found.` and
+ * agy's own `unknown model key %s` (a format string in the agy binary; the
+ * key is an internal `MODEL_PLACEHOLDER_*` id, not the model the session
+ * chose). Both appeared on gemini-4-argon-high turns during the 2026-11-09
+ * withdrawal. Callers must confirm against `agy models` before acting.
+ */
+export function isModelLookupFailure(text: string): boolean {
+  return (
+    /\bNOT_FOUND \(code 404\)/u.test(text) ||
+    /\bunknown model key \S+: model not found\b/u.test(text)
+  );
+}
+
+/** `agy models` when nobody is signed in (agy 1.2.x, upstream fixture). */
+function isSignInRequired(result: { stderr: string; stdout: string }): boolean {
+  return /Please sign in to view available models/i.test(`${result.stderr}\n${result.stdout}`);
 }
 
 /**
@@ -351,6 +394,7 @@ export type GetCatalogOptions = {
   allowStale?: boolean;
   bypassCache?: boolean;
   fallbackCatalog?: ProviderDiscovery | null;
+  now?: () => number;
   probeImpl?: typeof probe;
   probeTimeoutMs?: number;
   retryDelayMs?: number;
@@ -364,8 +408,9 @@ export async function getCatalog(
   env?: Record<string, string>,
   options: GetCatalogOptions = {},
 ): Promise<ProviderDiscovery> {
+  const now = options.now ?? Date.now;
   const state = catalogState(launchIdentity(command, args, env));
-  const cacheKey = getCatalogCacheKey(command, args, env);
+  const cacheKey = getCatalogCacheKey(command, args, env, now());
   const cached = host ? await host.readCatalogCache(cacheKey) : null;
   if (!options.bypassCache && cached && cached.models.length > 0) {
     return withWindows(excludeModels(cached, state.rejected));
@@ -386,19 +431,25 @@ export async function getCatalog(
     ? markStale(excludeModels(fallbackSource, state.rejected))
     : null;
 
-  let result = await probeFn(
-    command,
-    [...args, "models"],
-    env,
-    timeoutMs,
-    signal,
-  );
+  /**
+   * The daemon keeps a failed fetch under its catalogue key and never retries
+   * that key, so a failure schedules a retry (which changes the key) and,
+   * below the threshold, serves the last good catalogue marked stale.
+   */
+  const failed = (error: ProviderActionError): ProviderDiscovery => {
+    state.failures += 1;
+    state.retryAt = now() + catalogRetryDelayMs(state.failures);
+    if (fallback && state.failures < CATALOG_FAILURES_BEFORE_UNAVAILABLE) {
+      console.warn(
+        `[antigravity-resilient] Model discovery failed (${state.failures}/${CATALOG_FAILURES_BEFORE_UNAVAILABLE}: ${error.message}); using last valid cached catalog, retrying in ${catalogRetryDelayMs(state.failures) / 1000}s`,
+      );
+      return withWindows(fallback);
+    }
+    throw error;
+  };
 
-  if (result.exitCode !== 0 && isTransientDiscoveryFailure(result) && !signal?.aborted) {
-    console.warn(
-      `[antigravity-resilient] Model discovery failed transiently (${result.timedOut ? "timeout" : `exit=${result.exitCode}`}); retrying once in ${retryDelayMs}ms`,
-    );
-    await sleep(retryDelayMs, signal);
+  let result: Awaited<ReturnType<typeof probe>>;
+  try {
     result = await probeFn(
       command,
       [...args, "models"],
@@ -406,44 +457,50 @@ export async function getCatalog(
       timeoutMs,
       signal,
     );
-  }
 
-  if (result.timedOut) {
-    if (fallback) {
+    if (result.exitCode !== 0 && isTransientDiscoveryFailure(result) && !signal?.aborted) {
       console.warn(
-        "[antigravity-resilient] Model discovery timed out after retry; using last valid cached catalog",
+        `[antigravity-resilient] Model discovery failed transiently (${result.timedOut ? "timeout" : `exit=${result.exitCode}`}); retrying once in ${retryDelayMs}ms`,
       );
-      return withWindows(fallback);
+      await sleep(retryDelayMs, signal);
+      result = await probeFn(
+        command,
+        [...args, "models"],
+        env,
+        timeoutMs,
+        signal,
+      );
     }
-    throw new ProviderActionError(
-      "PROBE_TIMEOUT",
-      "Antigravity discovery timed out",
+  } catch (error) {
+    if (isAbortError(error)) throw error;
+    // e.g. BINARY_NOT_FOUND while agy swaps its binary during a self-update.
+    return failed(
+      error instanceof ProviderActionError
+        ? error
+        : new ProviderActionError("DISCOVERY_FAILED", error instanceof Error ? error.message : String(error)),
     );
   }
 
+  if (result.timedOut) {
+    return failed(new ProviderActionError("PROBE_TIMEOUT", "Antigravity discovery timed out"));
+  }
+
   if (result.exitCode !== 0) {
-    if (fallback && isTransientDiscoveryFailure(result)) {
-      console.warn(
-        "[antigravity-resilient] Model discovery returned transient error after retry; using last valid cached catalog",
-      );
-      return withWindows(fallback);
-    }
     const detail = diagnostic(
       result.stderr.trim() ||
         result.stdout.trim() ||
         `agy models exited with code ${result.exitCode ?? "unknown"}`,
     );
-    throw new ProviderActionError("DISCOVERY_FAILED", detail, detail);
+    const error = new ProviderActionError("DISCOVERY_FAILED", detail, detail);
+    // Signing in needs the user, so it is reported at once and not retried.
+    if (isSignInRequired(result)) throw error;
+    return failed(error);
   }
 
   const models = parseModels(result.stdout);
   if (models.length === 0) {
-    if (fallback) {
-      return withWindows(fallback);
-    }
-    throw new ProviderActionError(
-      "DISCOVERY_FAILED",
-      "Antigravity CLI returned no models from `agy models`.",
+    return failed(
+      new ProviderActionError("DISCOVERY_FAILED", "Antigravity CLI returned no models from `agy models`."),
     );
   }
 
@@ -457,6 +514,8 @@ export async function getCatalog(
   // `agy models` is authoritative: a model it lists again is usable again.
   state.rejected.clear();
   state.lastGood = catalog;
+  state.failures = 0;
+  state.retryAt = null;
   if (host) {
     await host.writeCatalogCache(cacheKey, catalog);
   }
