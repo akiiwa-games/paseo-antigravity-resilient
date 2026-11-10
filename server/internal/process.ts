@@ -54,6 +54,8 @@ export type DriverProcess = {
    * on success, so callers only await it in that case.
    */
   spawned: Promise<void> | null;
+  /** OS process id, for launch/stop log lines; undefined when the launch failed. */
+  pid: number | undefined;
   onClose: (
     listener: (code: number | null, signal: string | null) => void,
   ) => void;
@@ -192,6 +194,7 @@ export function spawnDriver(input: {
 
   return {
     spawned,
+    pid: child.pid,
     sendLine(line) {
       return new Promise((resolve, reject) => {
         if (!child.stdin.writable || child.stdin.destroyed) {

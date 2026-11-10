@@ -105,7 +105,7 @@ function makeSession(
     undefined,
     catalog,
     (event) => events.push(event),
-    { spawn, storeDir: tempDir, modelAvailability, launchRetryDelaysMs: [] },
+    { spawn, storeDir: tempDir, modelAvailability, launchRetryDelaysMs: [], modelRejectionRetryDelayMs: 0 },
   );
 }
 
@@ -168,7 +168,7 @@ for (const via of ["result", "stderr"] as const) test(`agy refusing the model ($
     assert.match(error?.message ?? "", /gemini-4-argon-high/);
     assert.match(error?.message ?? "", /gemini-3\.8-flash-high, claude-opus-5-5-high, GPT-OSS 120B \(Medium\)/);
     assert.match(error?.diagnostic ?? "", /invalid model selection/);
-    assert.equal(launches, 1, "a model refusal is not a crash and must not be relaunched");
+    assert.equal(launches, 1, "a refusal agy models confirms (or cannot disprove) is not relaunched");
 
     // Invalidated: the daemon sees a new catalogue key and agy is re-probed.
     assert.ok(getCatalogCacheKey("agy", [], env) !== keyBefore);
@@ -197,6 +197,97 @@ for (const via of ["result", "stderr"] as const) test(`agy refusing the model ($
     });
     assert.equal(restored.models[0]?.id, "gemini-4-argon-high");
     assert.ok(restored.models.every((model) => model.metadata?.catalogStale !== true));
+    await session.dispose();
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+/** agy refusing the model on stdout and stderr, then exiting 1 (see above). */
+function refuseModel(child: FakeChild): void {
+  child.stdout.write(`${JSON.stringify({
+    event: "result",
+    result: { conversation_id: "", status: "ERROR", response: "", error: AGY_INVALID_MODEL.join("\n") },
+  })}\n`);
+  child.stderr.write(`error: ${AGY_INVALID_MODEL.join("\n")}\n`);
+  child.exit(1);
+}
+
+/** A healthy agy: init, then one completed reply per prompt. */
+function answer(child: FakeChild, conversationId: string): void {
+  child.stdin.setEncoding("utf8");
+  child.stdin.once("data", () => {
+    child.stdout.write(`${JSON.stringify({ event: "message", conversation_id: conversationId, role: "assistant", content: "Done" })}\n`);
+    child.stdout.write(`${JSON.stringify({ event: "result", conversation_id: conversationId, status: "success", response: "Done" })}\n`);
+  });
+  child.stdout.write(`${JSON.stringify({ event: "init", conversation_id: conversationId })}\n`);
+}
+
+function turnEnd(events: ProviderEvent[]) {
+  return events.find(
+    (event): event is Extract<ProviderEvent, { type: "session.turn" }> =>
+      event.type === "session.turn" && (event.state === "completed" || event.state === "failed"),
+  );
+}
+
+// 2026-11-09/10: agy's startup list intermittently omitted Argon (and listed
+// Claude 4.6) while `agy models` moments later was complete.
+test("a refusal from a stale startup list relaunches once when agy models still lists the model", async () => {
+  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-stale-refusal-"));
+  try {
+    const env = { AGY_TEST: tempDir };
+    const catalog = holder(catalogWithArgon());
+    let probes = 0;
+    const availability = createModelAvailability(undefined, "agy", [], env, catalog, {
+      probeImpl: async () => {
+        probes += 1;
+        return { exitCode: 0, stdout: MODELS_WITH_ARGON, stderr: "" };
+      },
+    });
+    let launches = 0;
+    const spawn: SpawnFunction = () => {
+      launches += 1;
+      const child = new FakeChild();
+      const attempt = launches;
+      queueMicrotask(() => (attempt === 1 ? refuseModel(child) : answer(child, "conv-stale-refusal")));
+      return child as unknown as ReturnType<SpawnFunction>;
+    };
+    const events: ProviderEvent[] = [];
+    const session = makeSession(tempDir, spawn, catalogWithArgon(), availability, events);
+    await session.prompt({ clientMessageId: "m1", delivery: "auto", input: { type: "message", content: [{ type: "text", text: "hi" }] } });
+    await waitFor(() => turnEnd(events) !== undefined);
+
+    assert.equal(turnEnd(events)?.state, "completed");
+    assert.equal(launches, 2);
+    assert.ok(probes >= 1);
+    assert.ok(catalog.get()?.models.some((model) => model.id === "gemini-4-argon-high"), "the model stays offered");
+    await session.dispose();
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("a second refusal on the relaunch fails with INVALID_MODEL", async () => {
+  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-repeat-refusal-"));
+  try {
+    const env = { AGY_TEST: tempDir };
+    const availability = createModelAvailability(undefined, "agy", [], env, holder(catalogWithArgon()), {
+      probeImpl: async () => ({ exitCode: 0, stdout: MODELS_WITH_ARGON, stderr: "" }),
+    });
+    let launches = 0;
+    const spawn: SpawnFunction = () => {
+      launches += 1;
+      const child = new FakeChild();
+      queueMicrotask(() => refuseModel(child));
+      return child as unknown as ReturnType<SpawnFunction>;
+    };
+    const events: ProviderEvent[] = [];
+    const session = makeSession(tempDir, spawn, catalogWithArgon(), availability, events);
+    await session.prompt({ clientMessageId: "m1", delivery: "auto", input: { type: "message", content: [{ type: "text", text: "hi" }] } });
+    await waitFor(() => turnFailure(events) !== undefined);
+
+    assert.equal(turnFailure(events)?.code, "INVALID_MODEL");
+    assert.equal(launches, 2);
     await session.dispose();
   } finally {
     rmSync(tempDir, { recursive: true, force: true });

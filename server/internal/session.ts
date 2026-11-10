@@ -59,6 +59,34 @@ export const STREAM_INTERRUPT_RETRY_DELAY_MS = 2_000;
 // Silent OAuth/model discovery on a second Windows host can exceed upstream's
 // 30s deadline. Bound initialization without imposing a timeout on real work.
 export const DRIVER_STARTUP_TIMEOUT_MS = 90_000;
+// agy checks `--model` against the list its backend returns at startup; since
+// 2026-11-09 that list intermittently comes back stale (no Argon, Claude 4.6)
+// while `agy models` seconds later is complete. Wait this long, re-probe, and
+// relaunch once before reporting INVALID_MODEL.
+export const MODEL_REJECTION_RETRY_DELAY_MS = 3_000;
+// Relaunching agy over and over is a bug, never a recovery: on 2026-11-06/07
+// something started ~40 agy processes a minute for 20 hours, each killed
+// within 2 s. Normal use is a few launches an hour; a turn's own retries stay
+// well under the per-session cap.
+export const LAUNCH_RATE_WINDOW_MS = 60_000;
+export const MAX_SESSION_LAUNCHES_PER_WINDOW = 6;
+export const MAX_PROCESS_LAUNCHES_PER_WINDOW = 30;
+
+export type LaunchRateLimit = {
+  windowMs: number;
+  perSession: number;
+  perProcess: number;
+};
+
+/**
+ * Launch times of real agy processes across every session in this plugin
+ * process. Sessions given a `spawn` double start no agy and keep their own.
+ */
+const processLaunchTimes: number[] = [];
+
+function pruneBefore(times: number[], cutoff: number): void {
+  while (times.length > 0 && (times[0] ?? 0) <= cutoff) times.shift();
+}
 export const TOKEN_GAP_CONTINUE_PROMPT =
   "Continue the interrupted turn from the current conversation state. Do not repeat completed text or tool actions.";
 
@@ -138,8 +166,10 @@ export type SessionOptions = {
   autoCompactTokenThreshold?: number;
   brainDir?: string;
   hotCacheTtlMs?: number;
+  launchRateLimit?: LaunchRateLimit;
   launchRetryDelaysMs?: readonly number[];
   modelAvailability?: ModelAvailability;
+  modelRejectionRetryDelayMs?: number;
   now?: () => number;
   spawn?: SpawnFunction;
   store?: ConversationStore;
@@ -178,6 +208,7 @@ type ActiveTurn = {
   prompt: string;
   reasoningIndex: number;
   retriedMigration: boolean;
+  retriedModelRejection: boolean;
   retriedStreamInterrupt: boolean;
   retriedTokenGap: boolean;
   startedAt: number;
@@ -193,6 +224,17 @@ type ResultFailureAction = "retry_token_gap" | "sticky_recovered" | "retry_strea
 
 function isCompactionTurn(turn: ActiveTurn): boolean {
   return turn.kind !== "business";
+}
+
+/** Why a turn needs an agy process, for the launch log line. */
+function launchReason(turn: ActiveTurn): string {
+  const retries = [
+    turn.retriedTokenGap && "token-gap",
+    turn.retriedStreamInterrupt && "stream-interrupt",
+    turn.retriedMigration && "migration",
+    turn.retriedModelRejection && "model-rejection",
+  ].filter(Boolean);
+  return `${turn.kind} turn ${turn.id}${retries.length > 0 ? ` (retry: ${retries.join(", ")})` : ""}`;
 }
 
 function isForegroundTurn(turn: ActiveTurn): boolean {
@@ -230,6 +272,7 @@ function createTurn(
     pendingRapidRefills: 0,
     lastStepContextTokens: 0,
     retriedMigration: false,
+    retriedModelRejection: false,
     retriedTokenGap: false,
     retriedStreamInterrupt: false,
     activeMessageId: null,
@@ -364,6 +407,11 @@ export class Session {
   private systemPromptInjected = false;
   private contextGuidanceInjected = false;
   private readonly tokenGapRetryDelayMs: number;
+  private readonly modelRejectionRetryDelayMs: number;
+  private readonly launchRateLimit: LaunchRateLimit;
+  private readonly launchTimes: number[] = [];
+  private readonly allLaunchTimes: number[];
+  private driverStartedAt = 0;
   private turn: ActiveTurn | null = null;
   private turnIndex = 0;
 
@@ -396,6 +444,7 @@ export class Session {
     }
     this.mode = requestedMode;
     this.spawnImpl = options.spawn;
+    this.allLaunchTimes = options.spawn ? [] : processLaunchTimes;
     this.modelAvailability = options.modelAvailability;
     this.launchRetryDelaysMs = options.launchRetryDelaysMs ?? LAUNCH_RETRY_DELAYS_MS;
 
@@ -420,6 +469,12 @@ export class Session {
         ...(storeDir ? { storeDir } : {}),
         ...(brainDir ? { brainDir } : {}),
       });
+    this.modelRejectionRetryDelayMs = options.modelRejectionRetryDelayMs ?? MODEL_REJECTION_RETRY_DELAY_MS;
+    this.launchRateLimit = options.launchRateLimit ?? {
+      windowMs: LAUNCH_RATE_WINDOW_MS,
+      perSession: MAX_SESSION_LAUNCHES_PER_WINDOW,
+      perProcess: MAX_PROCESS_LAUNCHES_PER_WINDOW,
+    };
     this.tokenGapRetryDelayMs =
       options.tokenGapRetryDelayMs ??
       numberOption(
@@ -698,7 +753,7 @@ export class Session {
     }
 
     if (restartDriver && !this.turn) {
-      await this.stopDriver();
+      await this.stopDriver("model or mode changed");
     }
 
     this.emitConfig();
@@ -1051,10 +1106,10 @@ export class Session {
         }
       }
       this.startNativeReasoning();
-      await this.ensureDriver(slashCommandRequirement(payload, isCompactionTurn(turn)));
+      await this.ensureDriver(slashCommandRequirement(payload, isCompactionTurn(turn)), launchReason(turn));
       if (this.turn !== turn || this.closed) return;
       if (turn.retriedMigration && this.migratingFromConversationId) {
-        await this.stopDriver();
+        await this.stopDriver("conversation migration");
         if (this.turn !== turn || this.closed) return;
         await this.sendTurnPrompt(turn, promptOverride);
         return;
@@ -1081,7 +1136,7 @@ export class Session {
       await this.driverReady;
       if (this.turn !== turn || this.closed) return;
       if (turn.retriedMigration && this.migratingFromConversationId) {
-        await this.stopDriver();
+        await this.stopDriver("conversation migration");
         if (this.turn !== turn || this.closed) return;
         await this.sendTurnPrompt(turn, promptOverride);
         return;
@@ -1091,7 +1146,7 @@ export class Session {
         const message = diagnostic(
           error instanceof Error ? error.message : String(error),
         );
-        this.failTurn(message);
+        this.failTurn(message, error instanceof ProviderActionError ? { code: error.code } : undefined);
       }
     }
   }
@@ -1119,7 +1174,7 @@ export class Session {
       `[antigravity-resilient] ${reason} on conversation ${this.conversationId ?? "unknown"}; retrying once in ${delayMs}ms (hadProgress=${hadProgress})`,
     );
 
-    await this.stopDriver();
+    await this.stopDriver(`retrying: ${reason}`);
     if (this.turn !== turn || this.closed) {
       return;
     }
@@ -1143,7 +1198,7 @@ export class Session {
     this.turn = null;
     this.autoCompactResolve?.();
     this.flushStore();
-    await this.stopDriver();
+    await this.stopDriver("interrupted");
     if (activeTurn && isForegroundTurn(activeTurn)) {
       this.emit({
         type: "session.turn",
@@ -1173,7 +1228,7 @@ export class Session {
     this.turn = null;
     this.autoCompactResolve?.();
     this.flushStore();
-    try { await this.stopDriver(); }
+    try { await this.stopDriver("session closed"); }
     finally { await this.promptFiles.close(); }
   }
 
@@ -1207,16 +1262,17 @@ export class Session {
    * mode (see `slashCommandRequirement`). A fresh process starts with slash
    * commands enabled, so the next `/compact` reuses it.
    */
-  private async ensureDriver(slashCommands: boolean | null = null): Promise<void> {
+  private async ensureDriver(slashCommands: boolean | null, reason: string): Promise<void> {
     await this.driverStopping;
     if (this.closed) return;
     if (this.driver && slashCommands !== null && this.driverSlashCommandsEnabled !== slashCommands) {
-      await this.stopDriver();
+      await this.stopDriver("slash-command mode switch");
     }
     if (this.driver) {
       return;
     }
     const enableSlashCommands = slashCommands ?? true;
+    this.checkLaunchRate(reason);
     this.reportedDenials.clear();
     const expectedConversationId = this.conversationId;
 
@@ -1265,12 +1321,16 @@ export class Session {
       return;
     }
     this.driver = driver;
+    this.driverStartedAt = this.now();
     this.driverSlashCommandsEnabled = enableSlashCommands;
+    console.info(
+      `[antigravity-resilient] Launched Antigravity CLI pid=${driver.pid ?? "?"} session=${this.sessionId} conversation=${this.conversationId ?? "new"} model=${this.model ?? "default"} for ${reason} (launches in the last ${this.launchRateLimit.windowMs / 1000}s: session ${this.launchTimes.length}, all sessions ${this.allLaunchTimes.length})`,
+    );
     this.driverStartupTimer = setTimeout(() => {
       if (this.driver !== driver) return;
       const message = `Antigravity did not initialize within ${this.startupTimeoutMs / 1000} seconds`;
       if (this.turn) this.failTurn(message);
-      void this.stopDriver();
+      void this.stopDriver("startup timeout");
     }, this.startupTimeoutMs);
 
     driver.onStdoutLine((line) => {
@@ -1302,7 +1362,7 @@ export class Session {
           return;
         }
         this.failTurn("Antigravity restored a different conversation; refusing to mix histories");
-        void this.stopDriver();
+        void this.stopDriver("restored a different conversation");
         return;
       }
       this.handleStdoutLine(line);
@@ -1335,7 +1395,7 @@ export class Session {
           error: { message },
         });
       }
-      void this.stopDriver();
+      void this.stopDriver("driver error");
     });
     driver.onClose((code, signal) => {
       if (this.driver !== driver) {
@@ -1348,11 +1408,14 @@ export class Session {
       }
       this.driver = null;
       this.driverResolve?.();
+      console.info(
+        `[antigravity-resilient] Antigravity CLI pid=${driver.pid ?? "?"} session=${this.sessionId} exited (code ${code}, signal ${signal}) after ${this.now() - this.driverStartedAt}ms`,
+      );
       // agy exits (code 3) right after such a failed result; the check decides.
       if (this.turn && this.turn === this.modelCheckTurn) return;
       if (this.turn && !this.closed) {
         const stderr = this.turn.stderr.join("\n").trim();
-        if (this.failRejectedModel(stderr)) return;
+        if (this.failRejectedModel(this.turn, stderr)) return;
         if (isModelLookupFailure(stderr) && this.model && this.modelAvailability) {
           void this.failModelLookup(this.turn, this.model, stderr);
           return;
@@ -1370,10 +1433,39 @@ export class Session {
     });
   }
 
-  private async stopDriver(): Promise<void> {
+  /**
+   * Refuses a launch past the per-session or per-process cap instead of
+   * feeding a relaunch loop. Counted before spawning, so a launch that dies
+   * at once still counts.
+   */
+  private checkLaunchRate(reason: string): void {
+    const { windowMs, perSession, perProcess } = this.launchRateLimit;
+    const now = Date.now();
+    pruneBefore(this.launchTimes, now - windowMs);
+    pruneBefore(this.allLaunchTimes, now - windowMs);
+    const scope = this.launchTimes.length >= perSession
+      ? `${this.launchTimes.length} times for this session`
+      : this.allLaunchTimes.length >= perProcess
+        ? `${this.allLaunchTimes.length} times across all sessions`
+        : null;
+    if (scope) {
+      const message = `Antigravity CLI was launched ${scope} in the last ${windowMs / 1000} seconds; refusing to launch it again for ${reason}. Wait a minute and resend.`;
+      console.warn(`[antigravity-resilient] ${message} (session=${this.sessionId})`);
+      throw new ProviderActionError("LAUNCH_RATE_LIMITED", message);
+    }
+    this.launchTimes.push(now);
+    if (this.allLaunchTimes !== this.launchTimes) this.allLaunchTimes.push(now);
+  }
+
+  private async stopDriver(reason: string): Promise<void> {
     this.clearDriverStartupTimer();
     const current = this.driver;
     this.driver = null;
+    if (current) {
+      console.info(
+        `[antigravity-resilient] Stopping Antigravity CLI pid=${current.pid ?? "?"} session=${this.sessionId} after ${this.now() - this.driverStartedAt}ms: ${reason}`,
+      );
+    }
     this.driverSlashCommandsEnabled = false;
     this.driverResolve?.();
     this.driverResolve = null;
@@ -2151,7 +2243,7 @@ export class Session {
           this.endTurn("canceled", diagnostic(rawError));
           return false;
         }
-        if (this.failRejectedModel(rawError)) return false;
+        if (this.failRejectedModel(turn, rawError)) return false;
         if (isModelLookupFailure(rawError) && this.model && this.modelAvailability) {
           void this.failModelLookup(turn, this.model, rawError);
           return false;
@@ -2392,13 +2484,58 @@ export class Session {
   }
 
   /**
-   * agy refusing `--model` is a structured "model unavailable", not a crash:
-   * the turn fails with INVALID_MODEL (never retried) and the catalogue drops
-   * the model. Returns false when `text` is not that refusal.
+   * agy refusing `--model` is a structured "model unavailable", not a crash.
+   * agy may have checked a stale startup list, so a refusal before any
+   * progress first waits, re-probes `agy models`, and relaunches once if the
+   * model is still listed. Otherwise the turn fails with INVALID_MODEL and the
+   * catalogue drops the model. Returns false when `text` is not that refusal.
    */
-  private failRejectedModel(text: string): boolean {
+  private failRejectedModel(turn: ActiveTurn, text: string): boolean {
     const rejection = parseInvalidModelSelection(text);
     if (!rejection) return false;
+    const hadProgress = turn.text.size > 0 || turn.tools.size > 0 || turn.nativeCompacted;
+    if (!turn.retriedModelRejection && !hadProgress && this.modelAvailability) {
+      turn.retriedModelRejection = true;
+      void this.recheckRejectedModel(turn, rejection, text);
+      return true;
+    }
+    this.reportRejectedModel(rejection, text);
+    return true;
+  }
+
+  private async recheckRejectedModel(
+    turn: ActiveTurn,
+    rejection: { model: string; available: string[] },
+    text: string,
+  ): Promise<void> {
+    let listed = false;
+    this.modelCheckTurn = turn;
+    try {
+      if (this.modelRejectionRetryDelayMs > 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, this.modelRejectionRetryDelayMs));
+      }
+      if (this.turn === turn && !this.closed) {
+        listed = (await this.modelAvailability?.stillListed(rejection.model)) ?? false;
+      }
+    } catch {
+      listed = false;
+    } finally {
+      if (this.modelCheckTurn === turn) this.modelCheckTurn = null;
+    }
+    if (this.turn !== turn || this.closed) return;
+    if (!listed) {
+      this.reportRejectedModel(rejection, text);
+      return;
+    }
+    await this.retryTurnAfterRecovery(
+      turn,
+      false,
+      0,
+      `agy rejected model ${rejection.model} but agy models still lists it`,
+    );
+  }
+
+  private reportRejectedModel(rejection: { model: string; available: string[] }, text: string): void {
     this.modelAvailability?.rejected(rejection.model);
     const before = this.catalog;
     this.catalog = excludeModels(this.catalog, [rejection.model]);
@@ -2407,7 +2544,6 @@ export class Session {
       (label) => before.models.find((model) => model.label === label)?.id ?? label,
     );
     this.failInvalidModel(rejection.model, available, text);
-    return true;
   }
 
   /**

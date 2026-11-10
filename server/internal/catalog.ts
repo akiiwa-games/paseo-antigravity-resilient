@@ -605,6 +605,12 @@ export type ModelAvailability = {
    * lists `model`, or null when it still does or the probe failed.
    */
   confirmMissing(model: string): Promise<ProviderDiscovery | null>;
+  /**
+   * Re-probes `agy models`. True only when the fresh catalogue lists `model`,
+   * i.e. agy's refusal came from a stale startup list; false when it is gone
+   * or the probe failed.
+   */
+  stillListed(model: string): Promise<boolean>;
 };
 
 export function createModelAvailability(
@@ -655,6 +661,16 @@ export function createModelAvailability(
       if (fresh.models.some((entry) => entry.id === model)) return null;
       invalidateModel(command, args, env, model);
       return fresh;
+    },
+    async stillListed(model) {
+      let fresh: ProviderDiscovery;
+      try {
+        fresh = await refresh({ allowStale: false, countTimeouts: false, probeTimeoutMs: DISCOVERY_TIMEOUT_MS });
+      } catch {
+        return false;
+      }
+      catalog.set(fresh);
+      return fresh.models.some((entry) => entry.id === model);
     },
   };
 }
