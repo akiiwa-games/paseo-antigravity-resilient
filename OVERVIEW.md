@@ -13,6 +13,6 @@ CLI 故障的有限恢复、压缩状态管理、上下文估计和订阅额度�
 agy >=1.1.15。仅提供 full-access，CLI 将使用 --dangerously-skip-permissions。
 提示与工具结果经 agy 发往 Antigravity。回放保存在主机本地；额度查询读取
 系统凭据并调用 Google 接口，不负责刷新凭据。DISABLE_COMPACT=1 可禁用
-空闲自动压缩；上下文窗口是可覆盖的估计值。
+空闲与轮前自动压缩；上下文窗口是可覆盖的估计值。
 
 macOS/Linux 尚未完成端到端验证；Linux 额度发现不支持。

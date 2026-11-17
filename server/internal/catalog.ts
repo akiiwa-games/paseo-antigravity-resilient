@@ -279,8 +279,9 @@ function isSignInRequired(result: { stderr: string; stdout: string }): boolean {
  *
  * Gemini's own limit is 1M, but agy runs every conversation in its default
  * `256K` context-window preset (`512K`/`900K` are paid upgrades in the model
- * selector) and checkpoints natively at ~230-250K, so 256K is what the
- * meter should measure against.
+ * selector), so 256K is what the meter should measure against. agy does not
+ * stop or checkpoint at this size: a 2026-11-17 session sent 335K requests
+ * with no native CHECKPOINT, so the plugin's own compactors bound it.
  */
 export const AGY_DEFAULT_CONTEXT_WINDOW_TOKENS = 262_144;
 

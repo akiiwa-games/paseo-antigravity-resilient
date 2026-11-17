@@ -39,6 +39,7 @@ import {
   DEFAULT_AUTO_COMPACT_MAX_LATE_MS,
   DEFAULT_AUTO_COMPACT_TOKEN_THRESHOLD,
   DEFAULT_HOT_CACHE_TTL_MS,
+  DEFAULT_PRE_TURN_COMPACT_TOKEN_THRESHOLD,
   isCompactPromptText,
   isGoalPromptText,
   MAX_CONSECUTIVE_COMPACT_FAILURES,
@@ -2863,4 +2864,125 @@ test("availability re-checks transient agy --version failures but not unsupporte
   const gone = await checkAgyStatus("agy", [], undefined, { probe: down, retryDelaysMs: [1, 1] });
   assert.deepEqual(gone, { available: false, diagnostic: "broken" });
   assert.equal(calls, 3);
+});
+
+/** A fake agy whose business turns report the next context size from `sizes`;
+ * `/compact` reports cumulative totals (ignored by the post-compact estimate)
+ * unless `holdCompact` keeps it pending. */
+function preTurnHarness(conv: string, sizes: number[], options: { hotCacheTtlMs: number; holdCompact?: boolean }) {
+  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-preturn-"));
+  const events: ProviderEvent[] = [];
+  const invocations: string[] = [];
+  let business = 0;
+  const spawn: SpawnFunction = (_cmd, args) => {
+    const child = new FakeChildProcess(args, (prompt, proc) => {
+      invocations.push(prompt.content);
+      if (prompt.content.startsWith("/compact")) {
+        if (options.holdCompact) return;
+        proc.sendFrame({ event: "result", conversation_id: conv, status: "success",
+          stats: { input_tokens: 24_000, cache_read_tokens: 319_000, output_tokens: 2_000, total_tokens: 26_000 } });
+        return;
+      }
+      const total = sizes[business++] ?? 20_000;
+      proc.sendFrame({ event: "result", conversation_id: conv, status: "success", response: "OK",
+        stats: { input_tokens: 4_000, cache_read_tokens: total - 5_000, output_tokens: 1_000, total_tokens: total } });
+    });
+    queueMicrotask(() => child.sendFrame({ event: "init", conversation_id: conv }));
+    return child as unknown as ReturnType<SpawnFunction>;
+  };
+  const brainDir = path.join(tempDir, "brain");
+  writeFirstRequest(brainDir, conv, 17_000);
+  const session = new Session(`sess-${conv}`, "agy", [], {}, makeConfig(), undefined, TEST_CATALOG,
+    (event) => events.push(event), {
+      spawn, storeDir: tempDir, brainDir, hotCacheTtlMs: options.hotCacheTtlMs,
+      // Lead 0 arms the idle timer at expiry, where the cache is already cold:
+      // the idle compactor always skips as "lapsed", isolating the pre-turn path.
+      autoCompactLeadMs: 0, autoCompactMaxLateMs: 0,
+    });
+  return { tempDir, events, invocations, session };
+}
+
+test("pre-turn compaction: a cold cache over the idle threshold compacts before the next business prompt, inside its announced turn", async () => {
+  assert.equal(DEFAULT_PRE_TURN_COMPACT_TOKEN_THRESHOLD, 200_000);
+  const h = preTurnHarness("conv-preturn-cold", [160_000, 30_000], { hotCacheTtlMs: 30 });
+  try {
+    await h.session.prompt(userPrompt("Turn 1", "m-1"));
+    await waitForTurnEnd(h.events);
+    assert.equal(h.session.getLastContextTokens(), 160_000);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(h.invocations.length, 1, "The idle compactor lapsed; nothing ran while idle");
+
+    h.events.length = 0;
+    await h.session.prompt(userPrompt("Turn 2", "m-2"));
+    await waitForTurnEnd(h.events);
+    assert.deepEqual(h.invocations.slice(1).map((c) => c.split("\n").at(-1)), ["/compact", "Turn 2"]);
+
+    const turns = h.events.filter((e): e is Extract<ProviderEvent, { type: "session.turn" }> => e.type === "session.turn");
+    assert.deepEqual(turns.map((t) => [t.turnId, t.state]), [["turn-3", "started"], ["turn-3", "completed"]],
+      "The compact runs inside the business turn Paseo already shows; it gets no session.turn of its own");
+    const order = h.events.flatMap((e) => e.type === "timeline.item" && (e.item.type === "user_message" || e.item.type === "compaction")
+      ? [e.item.type] : []);
+    assert.deepEqual(order, ["user_message", "compaction"]);
+    const compaction = h.events.find((e) => e.type === "timeline.item" && e.item.type === "compaction");
+    assert.equal(compaction?.type === "timeline.item" && compaction.item.type === "compaction" ? compaction.item.preTokens : null, 160_000);
+    assert.equal(h.session.getLastContextTokens(), 30_000);
+    await h.session.dispose();
+  } finally {
+    rmSync(h.tempDir, { recursive: true, force: true });
+  }
+});
+
+test("pre-turn compaction: a warm cache waits for the hard threshold, and commands never trigger it", async () => {
+  const h = preTurnHarness("conv-preturn-warm", [180_000, 210_000, 215_000, 20_000], { hotCacheTtlMs: 10_000 });
+  try {
+    await h.session.prompt(userPrompt("Turn 1", "m-1"));
+    await waitForTurnEnd(h.events);
+    h.events.length = 0;
+    await h.session.prompt(userPrompt("Turn 2", "m-2"));
+    await waitForTurnEnd(h.events);
+    assert.equal(h.invocations.length, 2, "180K with a warm cache stays cached; no compact");
+    assert.equal(h.session.getLastContextTokens(), 210_000);
+
+    h.events.length = 0;
+    await h.session.prompt({ clientMessageId: "m-goal", delivery: "auto",
+      input: { type: "command", name: "goal", arguments: "finish" } });
+    await waitForTurnEnd(h.events);
+    assert.equal(h.invocations.at(-1), "/goal finish", "A command runs as typed, without a pre-turn compact");
+
+    h.events.length = 0;
+    await h.session.prompt(userPrompt("Turn 4", "m-4"));
+    await waitForTurnEnd(h.events);
+    assert.deepEqual(h.invocations.slice(-2).map((c) => c.split("\n").at(-1)), ["/compact", "Turn 4"],
+      "Over the hard threshold the next business turn compacts first even with a warm cache");
+    await h.session.dispose();
+  } finally {
+    rmSync(h.tempDir, { recursive: true, force: true });
+  }
+});
+
+test("pre-turn compaction: interrupting during the compact cancels the announced turn without sending its prompt", async () => {
+  const h = preTurnHarness("conv-preturn-interrupt", [230_000], { hotCacheTtlMs: 10_000, holdCompact: true });
+  try {
+    await h.session.prompt(userPrompt("Turn 1", "m-1"));
+    await waitForTurnEnd(h.events);
+    h.events.length = 0;
+    const pending = h.session.prompt(userPrompt("Turn 2", "m-2"));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(h.invocations.at(-1), "/compact");
+
+    h.events.length = 0;
+    await h.session.prompt(userPrompt("Overlapping", "m-3"));
+    const rejected = h.events.find((e) => e.type === "session.prompt_result");
+    assert.equal(rejected?.type === "session.prompt_result" && rejected.result.type === "failed" ? rejected.result.error.code : null,
+      "TURN_ACTIVE", "A second prompt during the pre-turn compact is refused, not queued behind it");
+
+    await h.session.interrupt("req-int");
+    await pending;
+    const ended = await waitForTurnEnd(h.events);
+    assert.deepEqual([ended.turnId, ended.state], ["turn-3", "canceled"]);
+    assert.equal(h.invocations.includes("Turn 2") || h.invocations.some((c) => c.endsWith("Turn 2")), false);
+    await h.session.dispose();
+  } finally {
+    rmSync(h.tempDir, { recursive: true, force: true });
+  }
 });

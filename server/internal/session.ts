@@ -98,7 +98,8 @@ export const TOKEN_GAP_CONTINUE_PROMPT =
  * implementation (`BKt` idle compactor + `aX` prompt cache tracker + `vmr`/`Ebn`
  * circuit breakers):
  * - Default minimum token threshold: 150,000 tokens (Claude Code's `bjo = 200_000`
- *   scaled down for agy's 256K window, which checkpoints natively at ~230-250K)
+ *   scaled down for agy's 256K window; agy itself did not checkpoint even at 335K,
+ *   so the pre-turn compactor bounds sessions that are never idle)
  * - Minimum env-override threshold (`CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS`): 100,000 (`wjo = 100_000`)
  * - Lead time before cache expiry: 60,000 ms (`Rjo = 60_000`)
  * - Max late tolerance after scheduled fire time: 60,000 ms (`Rjo = 60_000`)
@@ -112,6 +113,13 @@ export const DEFAULT_HOT_CACHE_TTL_MS = 5 * 60 * 1_000;
 export const DEFAULT_AUTO_COMPACT_LEAD_MS = 60 * 1_000;
 export const DEFAULT_AUTO_COMPACT_MAX_LATE_MS = 60 * 1_000;
 export const DEFAULT_AUTO_COMPACT_TOKEN_THRESHOLD = 150_000;
+/**
+ * Context size at which a new business turn compacts first even while the
+ * prompt cache is warm. agy did not checkpoint natively anywhere up to 335K in
+ * a LITTLESPRING coordinator session (no CHECKPOINT row), so nothing else
+ * bounds a session that is never idle.
+ */
+export const DEFAULT_PRE_TURN_COMPACT_TOKEN_THRESHOLD = 200_000;
 export const MIN_ENV_AUTO_COMPACT_TOKEN_THRESHOLD = 100_000;
 export { RAPID_REFILL_BREAKER_LIMIT, RAPID_REFILL_REQUEST_WINDOW };
 export const MAX_CONSECUTIVE_COMPACT_FAILURES = 3;
@@ -164,6 +172,7 @@ export type SessionOptions = {
   autoCompactLeadMs?: number;
   autoCompactMaxLateMs?: number;
   autoCompactTokenThreshold?: number;
+  preTurnCompactTokenThreshold?: number;
   brainDir?: string;
   hotCacheTtlMs?: number;
   launchRateLimit?: LaunchRateLimit;
@@ -367,6 +376,9 @@ export class Session {
   private readonly autoCompactLeadMs: number;
   private readonly autoCompactMaxLateMs: number;
   private readonly autoCompactTokenThreshold: number;
+  private readonly preTurnCompactTokenThreshold: number;
+  /** Business turn already announced to Paseo while its pre-turn compact runs. */
+  private pendingForegroundTurn: { turnId: string } | null = null;
   private autoCompactPromise: Promise<void> | null = null;
   private autoCompactResolve: (() => void) | null = null;
   private autoCompactTimer: unknown = null;
@@ -506,6 +518,12 @@ export class Session {
       numberOption(
         providerOpts.autoCompactTokenThreshold,
         envMinTokens ?? DEFAULT_AUTO_COMPACT_TOKEN_THRESHOLD,
+      );
+    this.preTurnCompactTokenThreshold =
+      options.preTurnCompactTokenThreshold ??
+      numberOption(
+        providerOpts.preTurnCompactTokenThreshold,
+        DEFAULT_PRE_TURN_COMPACT_TOKEN_THRESHOLD,
       );
     this.hotCacheTtlMs =
       options.hotCacheTtlMs ??
@@ -766,7 +784,7 @@ export class Session {
   async prompt(prompt: ProviderPrompt): Promise<void> {
     this.clearAutoCompactTimer();
 
-    if (this.turn && !isForegroundTurn(this.turn) && this.autoCompactPromise) {
+    if (this.turn && !isForegroundTurn(this.turn) && this.autoCompactPromise && !this.pendingForegroundTurn) {
       await this.autoCompactPromise;
     }
 
@@ -774,7 +792,7 @@ export class Session {
       return;
     }
 
-    if (this.turn) {
+    if (this.turn || this.pendingForegroundTurn) {
       this.emit({
         type: "session.prompt_result",
         sessionId: this.sessionId,
@@ -793,10 +811,11 @@ export class Session {
 
     let prepared: { cliText: string; userText: string };
     let isManualCompact = false;
+    let isCommand = false;
     try {
       const rawPreview = await this.promptFiles.encode(prompt);
       isManualCompact = isCompactPromptText(rawPreview.userText);
-      const isCommand = prompt.input.type === "command" || /^\/\S+/.test(rawPreview.userText.trim());
+      isCommand = prompt.input.type === "command" || /^\/\S+/.test(rawPreview.userText.trim());
       if (isCommand) {
         prepared = rawPreview;
       } else {
@@ -823,7 +842,26 @@ export class Session {
       return;
     }
 
+    // Commands (including /compact) never trigger the pre-turn compact. The
+    // compact takes the lower turn number so timeline order matches run order.
+    const preTurnCompactId = !isCommand && this.needsPreTurnCompact(this.now())
+      ? `turn-${++this.turnIndex}`
+      : null;
     const turnId = `turn-${++this.turnIndex}`;
+    if (preTurnCompactId) {
+      this.announceTurn(prompt.clientMessageId, turnId, prepared.userText);
+      const pending = { turnId };
+      this.pendingForegroundTurn = pending;
+      const compactTurn = this.beginAutomaticCompact("pre-turn auto-compaction", preTurnCompactId);
+      if (compactTurn) {
+        await this.sendTurnPrompt(compactTurn);
+        if (this.autoCompactPromise) await this.autoCompactPromise;
+      }
+      // interrupt() or close() during the compact already settled this turn.
+      if (this.pendingForegroundTurn !== pending || this.closed) return;
+      this.pendingForegroundTurn = null;
+    }
+
     const turn = createTurn(isManualCompact ? "manual_compact" : "business", turnId, prepared.cliText, {
       clientMessageId: prompt.clientMessageId,
       nativeStartStep: this.compaction.nativeStep,
@@ -835,10 +873,17 @@ export class Session {
     else beginBusinessTurn(this.compaction);
     this.persistCompaction();
 
+    if (!preTurnCompactId) this.announceTurn(prompt.clientMessageId, turnId, prepared.userText);
+
+    await this.sendTurnPrompt(turn);
+  }
+
+  /** Tells Paseo the turn started and records the user's message row. */
+  private announceTurn(clientMessageId: string, turnId: string, userText: string): void {
     this.emit({
       type: "session.prompt_result",
       sessionId: this.sessionId,
-      clientMessageId: prompt.clientMessageId,
+      clientMessageId,
       result: { type: "turn", turnId },
     });
     this.emit({
@@ -848,15 +893,11 @@ export class Session {
       state: "started",
     });
     this.emitItem({
-      id: prompt.clientMessageId
-        ? `user:${prompt.clientMessageId}`
-        : `user:${turnId}`,
+      id: clientMessageId ? `user:${clientMessageId}` : `user:${turnId}`,
       type: "user_message",
-      text: prepared.userText,
-      clientMessageId: prompt.clientMessageId,
+      text: userText,
+      clientMessageId,
     });
-
-    await this.sendTurnPrompt(turn);
   }
 
   private recordCacheActivity(contextTokens?: number): void {
@@ -1005,6 +1046,19 @@ export class Session {
     this.lastHandledRequestAt = armedRequestAt;
     this.lastIdleSkipReason = null;
 
+    const turn = this.beginAutomaticCompact("pre-cache-expiry auto-compaction");
+    if (!turn) return;
+    await this.sendTurnPrompt(turn);
+  }
+
+  /**
+   * Starts a background `/compact` turn for the idle or pre-turn compactor:
+   * applies the rapid-refill breaker, records the pending event and arms
+   * `autoCompactPromise`. Returns null when the attempt must not run. The
+   * turn id is allocated only once the attempt passes the breaker, unless the
+   * caller reserved one.
+   */
+  private beginAutomaticCompact(label: string, reservedTurnId?: string): ActiveTurn | null {
     // Claude Code's rapid-refill thrashing circuit breaker (`vmr` / `_Bo`),
     // measured in agy model requests since the last compact.
     const nextRapidRefills =
@@ -1027,10 +1081,10 @@ export class Session {
         message: AUTOCOMPACT_THRASHING_MESSAGE,
       });
       this.flushStore();
-      return;
+      return null;
     }
 
-    const turnId = `turn-${++this.turnIndex}`;
+    const turnId = reservedTurnId ?? `turn-${++this.turnIndex}`;
     const preCompactTokens = this.compaction.lastContextTokens;
     const turn = createTurn("idle_compact", turnId, AUTO_COMPACT_COMMAND, {
       clientMessageId: "",
@@ -1047,7 +1101,7 @@ export class Session {
       this.compaction.events = this.compaction.events.filter((e) => e.id !== turn.compactEventId);
       this.turn = null;
       this.lastIdleSkipReason = "state_unavailable";
-      return;
+      return null;
     }
 
     let resolveCompact: (() => void) | null = null;
@@ -1062,10 +1116,29 @@ export class Session {
     };
 
     console.info(
-      `[antigravity-resilient] Starting pre-cache-expiry auto-compaction on conversation ${this.conversationId} (contextTokens=${preCompactTokens}, threshold=${this.autoCompactTokenThreshold})`,
+      `[antigravity-resilient] Starting ${label} on conversation ${this.conversationId} (contextTokens=${preCompactTokens}, threshold=${this.autoCompactTokenThreshold})`,
     );
+    return turn;
+  }
 
-    await this.sendTurnPrompt(turn);
+  /**
+   * Pre-turn compaction: the idle compactor only runs between turns, so a
+   * session that is never idle long enough (a coordinator whose turns run
+   * long tools and are chained by worker notifications) never compacts, and
+   * agy itself does not checkpoint at 230-350K. Before a new business turn,
+   * compact first when the context is over the idle threshold and the prompt
+   * cache is already cold (the next request would reread it at full price
+   * anyway), or when the context is over the hard pre-turn threshold.
+   */
+  private needsPreTurnCompact(now: number): boolean {
+    if (!this.autoCompactEnabled || this.closed || !this.conversationId) return false;
+    if (this.compaction.compactedSinceLastTurn) return false;
+    if (this.compaction.consecutiveCompactFailures >= MAX_CONSECUTIVE_COMPACT_FAILURES) return false;
+    if (this.compaction.rapidRefillBreakerTripped && withinRapidRefillWindow(this.compaction)) return false;
+    const tokens = this.compaction.lastContextTokens;
+    if (tokens < this.autoCompactTokenThreshold) return false;
+    const cacheCold = this.cacheExpiresAt === null || now >= this.cacheExpiresAt;
+    return cacheCold || tokens >= Math.max(this.preTurnCompactTokenThreshold, this.autoCompactTokenThreshold);
   }
 
   private async sendTurnPrompt(
@@ -1192,6 +1265,8 @@ export class Session {
   async interrupt(requestId: string): Promise<void> {
     this.clearAutoCompactTimer();
     const activeTurn = this.turn;
+    const pendingForeground = this.pendingForegroundTurn;
+    this.pendingForegroundTurn = null;
     this.stopNativeReasoning();
     if (activeTurn) this.finishTools(activeTurn, "canceled");
     recoverInterruptedCompacts(this.compaction, this.now());
@@ -1199,11 +1274,14 @@ export class Session {
     this.autoCompactResolve?.();
     this.flushStore();
     await this.stopDriver("interrupted");
-    if (activeTurn && isForegroundTurn(activeTurn)) {
+    const canceledTurnId = activeTurn && isForegroundTurn(activeTurn)
+      ? activeTurn.id
+      : pendingForeground?.turnId;
+    if (canceledTurnId) {
       this.emit({
         type: "session.turn",
         sessionId: this.sessionId,
-        turnId: activeTurn.id,
+        turnId: canceledTurnId,
         state: "canceled",
       });
     }
@@ -1221,6 +1299,7 @@ export class Session {
 
   async dispose(): Promise<void> {
     this.closed = true;
+    this.pendingForegroundTurn = null;
     this.clearAutoCompactTimer();
     recoverInterruptedCompacts(this.compaction, this.now());
     this.stopNativeReasoning();
