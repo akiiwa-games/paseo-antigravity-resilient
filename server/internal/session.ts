@@ -2557,7 +2557,13 @@ export class Session {
       this.autoCompactResolve?.();
       return;
     }
-    this.compaction.compactedSinceLastTurn = turn.nativeCompacted;
+    // A native checkpoint early in a long turn does not mean the context is
+    // still compact when the turn ends: one 3.5-hour turn checkpointed at 528K,
+    // regrew to 370K, and was then skipped as "already_compacted". Only a
+    // checkpoint whose context is still under the threshold suppresses the
+    // idle and pre-turn compactors.
+    this.compaction.compactedSinceLastTurn = turn.nativeCompacted &&
+      this.compaction.lastContextTokens < this.autoCompactTokenThreshold;
     this.persistCompaction();
     this.scheduleAutoCompactIfNeeded();
   }

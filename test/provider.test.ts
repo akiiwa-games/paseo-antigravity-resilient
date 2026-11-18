@@ -2986,3 +2986,66 @@ test("pre-turn compaction: interrupting during the compact cancels the announced
     rmSync(h.tempDir, { recursive: true, force: true });
   }
 });
+
+test("a native checkpoint early in a turn does not suppress idle compaction once the turn regrows past the threshold", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agy-native-regrow-"));
+  const conv = "conv-native-regrow";
+  const events: ProviderEvent[] = [];
+  const prompts: string[] = [];
+  const logs = path.join(dir, "brain", conv, ".system_generated", "logs");
+  mkdirSync(logs, { recursive: true });
+  const file = path.join(logs, "transcript.jsonl");
+  const at = () => new Date().toISOString();
+  const rows: Record<string, unknown>[] = [
+    { step_index: 0, type: "USER_INPUT", status: "DONE", created_at: at(), content: "first request" },
+    { step_index: 1, type: "PLANNER_RESPONSE", status: "DONE", created_at: at(), input_tokens: 17_000 },
+  ];
+  const save = () => writeFileSync(file, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
+  save();
+  let step = 2;
+  const spawn: SpawnFunction = (_cmd, args) => {
+    const child = new FakeChildProcess(args, (prompt, proc) => {
+      prompts.push(prompt.content);
+      rows.push({ step_index: step++, type: "USER_INPUT", status: "DONE", created_at: at(), content: prompt.content });
+      if (prompt.content === "/compact") {
+        const cp = step++;
+        rows.push({ step_index: cp, type: "CHECKPOINT", status: "DONE", created_at: at(), content: "summary" });
+        save();
+        proc.sendFrame({ event: "step_update", conversation_id: conv, timestamp: at(), step_update: { step_index: cp, step_type: "CHECKPOINT", state: "DONE" } });
+        proc.sendFrame({ event: "result", conversation_id: conv, status: "success", stats: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } });
+        return;
+      }
+      // agy checkpoints natively early in the turn, then the same turn keeps working.
+      const cp = step++;
+      rows.push({ step_index: cp, type: "CHECKPOINT", status: "DONE", created_at: at(), content: "native summary" });
+      save();
+      proc.sendFrame({ event: "step_update", conversation_id: conv, timestamp: at(), step_update: { step_index: cp, step_type: "CHECKPOINT", state: "DONE" } });
+      for (const tokens of [60_000, 140_000, 225_000]) {
+        const s = step++;
+        rows.push({ step_index: s, type: "PLANNER_RESPONSE", status: "DONE", created_at: at(), input_tokens: tokens });
+        save();
+        proc.sendFrame({ event: "step_update", conversation_id: conv, timestamp: at(),
+          step_update: { step_index: s, step_type: "agent_response", state: "DONE", text_delta: tokens === 225_000 ? "done" : "", usage: { input_tokens: tokens } } });
+      }
+      proc.sendFrame({ event: "result", conversation_id: conv, status: "success", response: "done", stats: { input_tokens: 225_000, output_tokens: 1_000, total_tokens: 226_000 } });
+    });
+    queueMicrotask(() => child.sendFrame({ event: "init", conversation_id: conv }));
+    return child as unknown as ReturnType<SpawnFunction>;
+  };
+  const session = new Session("regrow", "agy", [], {}, makeConfig(),
+    { version: 1, data: { conversationId: conv, sessionKey: conv } }, TEST_CATALOG, (e) => events.push(e),
+    { storeDir: dir, brainDir: path.join(dir, "brain"), spawn, hotCacheTtlMs: 80, autoCompactLeadMs: 40 });
+  try {
+    await session.prompt(userPrompt("long turn", "m-1"));
+    await waitForTurnEnd(events);
+    assert.equal(session.getLastContextTokens(), 225_000);
+    assert.equal(session.hasCompactedSinceLastTurn(), false,
+      "the turn's native checkpoint was undone by regrowth past the threshold");
+    const deadline = Date.now() + 2_000;
+    while (prompts.length < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+    assert.deepEqual(prompts.slice(1), ["/compact"], "the idle compactor runs after the regrown turn ends");
+  } finally {
+    await session.dispose();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
