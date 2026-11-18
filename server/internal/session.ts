@@ -221,6 +221,11 @@ type ActiveTurn = {
   retriedStreamInterrupt: boolean;
   retriedTokenGap: boolean;
   startedAt: number;
+  /** When the next model request can begin: the prompt was sent, or the
+   * last tool or response step finished. */
+  requestBoundaryAt: number;
+  /** Best estimate of when this turn's latest model request was sent. */
+  lastRequestStartedAt: number | null;
   stderr: string[];
   text: Map<string, string>;
   thinking: Map<string, string>;
@@ -298,6 +303,8 @@ function createTurn(
     tools: new Map(),
     toolItems: new Map(),
     stderr: [],
+    requestBoundaryAt: fields.startedAt,
+    lastRequestStartedAt: null,
     ...fields,
   };
 }
@@ -900,11 +907,32 @@ export class Session {
     });
   }
 
-  private recordCacheActivity(contextTokens?: number): void {
+  /**
+   * When the request behind a finished response step was sent: agy's own
+   * `created_at` for the step when it is plausible for this turn, else the
+   * moment the request could start (prompt sent or previous step finished).
+   */
+  private requestStartedAt(turn: ActiveTurn, nativeCreatedAt: string | undefined): number {
     const now = this.now();
+    const parsed = nativeCreatedAt ? Date.parse(nativeCreatedAt) : Number.NaN;
+    if (Number.isFinite(parsed) && parsed >= turn.startedAt - 1_000 && parsed <= now + 5_000) {
+      return Math.min(parsed, now);
+    }
+    return Math.min(turn.requestBoundaryAt, now);
+  }
+
+  /**
+   * The prompt cache is written when a request is sent, not when its reply
+   * finishes streaming or the turn's result arrives. Anchoring expiry at the
+   * result made idle compaction fire 5-6 minutes after a slow final reply was
+   * requested, where 14 of 19 such compactions missed the cache (2026-11-18).
+   */
+  private recordCacheActivity(contextTokens?: number, requestStartedAt?: number | null): void {
+    const now = this.now();
+    const startedAt = requestStartedAt != null ? Math.min(requestStartedAt, now) : now;
     this.lastRequestAt = now;
-    this.lastCacheActivityAt = now;
-    this.cacheExpiresAt = now + this.hotCacheTtlMs;
+    this.lastCacheActivityAt = startedAt;
+    this.cacheExpiresAt = startedAt + this.hotCacheTtlMs;
     if (typeof contextTokens === "number" && contextTokens > 0) {
       this.compaction.lastContextTokens = contextTokens;
       this.compaction.contextAt = now;
@@ -1198,6 +1226,7 @@ export class Session {
           turn.lastStreamedStepIndex = Math.max(turn.lastStreamedStepIndex, turn.nativeStartStep + 1);
         }
       }
+      turn.requestBoundaryAt = this.now();
       await this.driver.sendLine(
         JSON.stringify({
           event: "user",
@@ -1856,7 +1885,8 @@ export class Session {
               if (stepTokens > 0) {
                 turn.lastStepContextTokens = stepTokens;
               }
-              this.recordCacheActivity(stepTokens);
+              turn.lastRequestStartedAt = this.requestStartedAt(turn, nativeStep?.timestamp);
+              this.recordCacheActivity(stepTokens, turn.lastRequestStartedAt);
               this.compaction.contextStep = Math.max(this.compaction.contextStep, step.step_index);
             }
             this.emit({
@@ -1876,6 +1906,7 @@ export class Session {
               },
             });
           }
+          if (step.state === "DONE") turn.requestBoundaryAt = this.now();
           return;
         }
         if (step.step_type === "thinking" || step.step_type === "reasoning") {
@@ -1908,6 +1939,7 @@ export class Session {
             ? { subagents: step.subagent_info.subagents }
             : undefined;
           turn.tools.set(id, { name, input: params });
+          if (step.state !== "ACTIVE") turn.requestBoundaryAt = this.now();
           if (step.state === "ERROR") {
             const errText =
               step.tool_info?.error?.message || "Antigravity tool failed";
@@ -2040,6 +2072,7 @@ export class Session {
         const output = toolOutput(frame);
         const detail = toolDetail(name, existing?.input, output);
         const failed = frame.is_error === true || Boolean(frame.error);
+        turn.requestBoundaryAt = this.now();
         const timestamp =
           typeof frame.timestamp === "string" ? frame.timestamp : undefined;
         if (failed) {
@@ -2363,7 +2396,9 @@ export class Session {
     const contextTokens =
       turn.nativeCompacted ? this.compaction.lastContextTokens || turn.lastStepContextTokens
         : turn.lastStepContextTokens > 0 ? turn.lastStepContextTokens : statsTokens;
-    if (!turn.nativeCompacted || contextTokens > 0) this.recordCacheActivity(contextTokens);
+    if (!turn.nativeCompacted || contextTokens > 0) {
+      this.recordCacheActivity(contextTokens, turn.lastRequestStartedAt ?? turn.requestBoundaryAt);
+    }
     this.emitContextUsage(turn, contextTokens, stats);
   }
 

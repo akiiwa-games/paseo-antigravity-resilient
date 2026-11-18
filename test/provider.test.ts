@@ -3049,3 +3049,45 @@ test("a native checkpoint early in a turn does not suppress idle compaction once
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("the idle compactor anchors the prompt cache at the request, not at a slow reply's result", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agy-cache-anchor-"));
+  const conv = "conv-cache-anchor";
+  const events: ProviderEvent[] = [];
+  const prompts: string[] = [];
+  let clock = 1_000_000;
+  const spawn: SpawnFunction = (_cmd, args) => {
+    const child = new FakeChildProcess(args, (prompt, proc) => {
+      prompts.push(prompt.content);
+      if (prompt.content === "/compact") {
+        proc.sendFrame({ event: "result", conversation_id: conv, status: "success", stats: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } });
+        return;
+      }
+      // The final reply streams for 250ms of the 300ms cache lifetime.
+      clock += 250;
+      proc.sendFrame({ event: "step_update", conversation_id: conv,
+        step_update: { step_index: 5, step_type: "agent_response", state: "DONE", text_delta: "done",
+          usage: { input_tokens: 5_000, cache_read_tokens: 215_000 } } });
+      clock += 10;
+      proc.sendFrame({ event: "result", conversation_id: conv, status: "success", response: "done",
+        stats: { input_tokens: 5_000, cache_read_tokens: 215_000, total_tokens: 220_000 } });
+    });
+    queueMicrotask(() => child.sendFrame({ event: "init", conversation_id: conv }));
+    return child as unknown as ReturnType<SpawnFunction>;
+  };
+  writeFirstRequest(path.join(dir, "brain"), conv, 17_000);
+  const session = new Session("anchor", "agy", [], {}, makeConfig(), undefined, TEST_CATALOG, (e) => events.push(e),
+    { storeDir: dir, brainDir: path.join(dir, "brain"), spawn, now: () => clock, hotCacheTtlMs: 300, autoCompactLeadMs: 100 });
+  try {
+    await session.prompt(userPrompt("slow reply", "m-1"));
+    await waitForTurnEnd(events);
+    // Anchored at the result, the timer would wait until result + 200ms, after
+    // the cache written at the request (expiring at request + 300ms) is gone.
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.deepEqual(prompts.slice(1), ["/compact"],
+      "with 40ms of cache left the compaction runs right away instead of after it expires");
+  } finally {
+    await session.dispose();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
