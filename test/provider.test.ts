@@ -1514,9 +1514,9 @@ test("new persistent session emits valid sessionKey persistence on session.opene
   }
 });
 
-test("pre-cache-expiry auto-compaction triggers 1m before 5m hot cache TTL only when >=150k tokens and not yet compacted", async () => {
+test("pre-cache-expiry auto-compaction triggers 2.5m before 5m hot cache TTL only when >=150k tokens and not yet compacted", async () => {
   assert.equal(DEFAULT_HOT_CACHE_TTL_MS, 300_000);
-  assert.equal(DEFAULT_AUTO_COMPACT_LEAD_MS, 60_000);
+  assert.equal(DEFAULT_AUTO_COMPACT_LEAD_MS, 150_000);
   assert.equal(DEFAULT_AUTO_COMPACT_MAX_LATE_MS, 60_000);
   assert.equal(DEFAULT_AUTO_COMPACT_TOKEN_THRESHOLD, 150_000);
   assert.equal(MIN_ENV_AUTO_COMPACT_TOKEN_THRESHOLD, 100_000);

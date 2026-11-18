@@ -101,7 +101,10 @@ export const TOKEN_GAP_CONTINUE_PROMPT =
  *   scaled down for agy's 256K window; agy itself did not checkpoint even at 335K,
  *   so the pre-turn compactor bounds sessions that are never idle)
  * - Minimum env-override threshold (`CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS`): 100,000 (`wjo = 100_000`)
- * - Lead time before cache expiry: 60,000 ms (`Rjo = 60_000`)
+ * - Lead time before cache expiry: 150,000 ms, so the compact runs 2.5 min after the
+ *   request (Claude Code's `Rjo = 60_000`). Gemini's implicit cache is best-effort:
+ *   on 2026-11-15..18 requests hit it 87-89% of the time 1-3 min apart but only
+ *   46-73% at 4-5 min, where the old 1-minute lead fired.
  * - Max late tolerance after scheduled fire time: 60,000 ms (`Rjo = 60_000`)
  * - Rapid-refill thrashing circuit breaker: 3 consecutive idle compactions within
  *   < 10 agy model requests each (`hqt = 3` turns in Claude Code; one Paseo prompt
@@ -110,7 +113,7 @@ export const TOKEN_GAP_CONTINUE_PROMPT =
  * - Consecutive failure circuit breaker: 3 consecutive failures (`Cbn = 3`)
  */
 export const DEFAULT_HOT_CACHE_TTL_MS = 5 * 60 * 1_000;
-export const DEFAULT_AUTO_COMPACT_LEAD_MS = 60 * 1_000;
+export const DEFAULT_AUTO_COMPACT_LEAD_MS = 150 * 1_000;
 export const DEFAULT_AUTO_COMPACT_MAX_LATE_MS = 60 * 1_000;
 export const DEFAULT_AUTO_COMPACT_TOKEN_THRESHOLD = 150_000;
 /**
