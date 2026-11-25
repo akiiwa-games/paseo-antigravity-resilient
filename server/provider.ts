@@ -86,6 +86,7 @@ export const CATALOG_FAILURES_BEFORE_UNAVAILABLE = 3;
 export const DEFAULT_STARTUP_TIMEOUT_MS = 90_000;
 export const DEFAULT_DISCOVERY_RETRY_DELAY_MS = 1_500;
 export const DEFAULT_CANCEL_FALLBACK_TIMEOUT_MS = 5_000;
+export const DEFAULT_POST_LOAD_USAGE_WINDOW_MS = 300;
 
 const systemPromptCapability = z.object({
   antigravity: z.object({ systemPrompt: z.object({ append: z.literal(true) }) }),
@@ -120,6 +121,7 @@ export interface AntigravityResilientOptions {
   launchRateLimit?: Partial<LaunchRateLimit>;
   startupTimeoutMs?: number;
   loadReplayQuietPeriodMs?: number;
+  postLoadUsageWindowMs?: number;
   cancelFallbackTimeoutMs?: number;
   discoveryRetryDelayMs?: number;
   minAgyVersion?: string;
@@ -239,9 +241,12 @@ function promptDisplayText(prompt: ProviderPrompt): string {
 
 interface ConnectorContext {
   purpose: string;
+  session?: ManagedSession;
   sessionId?: string;
   cwd?: string;
   env?: Readonly<Record<string, string>>;
+  signal?: AbortSignal;
+  onChild?: (child: OwnedAcpChild) => void;
 }
 
 interface CancelDeadline {
@@ -286,6 +291,8 @@ interface ActiveForegroundTurn {
   ranForegroundTools: boolean;
   hasTrailingAssistantText: boolean;
   cancelRequested: boolean;
+  cancelAbort: AbortController;
+  cancelDeadline: CancelDeadline | null;
   recovering: boolean;
   retryCounts: TurnRetryCounts;
   openTools: Map<string, Extract<ProviderTimelineItem, { type: "tool_call" }>>;
@@ -314,6 +321,10 @@ interface ManagedSession {
   readyEmitted: boolean;
   openingBuffer: ProviderEvent[] | null;
   openAbort: AbortController | null;
+  reopenAbort: AbortController | null;
+  activeOpenReqId: string | null;
+  activeLifecycleOpen: Promise<void> | null;
+  closingPromise: Promise<void> | null;
   closedByHost: boolean;
   innerOpen: boolean;
   innerDead: boolean;
@@ -322,6 +333,7 @@ interface ManagedSession {
   currentChild: OwnedAcpChild | null;
   inFlightPromptRpcIds: Set<string | number>;
   sawUsageSinceOpen: boolean;
+  sentPromptSinceOpen: boolean;
   postLoadUsageWaiter: PostLoadUsageWaiter | null;
   readonly compactor: SessionCompactor;
   activeCompaction: ActiveCompaction | null;
@@ -376,6 +388,8 @@ export function createAntigravityResilientProvider(
   const minAgyVersion = options.minAgyVersion ?? MIN_AGY_VERSION;
   const startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS;
   const loadReplayQuietPeriodMs = options.loadReplayQuietPeriodMs ?? 0;
+  const postLoadUsageWindowMs =
+    options.postLoadUsageWindowMs ?? DEFAULT_POST_LOAD_USAGE_WINDOW_MS;
   const cancelFallbackTimeoutMs =
     options.cancelFallbackTimeoutMs ?? DEFAULT_CANCEL_FALLBACK_TIMEOUT_MS;
   const discoveryRetryDelayMs = options.discoveryRetryDelayMs ?? DEFAULT_DISCOVERY_RETRY_DELAY_MS;
@@ -426,8 +440,11 @@ export function createAntigravityResilientProvider(
     const catalogState = getCatalogState(launch);
     const contextStore = new AsyncLocalStorage<ConnectorContext>();
     const sessions = new Map<string, ManagedSession>();
+    const activeChildren = new Set<OwnedAcpChild>();
+    const pendingAbortedCleanups = new Set<Promise<void>>();
     let lastUtilityChild = null as OwnedAcpChild | null;
     let connectionClosed = false;
+    let closeConnectionPromise: Promise<void> | null = null;
 
     const transformer: AcpTransformer = {
       command(command) {
@@ -473,13 +490,11 @@ export function createAntigravityResilientProvider(
       transformers: [transformer],
       connector: async () => {
         const ctx = contextStore.getStore();
-        const session = ctx?.sessionId ? sessions.get(ctx.sessionId) : undefined;
-        const storeDir =
-          isRecord(session?.currentConfig.providerOptions) &&
-          typeof session.currentConfig.providerOptions.storeDir === "string"
-            ? session.currentConfig.providerOptions.storeDir
-            : undefined;
-        void storeDir;
+        const session =
+          ctx?.session ?? (ctx?.sessionId ? sessions.get(ctx.sessionId) : undefined);
+        if (connectionClosed || session?.closedByHost || ctx?.signal?.aborted) {
+          throw new Error("Antigravity ACP launch aborted");
+        }
 
         if (session) {
           launchRateGuard.recordLaunch(session.sessionId, ctx?.purpose ?? "session");
@@ -491,12 +506,28 @@ export function createAntigravityResilientProvider(
           spawn: options.spawn,
           retryDelaysMs: options.launchRetryDelaysMs ?? LAUNCH_RETRY_DELAYS_MS,
           minAgyVersion,
-          shouldStopRetry: () => connectionClosed || Boolean(session?.closedByHost),
+          signal: ctx?.signal,
+          shouldStopRetry: () =>
+            connectionClosed || Boolean(session?.closedByHost) || Boolean(ctx?.signal?.aborted),
+          onAbortedCleanup: (cleanup) => {
+            pendingAbortedCleanups.add(cleanup);
+            void cleanup.finally(() => pendingAbortedCleanups.delete(cleanup));
+          },
         });
+        activeChildren.add(owned);
+        void owned.closed.finally(() => {
+          activeChildren.delete(owned);
+        });
+        if (connectionClosed || session?.closedByHost || ctx?.signal?.aborted) {
+          await owned.close({ force: true }).catch(() => undefined);
+          throw new Error("Antigravity ACP launch aborted");
+        }
+        ctx?.onChild?.(owned);
 
         if (session) {
           session.currentChild = owned;
           session.inFlightPromptRpcIds.clear();
+          session.sentPromptSinceOpen = false;
           const wrappedStream = {
             readable: owned.stream.readable.pipeThrough(
               new TransformStream<AcpStreamMessage, AcpStreamMessage>({
@@ -525,13 +556,14 @@ export function createAntigravityResilientProvider(
             writable: new WritableStream<AcpStreamMessage>({
               write(frame) {
                 const raw = frame as Record<string, unknown>;
-                if (
-                  raw.method === "session/prompt" &&
-                  (typeof raw.id === "string" || typeof raw.id === "number")
-                ) {
-                  session.inFlightPromptRpcIds.add(raw.id);
-                  if (session.activeTurn?.activeAttempt) {
-                    session.activeTurn.activeAttempt.crossedWireEndTurn = false;
+                if (raw.method === "session/prompt") {
+                  session.sentPromptSinceOpen = true;
+                  session.postLoadUsageWaiter?.settle();
+                  if (typeof raw.id === "string" || typeof raw.id === "number") {
+                    session.inFlightPromptRpcIds.add(raw.id);
+                    if (session.activeTurn?.activeAttempt) {
+                      session.activeTurn.activeAttempt.crossedWireEndTurn = false;
+                    }
                   }
                 }
                 const writer = owned.stream.writable.getWriter();
@@ -565,6 +597,9 @@ export function createAntigravityResilientProvider(
     } catch (error) {
       const utilityFailure = lastUtilityChild?.describeFailure(
         error instanceof Error ? error.message : String(error),
+      );
+      await Promise.all(
+        [...activeChildren].map((child) => child.close({ force: true }).catch(() => undefined)),
       );
       await (lastUtilityChild as OwnedAcpChild | null)?.close({ force: true }).catch(() => undefined);
       const message =
@@ -681,12 +716,21 @@ export function createAntigravityResilientProvider(
       ctx: ConnectorContext,
     ): Promise<ProviderEvent> =>
       new Promise<ProviderEvent>((resolve, reject) => {
+        if (connectionClosed) {
+          reject({
+            message: "ACP provider connection is closed",
+            diagnostic: "ACP provider connection is closed",
+          });
+          return;
+        }
         pendingInternalRequests.set(input.requestId, { resolve, reject });
         contextStore
           .run(ctx, () => inner.send(input))
           .catch((error) => {
             if (!pendingInternalRequests.delete(input.requestId)) return;
-            const child = ctx.sessionId ? sessions.get(ctx.sessionId)?.currentChild : lastUtilityChild;
+            const sessionRef =
+              ctx.session ?? (ctx.sessionId ? sessions.get(ctx.sessionId) : undefined);
+            const child = sessionRef ? sessionRef.currentChild : lastUtilityChild;
             const message =
               child?.describeFailure(error instanceof Error ? error.message : String(error)) ??
               formatDiagnostic(error instanceof Error ? error.message : String(error));
@@ -729,6 +773,66 @@ export function createAntigravityResilientProvider(
       if (deadline) clearInterval(deadline.timer);
     };
 
+    const abortPendingSessionOpen = (
+      session: ManagedSession,
+      reason: string,
+      optionsAbort?: { killChild?: boolean },
+    ): void => {
+      session.openAbort?.abort();
+      session.reopenAbort?.abort();
+      if (session.activeOpenReqId) {
+        const reqId = session.activeOpenReqId;
+        session.activeOpenReqId = null;
+        const pending = pendingInternalRequests.get(reqId);
+        if (pending) {
+          pendingInternalRequests.delete(reqId);
+          pending.reject({ message: reason, diagnostic: reason });
+        }
+      }
+      if (optionsAbort?.killChild ?? true) {
+        session.innerDead = true;
+        void session.currentChild?.close({ force: true }).catch(() => undefined);
+      }
+    };
+
+    const awaitOpenReadyWithTimeout = async (
+      session: ManagedSession,
+      internalReqId: string,
+      readyPromise: Promise<unknown>,
+      signal: AbortSignal,
+    ): Promise<void> => {
+      let startupTimer: ReturnType<typeof setTimeout> | null = null;
+      if (startupTimeoutMs > 0) {
+        startupTimer = setTimeout(() => {
+          if (pendingInternalRequests.has(internalReqId)) {
+            abortPendingSessionOpen(
+              session,
+              `Antigravity session did not become ready within ${startupTimeoutMs}ms`,
+              { killChild: true },
+            );
+          }
+        }, startupTimeoutMs);
+        if (typeof startupTimer === "object" && "unref" in startupTimer) {
+          startupTimer.unref();
+        }
+      }
+      const onAbort = () => {
+        if (pendingInternalRequests.has(internalReqId)) {
+          abortPendingSessionOpen(session, "Antigravity session open aborted", { killChild: true });
+        }
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      try {
+        await readyPromise;
+      } finally {
+        if (startupTimer !== null) clearTimeout(startupTimer);
+        signal.removeEventListener("abort", onAbort);
+        if (session.activeOpenReqId === internalReqId) {
+          session.activeOpenReqId = null;
+        }
+      }
+    };
+
     const invalidateModel = (model: string): void => {
       const clean = model.trim();
       if (!clean) return;
@@ -738,20 +842,59 @@ export function createAntigravityResilientProvider(
       catalogState.generation += 1;
     };
 
-    const probeCatalogOnce = async (cwd?: string): Promise<ProviderCatalog> => {
+    const probeCatalogOnce = async (
+      cwd?: string,
+      signal?: AbortSignal,
+    ): Promise<ProviderCatalog> => {
       const reqId = `__internal_catalog_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      let catalogChild: OwnedAcpChild | null = null;
+      let startupTimer: ReturnType<typeof setTimeout> | null = null;
+      const onAbort = () => {
+        const pending = pendingInternalRequests.get(reqId);
+        if (pending) {
+          pendingInternalRequests.delete(reqId);
+          void catalogChild?.close({ force: true }).catch(() => undefined);
+          pending.reject({
+            message: "Antigravity catalog probe aborted",
+            diagnostic: "Antigravity catalog probe aborted",
+          });
+        }
+      };
+      if (startupTimeoutMs > 0) {
+        startupTimer = setTimeout(() => {
+          const pending = pendingInternalRequests.get(reqId);
+          if (pending) {
+            pendingInternalRequests.delete(reqId);
+            void catalogChild?.close({ force: true }).catch(() => undefined);
+            const msg = `Antigravity catalog discovery timed out after ${startupTimeoutMs}ms`;
+            pending.reject({ message: msg, diagnostic: msg });
+          }
+        }, startupTimeoutMs);
+        if (typeof startupTimer === "object" && "unref" in startupTimer) {
+          startupTimer.unref();
+        }
+      }
+      signal?.addEventListener("abort", onAbort, { once: true });
       try {
         const event = await callInnerRequest(
           { type: "catalog", requestId: reqId, ...(cwd ? { cwd } : {}) },
-          { purpose: "catalog", cwd },
+          {
+            purpose: "catalog",
+            cwd,
+            signal,
+            onChild: (c) => {
+              catalogChild = c;
+            },
+          },
         );
         if (event.type !== "catalog") {
           throw new Error("Invalid catalog event from ACP provider");
         }
         return event.catalog;
       } catch (err) {
+        const childRef = catalogChild ?? lastUtilityChild;
         const message =
-          lastUtilityChild?.describeFailure(
+          childRef?.describeFailure(
             isRecord(err) && typeof err.message === "string" ? err.message : String(err),
           ) ??
           (isRecord(err) && typeof err.message === "string"
@@ -762,24 +905,33 @@ export function createAntigravityResilientProvider(
           message,
           message,
         );
+      } finally {
+        if (startupTimer !== null) clearTimeout(startupTimer);
+        signal?.removeEventListener("abort", onAbort);
       }
     };
 
     const fetchCatalogWithResilience = async (
       cwd: string | undefined,
-      optionsFetch?: { allowStale?: boolean; countFailure?: boolean },
+      optionsFetch?: { allowStale?: boolean; countFailure?: boolean; signal?: AbortSignal },
     ): Promise<ProviderCatalog> => {
       const allowStale = optionsFetch?.allowStale ?? true;
       const countFailure = optionsFetch?.countFailure ?? true;
+      const signal = optionsFetch?.signal;
       try {
         let catalog: ProviderCatalog;
         try {
-          catalog = await probeCatalogOnce(cwd);
+          catalog = await probeCatalogOnce(cwd, signal);
         } catch (firstErr) {
           const msg = firstErr instanceof Error ? firstErr.message : String(firstErr);
-          if (!isPermanentAuthError(msg) && (isStreamInterruption(msg) || isTransientLaunchError(firstErr))) {
-            await abortableSleep(discoveryRetryDelayMs);
-            catalog = await probeCatalogOnce(cwd);
+          if (
+            !signal?.aborted &&
+            !connectionClosed &&
+            !isPermanentAuthError(msg) &&
+            (isStreamInterruption(msg) || isTransientLaunchError(firstErr))
+          ) {
+            await abortableSleep(discoveryRetryDelayMs, signal);
+            catalog = await probeCatalogOnce(cwd, signal);
           } else {
             throw firstErr;
           }
@@ -826,53 +978,84 @@ export function createAntigravityResilientProvider(
         throw new Error("Cannot reopen Antigravity session without a native session ID");
       }
 
+      const reopenAbort = new AbortController();
+      session.reopenAbort = reopenAbort;
       session.suppressInternalOpenClose = true;
-      try {
-        if (session.innerOpen) {
-          const closeId = `__internal_close_${++session.sequence}`;
-          await callInnerRequest(
-            { type: "session.close", requestId: closeId, sessionId: session.sessionId },
-            { purpose: "recovery-close", sessionId: session.sessionId },
-          ).catch(() => undefined);
-          session.innerOpen = false;
-        }
 
-        session.runtimeEpoch += 1;
-        session.sawUsageSinceOpen = false;
-        session.postLoadUsageWaiter?.settle();
-        const openId = `__internal_reopen_${++session.sequence}`;
-        const readyPromise = new Promise<void>((resolve, reject) => {
-          pendingInternalRequests.set(openId, {
-            resolve: () => resolve(),
-            reject: (err) => reject(new Error(err.message)),
+      const reopenTask = (async () => {
+        try {
+          if (session.innerOpen) {
+            const closeId = `__internal_close_${++session.sequence}`;
+            await callInnerRequest(
+              { type: "session.close", requestId: closeId, sessionId: session.sessionId },
+              { purpose: "recovery-close", session, sessionId: session.sessionId },
+            ).catch(() => undefined);
+            session.innerOpen = false;
+          }
+
+          if (session.closedByHost || connectionClosed || reopenAbort.signal.aborted) {
+            throw new Error("Antigravity session reopen aborted");
+          }
+
+          session.runtimeEpoch += 1;
+          session.sawUsageSinceOpen = false;
+          session.sentPromptSinceOpen = false;
+          session.postLoadUsageWaiter?.settle();
+          const openId = `__internal_reopen_${++session.sequence}`;
+          session.activeOpenReqId = openId;
+          const readyPromise = new Promise<void>((resolve, reject) => {
+            pendingInternalRequests.set(openId, {
+              resolve: () => resolve(),
+              reject: (err) => reject(new Error(err.message)),
+            });
           });
-        });
 
-        await contextStore.run(
-          {
-            purpose: "recovery-reopen",
-            sessionId: session.sessionId,
-            cwd: session.currentConfig.cwd,
-            env: session.currentConfig.env,
-          },
-          () =>
-            inner.send({
-              type: "session.open",
-              requestId: openId,
+          await contextStore.run(
+            {
+              purpose: "recovery-reopen",
+              session,
               sessionId: session.sessionId,
-              history: "skip",
-              persistence: { version: 1, data: { sessionId: session.nativeSessionId! } },
-              config: session.currentConfig,
-            }),
-        );
-        await readyPromise;
-        if (!session.sawUsageSinceOpen) {
-          armPostLoadUsageWindow(session, 60);
+              cwd: session.currentConfig.cwd,
+              env: session.currentConfig.env,
+              signal: reopenAbort.signal,
+            },
+            () =>
+              inner.send({
+                type: "session.open",
+                requestId: openId,
+                sessionId: session.sessionId,
+                history: "skip",
+                persistence: { version: 1, data: { sessionId: session.nativeSessionId! } },
+                config: session.currentConfig,
+              }),
+          );
+          await awaitOpenReadyWithTimeout(session, openId, readyPromise, reopenAbort.signal);
+          session.innerOpen = true;
+          session.innerDead = false;
+        } catch (err) {
+          session.innerOpen = false;
+          session.innerDead = true;
+          await session.currentChild?.close({ force: true }).catch(() => undefined);
+          throw err;
+        } finally {
+          if (session.reopenAbort === reopenAbort) {
+            session.reopenAbort = null;
+          }
+          session.suppressInternalOpenClose = false;
         }
-        session.innerOpen = true;
-        session.innerDead = false;
+      })();
+
+      const tracked = reopenTask.then(
+        () => undefined,
+        () => undefined,
+      );
+      session.activeLifecycleOpen = tracked;
+      try {
+        await reopenTask;
       } finally {
-        session.suppressInternalOpenClose = false;
+        if (session.activeLifecycleOpen === tracked) {
+          session.activeLifecycleOpen = null;
+        }
       }
     };
 
@@ -1074,6 +1257,8 @@ export function createAntigravityResilientProvider(
         ranForegroundTools: false,
         hasTrailingAssistantText: false,
         cancelRequested: false,
+        cancelAbort: new AbortController(),
+        cancelDeadline: null,
         recovering: false,
         retryCounts: emptyRetryCounts(),
         openTools: new Map(),
@@ -1113,6 +1298,8 @@ export function createAntigravityResilientProvider(
         state: "completed" | "failed" | "canceled",
         error?: ProviderError,
       ): void => {
+        clearCancelDeadline(turn.cancelDeadline);
+        turn.cancelDeadline = null;
         clearCancelDeadline(turn.activeAttempt?.cancelDeadline ?? null);
         turn.activeAttempt = null;
         if (session.activeTurn === turn) {
@@ -1335,6 +1522,7 @@ export function createAntigravityResilientProvider(
           }
 
           // Outcome is "failed": diagnose and classify for bounded recovery.
+          const explicitRpcError = session.currentChild?.lastRpcError() ?? null;
           const rawMessage =
             outcome.error?.code === "LAUNCH_RATE_LIMITED"
               ? outcome.error.message
@@ -1356,7 +1544,7 @@ export function createAntigravityResilientProvider(
 
           const decision = classifyTurnFailure({
             rawError: rawMessage,
-            processExited,
+            processExited: processExited && explicitRpcError === null,
             hadProgress: turn.hadProgress,
             configuredModel: session.currentConfig.model,
             counts: turn.retryCounts,
@@ -1385,9 +1573,14 @@ export function createAntigravityResilientProvider(
               freshCatalog = await fetchCatalogWithResilience(session.currentConfig.cwd, {
                 allowStale: false,
                 countFailure: false,
+                signal: turn.cancelAbort.signal,
               });
             } catch {
               freshCatalog = null;
+            }
+            if (turn.cancelRequested || session.closedByHost || connectionClosed) {
+              turn.recovering = false;
+              continue;
             }
 
             const stillListed =
@@ -1506,7 +1699,8 @@ export function createAntigravityResilientProvider(
     };
 
     const handleInnerEvent = (event: ProviderEvent): void => {
-      // 1. Intercept internal request replies (`catalog`, `session.close`, `session.open` recovery).
+      // 1. Intercept internal request replies BEFORE looking up `sessions`, so aborted/closed
+      // opens and utility probes always settle `pendingInternalRequests`.
       if (
         (event.type === "catalog" ||
           event.type === "sessions" ||
@@ -1518,6 +1712,39 @@ export function createAntigravityResilientProvider(
         pendingInternalRequests.delete(event.requestId);
         pending.resolve(event);
         return;
+      }
+
+      if (event.type === "session.ready" && event.requestId) {
+        if (pendingInternalRequests.has(event.requestId)) {
+          const targetSession = sessions.get(event.sessionId);
+          if (targetSession) {
+            targetSession.innerOpen = true;
+            targetSession.innerDead = false;
+            if (targetSession.activeOpenReqId === event.requestId) {
+              targetSession.activeOpenReqId = null;
+            }
+          }
+          const pending = pendingInternalRequests.get(event.requestId)!;
+          pendingInternalRequests.delete(event.requestId);
+          pending.resolve(event);
+          return;
+        }
+        if (
+          event.requestId.startsWith("__open_") ||
+          event.requestId.startsWith("__internal_reopen_")
+        ) {
+          // Late `session.ready` for an already-aborted internal open: evict from `inner` immediately.
+          const lateCloseId = `__late_close_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+          void inner
+            .send({
+              type: "session.close",
+              requestId: lateCloseId,
+              sessionId: event.sessionId,
+            })
+            .catch(() => undefined);
+          interceptedClientRequests.add(lateCloseId);
+          return;
+        }
       }
 
       if (event.type === "request.failed") {
@@ -1589,7 +1816,6 @@ export function createAntigravityResilientProvider(
         });
         if (decoded) session.nativeSessionId = decoded;
         session.capabilities = event.capabilities;
-        session.innerOpen = true;
         session.innerDead = false;
         if (session.suppressInternalOpenClose) return;
         emitSessionEvent(session, {
@@ -1791,9 +2017,9 @@ export function createAntigravityResilientProvider(
         if (event.type === "session.usage") {
           session.sawUsageSinceOpen = true;
           if (event.turnId === undefined) {
-            if (session.postLoadUsageWaiter !== null && !activeTurn.hadProgress) {
+            if (!session.sentPromptSinceOpen) {
               session.compactor.noteReplayedUsage(event.usage.contextWindowUsedTokens);
-              session.postLoadUsageWaiter.settle();
+              session.postLoadUsageWaiter?.settle();
             } else {
               session.compactor.noteBusinessModelUsage(event.usage.contextWindowUsedTokens);
             }
@@ -1832,11 +2058,16 @@ export function createAntigravityResilientProvider(
         return;
       }
 
-      // 6. Replay / post-ready / idle `session.usage` updates (cold baseline, never warms cache).
+      // 6. Replay / post-ready / idle `session.usage` updates: only treat as cold replay
+      // if no `session/prompt` has been sent to this child since open.
       if (event.type === "session.usage") {
         session.sawUsageSinceOpen = true;
-        session.compactor.noteReplayedUsage(event.usage.contextWindowUsedTokens);
-        session.postLoadUsageWaiter?.settle();
+        if (!session.sentPromptSinceOpen) {
+          session.compactor.noteReplayedUsage(event.usage.contextWindowUsedTokens);
+          session.postLoadUsageWaiter?.settle();
+        } else if (event.turnId === undefined) {
+          session.compactor.noteBusinessModelUsage(event.usage.contextWindowUsedTokens);
+        }
       }
 
       emitSessionEvent(session, event);
@@ -1846,9 +2077,23 @@ export function createAntigravityResilientProvider(
 
     const openManagedSessionWithModelRecheck = async (
       input: Extract<ProviderInput, { type: "session.open" }>,
+      priorClosingPromise: Promise<void> | null = null,
     ): Promise<void> => {
-      if (sessions.has(input.sessionId)) {
-        throw new Error(`Session already exists: ${input.sessionId}`);
+      if (priorClosingPromise) {
+        await priorClosingPromise;
+      }
+      if (connectionClosed) return;
+      const currentExisting = sessions.get(input.sessionId);
+      if (currentExisting && !currentExisting.closedByHost) {
+        emitToHost({
+          type: "request.failed",
+          requestId: input.requestId,
+          error: {
+            message: `Session already exists: ${input.sessionId}`,
+            diagnostic: `Session already exists: ${input.sessionId}`,
+          },
+        });
+        return;
       }
       requireProviderCapabilities(inner.capabilities, input);
 
@@ -1865,6 +2110,10 @@ export function createAntigravityResilientProvider(
         readyEmitted: false,
         openingBuffer: [],
         openAbort,
+        reopenAbort: null,
+        activeOpenReqId: null,
+        activeLifecycleOpen: null,
+        closingPromise: null,
         closedByHost: false,
         innerOpen: false,
         innerDead: false,
@@ -1873,6 +2122,7 @@ export function createAntigravityResilientProvider(
         currentChild: null,
         inFlightPromptRpcIds: new Set(),
         sawUsageSinceOpen: false,
+        sentPromptSinceOpen: false,
         postLoadUsageWaiter: null,
         compactor: new SessionCompactor({
           sessionEnv: input.config.env,
@@ -1889,20 +2139,27 @@ export function createAntigravityResilientProvider(
       sessions.set(input.sessionId, session);
 
       const runOpenOnce = async (): Promise<void> => {
+        if (session.closedByHost || connectionClosed || openAbort.signal.aborted) {
+          throw new Error("Antigravity session open aborted");
+        }
         session.openingBuffer = [];
         session.runtimeEpoch += 1;
         session.sawUsageSinceOpen = false;
+        session.sentPromptSinceOpen = false;
         session.postLoadUsageWaiter?.settle();
         const internalReqId = `__open_${++session.sequence}_${input.requestId}`;
+        session.activeOpenReqId = internalReqId;
         const readyPromise = new Promise<ProviderEvent>((resolve, reject) => {
           pendingInternalRequests.set(internalReqId, { resolve, reject });
         });
         await contextStore.run(
           {
             purpose: "session.open",
+            session,
             sessionId: input.sessionId,
             cwd: input.config.cwd,
             env: input.config.env,
+            signal: openAbort.signal,
           },
           () =>
             inner.send({
@@ -1910,115 +2167,146 @@ export function createAntigravityResilientProvider(
               requestId: internalReqId,
             }),
         );
-        await readyPromise;
+        await awaitOpenReadyWithTimeout(session, internalReqId, readyPromise, openAbort.signal);
+        session.innerOpen = true;
+        session.innerDead = false;
         if (session.nativeSessionId && input.persistence && !session.sawUsageSinceOpen) {
-          armPostLoadUsageWindow(session, 60);
+          armPostLoadUsageWindow(session, postLoadUsageWindowMs);
         }
       };
 
-      try {
+      const openFlow = (async () => {
         try {
-          await runOpenOnce();
-        } catch (firstErr) {
-          if (session.closedByHost || connectionClosed) return;
-          const rawMsg =
-            session.currentChild?.describeFailure(
-              isRecord(firstErr) && typeof firstErr.message === "string"
-                ? firstErr.message
-                : String(firstErr),
-            ) ??
-            formatDiagnostic(
-              isRecord(firstErr) && typeof firstErr.message === "string"
-                ? firstErr.message
-                : String(firstErr),
-            );
-          if (parseThinkingLevelRejection(rawMsg) !== null) {
-            throw new ProviderActionError("INVALID_THINKING_LEVEL", rawMsg, rawMsg);
-          }
-          const rejection = parseModelRejection(rawMsg, input.config.model);
-          if (!rejection) {
-            throw new ProviderActionError(
-              isRecord(firstErr) && typeof firstErr.code === "string" ? firstErr.code : "",
-              rawMsg,
-              rawMsg,
-            );
-          }
-
-          // Model rejected during session.open: discard buffered replay from attempt 1 and re-probe once (`db19236`).
-          session.openingBuffer = [];
-          const checkDelay =
-            options.recovery?.modelRejectionRetryDelayMs ?? MODEL_REJECTION_RETRY_DELAY_MS;
-          if (checkDelay > 0) await abortableSleep(checkDelay, openAbort.signal);
-          if (session.closedByHost || connectionClosed) return;
-
-          let freshCatalog: ProviderCatalog | null = null;
           try {
-            freshCatalog = await fetchCatalogWithResilience(input.config.cwd, {
-              allowStale: false,
-              countFailure: false,
-            });
-          } catch {
-            freshCatalog = null;
-          }
-          if (session.closedByHost || connectionClosed) return;
-
-          if (freshCatalog && catalogOffersModel(freshCatalog, rejection.model)) {
             await runOpenOnce();
-          } else {
-            invalidateModel(rejection.model);
-            const available = freshCatalog?.models.map((m) => m.id) ?? rejection.available;
-            const invalidErr = buildInvalidModelError(rejection.model, available, rawMsg);
-            throw new ProviderActionError("INVALID_MODEL", invalidErr.message, invalidErr.diagnostic);
-          }
-        }
+          } catch (firstErr) {
+            if (session.closedByHost || connectionClosed) {
+              await session.currentChild?.close({ force: true }).catch(() => undefined);
+              return;
+            }
+            const rawMsg =
+              session.currentChild?.describeFailure(
+                isRecord(firstErr) && typeof firstErr.message === "string"
+                  ? firstErr.message
+                  : String(firstErr),
+              ) ??
+              formatDiagnostic(
+                isRecord(firstErr) && typeof firstErr.message === "string"
+                  ? firstErr.message
+                  : String(firstErr),
+              );
+            await session.currentChild?.close({ force: true }).catch(() => undefined);
 
-        if (session.closedByHost || connectionClosed) {
-          if (session.innerOpen) {
-            const cleanupCloseId = `__close_after_aborted_open_${++session.sequence}`;
-            session.suppressInternalOpenClose = true;
-            await callInnerRequest(
-              { type: "session.close", requestId: cleanupCloseId, sessionId: session.sessionId },
-              { purpose: "session.close", sessionId: session.sessionId },
-            ).catch(() => undefined);
-          }
-          await session.currentChild?.close().catch(() => undefined);
-          return;
-        }
+            if (parseThinkingLevelRejection(rawMsg) !== null) {
+              throw new ProviderActionError("INVALID_THINKING_LEVEL", rawMsg, rawMsg);
+            }
+            const rejection = parseModelRejection(rawMsg, input.config.model);
+            if (!rejection) {
+              throw new ProviderActionError(
+                isRecord(firstErr) && typeof firstErr.code === "string" ? firstErr.code : "",
+                rawMsg,
+                rawMsg,
+              );
+            }
 
-        const buffered = session.openingBuffer ?? [];
-        session.openingBuffer = null;
-        session.openAbort = null;
-        for (const bufferedEvent of buffered) {
-          emitToHost(bufferedEvent);
+            // Model rejected during session.open: discard buffered replay from attempt 1 and re-probe once (`db19236`).
+            session.openingBuffer = [];
+            const checkDelay =
+              options.recovery?.modelRejectionRetryDelayMs ?? MODEL_REJECTION_RETRY_DELAY_MS;
+            if (checkDelay > 0) await abortableSleep(checkDelay, openAbort.signal);
+            if (session.closedByHost || connectionClosed) return;
+
+            let freshCatalog: ProviderCatalog | null = null;
+            try {
+              freshCatalog = await fetchCatalogWithResilience(input.config.cwd, {
+                allowStale: false,
+                countFailure: false,
+                signal: openAbort.signal,
+              });
+            } catch {
+              freshCatalog = null;
+            }
+            if (session.closedByHost || connectionClosed) return;
+
+            if (freshCatalog && catalogOffersModel(freshCatalog, rejection.model)) {
+              await runOpenOnce();
+            } else {
+              invalidateModel(rejection.model);
+              const available = freshCatalog?.models.map((m) => m.id) ?? rejection.available;
+              const invalidErr = buildInvalidModelError(rejection.model, available, rawMsg);
+              throw new ProviderActionError(
+                "INVALID_MODEL",
+                invalidErr.message,
+                invalidErr.diagnostic,
+              );
+            }
+          }
+
+          if (session.closedByHost || connectionClosed) {
+            if (session.innerOpen) {
+              const cleanupCloseId = `__close_after_aborted_open_${++session.sequence}`;
+              session.suppressInternalOpenClose = true;
+              await callInnerRequest(
+                { type: "session.close", requestId: cleanupCloseId, sessionId: session.sessionId },
+                { purpose: "session.close", session, sessionId: session.sessionId },
+              ).catch(() => undefined);
+              session.innerOpen = false;
+            }
+            await session.currentChild?.close({ force: true }).catch(() => undefined);
+            return;
+          }
+
+          const buffered = session.openingBuffer ?? [];
+          session.openingBuffer = null;
+          session.openAbort = null;
+          for (const bufferedEvent of buffered) {
+            emitToHost(bufferedEvent);
+          }
+          session.readyEmitted = true;
+          emitToHost({
+            type: "session.ready",
+            requestId: input.requestId,
+            sessionId: input.sessionId,
+          });
+        } catch (error) {
+          session.postLoadUsageWaiter?.settle();
+          await session.currentChild?.close({ force: true }).catch(() => undefined);
+          if (session.closedByHost || connectionClosed) {
+            return;
+          }
+          if (sessions.get(input.sessionId) === session) {
+            sessions.delete(input.sessionId);
+          }
+          launchRateGuard.clearSession(input.sessionId);
+          const errPayload: ProviderError =
+            error instanceof ProviderActionError
+              ? {
+                  ...(error.code ? { code: error.code } : {}),
+                  message: error.message,
+                  ...(error.diagnostic ? { diagnostic: error.diagnostic } : {}),
+                }
+              : {
+                  message: formatDiagnostic(error instanceof Error ? error.message : String(error)),
+                };
+          emitToHost({
+            type: "request.failed",
+            requestId: input.requestId,
+            error: errPayload,
+          });
         }
-        session.readyEmitted = true;
-        emitToHost({
-          type: "session.ready",
-          requestId: input.requestId,
-          sessionId: input.sessionId,
-        });
-      } catch (error) {
-        if (session.closedByHost || connectionClosed) {
-          return;
+      })();
+
+      const tracked = openFlow.then(
+        () => undefined,
+        () => undefined,
+      );
+      session.activeLifecycleOpen = tracked;
+      try {
+        await openFlow;
+      } finally {
+        if (session.activeLifecycleOpen === tracked) {
+          session.activeLifecycleOpen = null;
         }
-        session.postLoadUsageWaiter?.settle();
-        sessions.delete(input.sessionId);
-        launchRateGuard.clearSession(input.sessionId);
-        const errPayload: ProviderError =
-          error instanceof ProviderActionError
-            ? {
-                ...(error.code ? { code: error.code } : {}),
-                message: error.message,
-                ...(error.diagnostic ? { diagnostic: error.diagnostic } : {}),
-              }
-            : {
-                message: formatDiagnostic(error instanceof Error ? error.message : String(error)),
-              };
-        emitToHost({
-          type: "request.failed",
-          requestId: input.requestId,
-          error: errPayload,
-        });
       }
     };
 
@@ -2052,13 +2340,17 @@ export function createAntigravityResilientProvider(
 
       if (activeTurn) {
         activeTurn.cancelRequested = true;
+        activeTurn.cancelAbort.abort();
         activeTurn.sleepAbort?.abort();
-        const attempt = activeTurn.activeAttempt;
-        if (attempt && !attempt.cancelDeadline) {
-          attempt.cancelDeadline = armCancelDeadline(() => {
-            session.innerDead = true;
-            void session.currentChild?.close({ force: true });
-            attempt.resolve({ state: "canceled", processExited: true });
+        session.postLoadUsageWaiter?.settle();
+        // Arm a turn-level fallback deadline covering BOTH `ensureInnerSessionAlive` reopens
+        // (`activeAttempt === null`) and in-flight ACP attempts (`activeAttempt !== null`).
+        if (!activeTurn.cancelDeadline && (cancelCompaction || !session.activeCompaction)) {
+          activeTurn.cancelDeadline = armCancelDeadline(() => {
+            abortPendingSessionOpen(session, "Antigravity session reopen canceled", {
+              killChild: true,
+            });
+            activeTurn.activeAttempt?.resolve({ state: "canceled", processExited: true });
           });
         }
       }
@@ -2067,8 +2359,9 @@ export function createAntigravityResilientProvider(
         activeCompaction.cancelRequested = true;
         if (!activeCompaction.cancelDeadline) {
           activeCompaction.cancelDeadline = armCancelDeadline(() => {
-            session.innerDead = true;
-            void session.currentChild?.close({ force: true });
+            abortPendingSessionOpen(session, "Antigravity compaction reopen canceled", {
+              killChild: true,
+            });
             activeCompaction.resolveOutcome("canceled");
           });
         }
@@ -2092,7 +2385,7 @@ export function createAntigravityResilientProvider(
             requestId: internalInterruptId,
             sessionId: session.sessionId,
           },
-          { purpose: "session.interrupt", sessionId: session.sessionId },
+          { purpose: "session.interrupt", session, sessionId: session.sessionId },
         ).catch(() => undefined);
       }
 
@@ -2155,11 +2448,12 @@ export function createAntigravityResilientProvider(
         }
 
         if (input.type === "session.open") {
-          if (sessions.has(input.sessionId)) {
+          const existing = sessions.get(input.sessionId);
+          if (existing && !existing.closedByHost) {
             throw new Error(`Session already exists: ${input.sessionId}`);
           }
           requireProviderCapabilities(inner.capabilities, input);
-          void openManagedSessionWithModelRecheck(input);
+          void openManagedSessionWithModelRecheck(input, existing?.closingPromise ?? null);
           return;
         }
 
@@ -2169,7 +2463,7 @@ export function createAntigravityResilientProvider(
         }
 
         const session = sessions.get(input.sessionId);
-        if (!session) {
+        if (!session || (session.closedByHost && input.type !== "session.close")) {
           throw new Error(`Unknown session: ${input.sessionId}`);
         }
         requireProviderCapabilities(session.capabilities, input);
@@ -2271,12 +2565,15 @@ export function createAntigravityResilientProvider(
               if (session.activeCompaction) {
                 await session.activeCompaction.promise;
               }
+              if (session.closedByHost || connectionClosed) return;
               await ensureInnerSessionAlive(session);
+              if (session.closedByHost || connectionClosed) return;
               const internalCfgId = `__cfg_${++session.sequence}_${input.requestId}`;
               await callInnerRequest(
                 { ...input, requestId: internalCfgId },
                 {
                   purpose: "session.configure",
+                  session,
                   sessionId: session.sessionId,
                   cwd: session.currentConfig.cwd,
                   env: session.currentConfig.env,
@@ -2284,6 +2581,7 @@ export function createAntigravityResilientProvider(
               );
               emitToHost({ type: "request.completed", requestId: input.requestId });
             } catch (err) {
+              if (session.closedByHost || connectionClosed) return;
               const rawMsg =
                 session.currentChild?.describeFailure(
                   isRecord(err) && typeof err.message === "string" ? err.message : String(err),
@@ -2328,34 +2626,76 @@ export function createAntigravityResilientProvider(
         }
 
         if (input.type === "session.close") {
-          session.closedByHost = true;
-          session.openAbort?.abort();
-          session.postLoadUsageWaiter?.settle();
-          session.compactor.clearIdleTimer();
-          for (const queued of session.queuedTurns) {
-            queued.canceled = true;
+          if (session.closingPromise) {
+            await session.closingPromise;
+            emitToHost({ type: "request.completed", requestId: input.requestId });
+            return;
           }
-          if (session.activeTurn) {
-            session.activeTurn.cancelRequested = true;
-            session.activeTurn.sleepAbort?.abort();
-            session.activeTurn.activeAttempt?.resolve({ state: "canceled", processExited: true });
-          }
-          if (session.activeCompaction) {
-            session.activeCompaction.cancelRequested = true;
-            session.activeCompaction.resolveOutcome("canceled");
-          }
-          sessions.delete(session.sessionId);
-          launchRateGuard.clearSession(session.sessionId);
 
-          if (session.innerOpen) {
-            const internalCloseId = `__close_${++session.sequence}`;
-            session.suppressInternalOpenClose = true;
-            await callInnerRequest(
-              { type: "session.close", requestId: internalCloseId, sessionId: session.sessionId },
-              { purpose: "session.close", sessionId: session.sessionId },
-            ).catch(() => undefined);
-          }
-          await session.currentChild?.close().catch(() => undefined);
+          const closeTask = (async () => {
+            session.closedByHost = true;
+            session.postLoadUsageWaiter?.settle();
+            session.compactor.clearIdleTimer();
+            for (const queued of session.queuedTurns) {
+              queued.canceled = true;
+            }
+            if (session.activeTurn) {
+              session.activeTurn.cancelRequested = true;
+              session.activeTurn.cancelAbort.abort();
+              session.activeTurn.sleepAbort?.abort();
+              clearCancelDeadline(session.activeTurn.cancelDeadline);
+              session.activeTurn.cancelDeadline = null;
+              clearCancelDeadline(session.activeTurn.activeAttempt?.cancelDeadline ?? null);
+              session.activeTurn.activeAttempt?.resolve({ state: "canceled", processExited: true });
+            }
+            if (session.activeCompaction) {
+              session.activeCompaction.cancelRequested = true;
+              clearCancelDeadline(session.activeCompaction.cancelDeadline);
+              session.activeCompaction.cancelDeadline = null;
+              session.activeCompaction.resolveOutcome("canceled");
+            }
+            abortPendingSessionOpen(session, "Antigravity session closed", { killChild: true });
+
+            if (session.activeLifecycleOpen) {
+              await Promise.race([
+                session.activeLifecycleOpen,
+                abortableSleep(cancelFallbackTimeoutMs),
+              ]);
+            }
+
+            if (session.innerOpen) {
+              const internalCloseId = `__close_${++session.sequence}`;
+              session.suppressInternalOpenClose = true;
+              await Promise.race([
+                callInnerRequest(
+                  {
+                    type: "session.close",
+                    requestId: internalCloseId,
+                    sessionId: session.sessionId,
+                  },
+                  { purpose: "session.close", session, sessionId: session.sessionId },
+                ).catch(() => undefined),
+                abortableSleep(cancelFallbackTimeoutMs),
+              ]);
+              pendingInternalRequests.delete(internalCloseId);
+              session.innerOpen = false;
+            }
+
+            await session.currentChild?.close({ force: true }).catch(() => undefined);
+            if (pendingAbortedCleanups.size > 0) {
+              await Promise.race([
+                Promise.all([...pendingAbortedCleanups]),
+                abortableSleep(cancelFallbackTimeoutMs),
+              ]);
+            }
+            if (sessions.get(session.sessionId) === session) {
+              sessions.delete(session.sessionId);
+            }
+            launchRateGuard.clearSession(session.sessionId);
+          })();
+
+          session.closingPromise = closeTask;
+          await closeTask;
           emitToHost({ type: "session.closed", sessionId: session.sessionId });
           emitToHost({ type: "request.completed", requestId: input.requestId });
           return;
@@ -2364,28 +2704,63 @@ export function createAntigravityResilientProvider(
         await inner.send(input);
       },
       async close(): Promise<void> {
+        if (closeConnectionPromise) return closeConnectionPromise;
         connectionClosed = true;
-        for (const session of sessions.values()) {
-          session.closedByHost = true;
-          session.openAbort?.abort();
-          session.postLoadUsageWaiter?.settle();
-          session.compactor.clearIdleTimer();
-          for (const queued of session.queuedTurns) {
-            queued.canceled = true;
+        closeConnectionPromise = (async () => {
+          for (const session of sessions.values()) {
+            session.closedByHost = true;
+            session.postLoadUsageWaiter?.settle();
+            session.compactor.clearIdleTimer();
+            for (const queued of session.queuedTurns) {
+              queued.canceled = true;
+            }
+            if (session.activeTurn) {
+              session.activeTurn.cancelRequested = true;
+              session.activeTurn.cancelAbort.abort();
+              session.activeTurn.sleepAbort?.abort();
+              clearCancelDeadline(session.activeTurn.cancelDeadline);
+              session.activeTurn.cancelDeadline = null;
+              clearCancelDeadline(session.activeTurn.activeAttempt?.cancelDeadline ?? null);
+              session.activeTurn.activeAttempt?.resolve({ state: "canceled", processExited: true });
+            }
+            if (session.activeCompaction) {
+              session.activeCompaction.cancelRequested = true;
+              clearCancelDeadline(session.activeCompaction.cancelDeadline);
+              session.activeCompaction.cancelDeadline = null;
+              session.activeCompaction.resolveOutcome("canceled");
+            }
+            abortPendingSessionOpen(session, "ACP provider connection closed", { killChild: true });
           }
-          session.activeTurn?.sleepAbort?.abort();
-          session.activeTurn?.activeAttempt?.resolve({ state: "canceled", processExited: true });
-          session.activeCompaction?.resolveOutcome("canceled");
-        }
-        await inner.close().catch(() => undefined);
-        await Promise.all(
-          [...sessions.values()].map((session) =>
-            session.currentChild?.close({ force: true }).catch(() => undefined),
-          ),
-        );
-        await (lastUtilityChild as OwnedAcpChild | null)?.close({ force: true }).catch(() => undefined);
-        sessions.clear();
-        listeners.clear();
+
+          for (const [, pending] of pendingInternalRequests) {
+            pending.reject({
+              message: "ACP provider connection closed",
+              diagnostic: "ACP provider connection closed",
+            });
+          }
+          pendingInternalRequests.clear();
+
+          // Kill all active/spawning child processes BEFORE awaiting `inner.close()` so hung
+          // `session/new`, `session/load`, or `session/set_config_option` calls unblock immediately.
+          await Promise.all([
+            ...[...activeChildren].map((child) =>
+              child.close({ force: true }).catch(() => undefined),
+            ),
+            ...[...sessions.values()].map((session) =>
+              session.currentChild?.close({ force: true }).catch(() => undefined),
+            ),
+            ...[...pendingAbortedCleanups],
+            (lastUtilityChild as OwnedAcpChild | null)?.close({ force: true }).catch(() => undefined),
+          ]);
+
+          await Promise.race([
+            inner.close().catch(() => undefined),
+            abortableSleep(cancelFallbackTimeoutMs),
+          ]);
+          sessions.clear();
+          listeners.clear();
+        })();
+        return closeConnectionPromise;
       },
     };
   }

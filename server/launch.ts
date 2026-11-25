@@ -289,19 +289,33 @@ export async function withLaunchRetry<T>(
   retryable: (error: unknown) => boolean = isTransientLaunchError,
   delaysMs: readonly number[] = LAUNCH_RETRY_DELAYS_MS,
   shouldStop: () => boolean = () => false,
+  signal?: AbortSignal,
 ): Promise<T> {
   for (let i = 0; ; i += 1) {
+    if (signal?.aborted || shouldStop()) {
+      throw new Error("Antigravity CLI launch aborted");
+    }
     try {
       return await attempt();
     } catch (error) {
-      if (i >= delaysMs.length || shouldStop() || !retryable(error)) throw error;
+      if (i >= delaysMs.length || signal?.aborted || shouldStop() || !retryable(error)) throw error;
       const delay = delaysMs[i]!;
       console.warn(
         `[antigravity-resilient] Antigravity CLI launch failed (${sanitizeDiagnosticText(
           error instanceof Error ? error.message : String(error),
         )}); retrying in ${delay}ms`,
       );
-      await new Promise<void>((resolve) => setTimeout(resolve, delay));
+      await new Promise<void>((resolve) => {
+        const onAbort = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(() => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
+        }, delay);
+        signal?.addEventListener("abort", onAbort, { once: true });
+      });
     }
   }
 }
@@ -413,6 +427,8 @@ async function spawnChildOnce(
   args: string[],
   cwd: string | undefined,
   env: Record<string, string>,
+  signal?: AbortSignal,
+  onAbortedCleanup?: (cleanup: Promise<void>) => void,
 ): Promise<
   ChildProcess & {
     stdin: Writable;
@@ -420,6 +436,9 @@ async function spawnChildOnce(
     stderr: Readable;
   }
 > {
+  if (signal?.aborted) {
+    throw new Error("Antigravity CLI launch aborted");
+  }
   const child = spawnFn(command, args, {
     cwd,
     env,
@@ -427,10 +446,98 @@ async function spawnChildOnce(
   });
   if (child.pid !== undefined) return child;
   await new Promise<void>((resolve, reject) => {
-    child.once("spawn", () => resolve());
-    child.once("error", reject);
+    let settled = false;
+    const cleanup = () => {
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const killAbortedChild = async (): Promise<void> => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Ignore if already exited or handle not ready.
+      }
+      await terminateProcess(child, "SIGKILL").catch(() => undefined);
+      try {
+        child.stdin?.destroy();
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+      } catch {
+        // Ignore stream teardown errors on aborted child.
+      }
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      const cleanupTask =
+        child.pid !== undefined
+          ? killAbortedChild()
+          : new Promise<void>((done) => {
+              const safety = setTimeout(done, 1_000);
+              if (typeof safety === "object" && "unref" in safety) safety.unref();
+              child.once("spawn", () => {
+                clearTimeout(safety);
+                void killAbortedChild().finally(done);
+              });
+              child.once("error", () => {
+                clearTimeout(safety);
+                done();
+              });
+            });
+      onAbortedCleanup?.(cleanupTask);
+      child.once("error", () => undefined);
+      reject(new Error("Antigravity CLI launch aborted"));
+    };
+    const onSpawn = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const onError = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    child.once("spawn", onSpawn);
+    child.once("error", onError);
   });
   return child;
+}
+
+function extractRpcErrorDataText(data: unknown): string {
+  if (typeof data === "string") return sanitizeDiagnosticText(data.trim());
+  if (!isRecord(data)) return "";
+  for (const key of ["details", "detail", "message", "error"] as const) {
+    const val = data[key];
+    if (typeof val === "string" && val.trim()) {
+      return sanitizeDiagnosticText(val.trim());
+    }
+    if (isRecord(val) && typeof val.message === "string" && val.message.trim()) {
+      return sanitizeDiagnosticText(val.message.trim());
+    }
+  }
+  if (Object.keys(data).length === 0) return "";
+  try {
+    return sanitizeDiagnosticText(JSON.stringify(data));
+  } catch {
+    return "";
+  }
+}
+
+function formatRpcErrorDiagnostic(rpcErr: {
+  code: number;
+  message: string;
+  data?: unknown;
+}): string {
+  const msg = sanitizeDiagnosticText(rpcErr.message.trim());
+  const dataText = extractRpcErrorDataText(rpcErr.data);
+  if (!dataText) return msg;
+  if (!msg || dataText.includes(msg)) return dataText;
+  if (msg.includes(dataText)) return msg;
+  return `${msg}: ${dataText}`;
 }
 
 export async function spawnAcpChildStream(input: {
@@ -440,7 +547,9 @@ export async function spawnAcpChildStream(input: {
   spawn?: SpawnProcessLike;
   retryDelaysMs?: readonly number[];
   minAgyVersion?: string;
+  signal?: AbortSignal;
   shouldStopRetry?: () => boolean;
+  onAbortedCleanup?: (cleanup: Promise<void>) => void;
 }): Promise<OwnedAcpChild> {
   const spawnFn = input.spawn ?? (spawnProcess as SpawnProcessLike);
   const mergedEnv: Record<string, string> = {
@@ -448,11 +557,28 @@ export async function spawnAcpChildStream(input: {
     ...(input.env ?? {}),
   };
   const child = await withLaunchRetry(
-    () => spawnChildOnce(spawnFn, input.launch.command, [...input.launch.args], input.cwd, mergedEnv),
+    () =>
+      spawnChildOnce(
+        spawnFn,
+        input.launch.command,
+        [...input.launch.args],
+        input.cwd,
+        mergedEnv,
+        input.signal,
+        input.onAbortedCleanup,
+      ),
     isTransientLaunchError,
     input.retryDelaysMs ?? LAUNCH_RETRY_DELAYS_MS,
     input.shouldStopRetry,
+    input.signal,
   );
+  if (input.signal?.aborted || input.shouldStopRetry?.()) {
+    await terminateProcess(child, "SIGKILL").catch(() => undefined);
+    child.stdin?.destroy();
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+    throw new Error("Antigravity CLI launch aborted");
+  }
 
   const stderrLines: string[] = [];
   let activeStderrBookmark = 0;
@@ -705,20 +831,26 @@ export async function spawnAcpChildStream(input: {
     if (spawnErr) return formatDiagnostic(spawnErr.message);
 
     const fallbackClean = fallback ? sanitizeDiagnosticText(fallback.trim()) : "";
-    if (fallbackClean && !isGenericSdkTransportError(fallbackClean)) {
-      return formatDiagnostic(fallbackClean);
+    const processDiedWithPendingRpc = exitState !== null && pendingRequests.size > 0;
+
+    if (recentRpcError && !processDiedWithPendingRpc) {
+      const rpcCombined = formatRpcErrorDiagnostic(recentRpcError);
+      const dataText = extractRpcErrorDataText(recentRpcError.data);
+      if (
+        !fallbackClean ||
+        isGenericSdkTransportError(fallbackClean) ||
+        fallbackClean === recentRpcError.message ||
+        rpcCombined.includes(fallbackClean)
+      ) {
+        return formatDiagnostic(rpcCombined);
+      }
+      if (dataText && !fallbackClean.includes(dataText)) {
+        return formatDiagnostic(`${fallbackClean}: ${dataText}`);
+      }
     }
 
-    const processDiedWithPendingRpc = exitState !== null && pendingRequests.size > 0;
-    if (recentRpcError && !processDiedWithPendingRpc && exitState === null) {
-      const dataText =
-        typeof recentRpcError.data === "string"
-          ? recentRpcError.data
-          : isRecord(recentRpcError.data) && typeof recentRpcError.data.details === "string"
-            ? recentRpcError.data.details
-            : "";
-      const combined = [recentRpcError.message, dataText].filter(Boolean).join(": ");
-      return formatDiagnostic(combined);
+    if (fallbackClean && !isGenericSdkTransportError(fallbackClean)) {
+      return formatDiagnostic(fallbackClean);
     }
 
     const tail = stderrLines.slice(activeStderrBookmark).slice(-6).join("\n").trim();
@@ -740,14 +872,7 @@ export async function spawnAcpChildStream(input: {
       return `Antigravity CLI exited unexpectedly (${exitDetail})`;
     }
     if (recentRpcError) {
-      const dataText =
-        typeof recentRpcError.data === "string"
-          ? recentRpcError.data
-          : isRecord(recentRpcError.data) && typeof recentRpcError.data.details === "string"
-            ? recentRpcError.data.details
-            : "";
-      const combined = [recentRpcError.message, dataText].filter(Boolean).join(": ");
-      return formatDiagnostic(combined);
+      return formatDiagnostic(formatRpcErrorDiagnostic(recentRpcError));
     }
     return fallbackClean ? formatDiagnostic(fallbackClean) : "Antigravity ACP connection closed unexpectedly";
   };
@@ -801,7 +926,7 @@ export async function spawnAcpChildStream(input: {
     exitInfo: () => exitState,
     stderrTail: () => stderrLines,
     detectedVersion: () => agentVersion,
-    lastRpcError: () => recentRpcError,
+    lastRpcError: () => (exitState !== null && pendingRequests.size > 0 ? null : recentRpcError),
     describeFailure,
     close: closeTree,
   };

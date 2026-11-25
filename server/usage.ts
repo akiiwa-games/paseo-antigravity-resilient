@@ -13,7 +13,7 @@ import {
 } from "@getpaseo/plugin/server/usage";
 
 type UsageFetchResult = Awaited<ReturnType<UsageSourceRegistration["fetch"]>>;
-import { resolveEffectiveLaunch } from "./launch.ts";
+import { resolveCommandOnPath, resolveEffectiveLaunch } from "./launch.ts";
 
 export const USAGE_SOURCE_ID = "antigravity-resilient";
 export const USAGE_SOURCE_LABEL = "Antigravity (Resilient)";
@@ -108,20 +108,15 @@ export interface UsageOptions {
   allowGlobalDiscovery?: boolean;
 }
 
-const MAX_CACHED_LAUNCHES = 32;
+const SSH_SESSION_ENV_KEYS = ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"] as const;
 
-const USAGE_RELEVANT_ENV_KEYS = [
+const ACCOUNT_CONFIG_ENV_KEYS = [
   "ANTIGRAVITY_HOME",
   "HOME",
   "USERPROFILE",
   "LOCALAPPDATA",
   "APPDATA",
   "XDG_CONFIG_HOME",
-  "PATH",
-  "Path",
-  "SSH_CONNECTION",
-  "SSH_CLIENT",
-  "SSH_TTY",
   "HTTP_PROXY",
   "HTTPS_PROXY",
   "ALL_PROXY",
@@ -132,38 +127,134 @@ const USAGE_RELEVANT_ENV_KEYS = [
   "no_proxy",
 ] as const;
 
-function pickUsageRelevantEnvOverride(
-  baseEnv: Readonly<Record<string, string>>,
-  sessionEnv: Readonly<Record<string, string>> | undefined,
-): Record<string, string> | undefined {
-  if (!sessionEnv) return undefined;
-  let picked: Record<string, string> | undefined;
-  for (const key of USAGE_RELEVANT_ENV_KEYS) {
-    const value = sessionEnv[key];
-    if (typeof value === "string" && value !== baseEnv[key]) {
-      picked ??= {};
-      picked[key] = value;
-    }
-  }
-  return picked;
+const BINARY_RESOLUTION_ENV_KEYS = ["PATH", "Path"] as const;
+
+interface StoredUsageLaunch {
+  command: string;
+  args: string[];
+  baseEnv: Readonly<Record<string, string>>;
+  envOverrides?: Record<string, string>;
 }
 
-function canonicalLocator(launch: ProviderLaunch): { launch: ProviderLaunch; locator: string } {
-  const sortedEntries = Object.entries(launch.env).sort(([a], [b]) => a.localeCompare(b));
-  const canonicalEnv = Object.fromEntries(sortedEntries);
-  const normalized: ProviderLaunch = {
-    command: launch.command,
-    args: [...launch.args],
-    env: canonicalEnv,
-  };
-  const locator = hashAccountKey(
-    JSON.stringify([normalized.command, normalized.args, sortedEntries]),
+function hasSshSession(env: Readonly<Record<string, string | undefined>>): boolean {
+  return SSH_SESSION_ENV_KEYS.some((key) => Boolean(env[key]?.trim()));
+}
+
+function canonicalizeExecutablePath(command: string): string {
+  if (command.includes("/") || command.includes("\\") || path.isAbsolute(command)) {
+    const abs = path.resolve(command);
+    return process.platform === "win32" ? abs.toLowerCase() : abs;
+  }
+  return command;
+}
+
+function buildUsageLocatorAndLaunch(
+  baseLaunch: ProviderLaunch,
+  sessionEnv?: Readonly<Record<string, string>>,
+): { key: string; locator: string; stored: StoredUsageLaunch } {
+  let resolutionOverride: Record<string, string> | undefined;
+  let storedOverrides: Record<string, string> | undefined;
+
+  if (sessionEnv) {
+    for (const envKey of ACCOUNT_CONFIG_ENV_KEYS) {
+      const value = sessionEnv[envKey];
+      if (typeof value === "string" && value !== baseLaunch.env[envKey]) {
+        resolutionOverride ??= {};
+        resolutionOverride[envKey] = value;
+        storedOverrides ??= {};
+        storedOverrides[envKey] = value;
+      }
+    }
+    for (const pathKey of BINARY_RESOLUTION_ENV_KEYS) {
+      const value = sessionEnv[pathKey];
+      if (typeof value === "string" && value !== baseLaunch.env[pathKey]) {
+        resolutionOverride ??= {};
+        resolutionOverride[pathKey] = value;
+      }
+    }
+  }
+
+  const combinedSsh = sessionEnv
+    ? hasSshSession({ ...baseLaunch.env, ...sessionEnv })
+    : hasSshSession(baseLaunch.env);
+  const baseHasSsh = hasSshSession(baseLaunch.env);
+  if (combinedSsh && !baseHasSsh) {
+    storedOverrides ??= {};
+    storedOverrides.SSH_TTY = "1";
+  } else if (!combinedSsh && baseHasSsh) {
+    storedOverrides ??= {};
+    for (const sshKey of SSH_SESSION_ENV_KEYS) {
+      storedOverrides[sshKey] = "";
+    }
+  }
+
+  const resolved = resolveEffectiveLaunch(
+    baseLaunch,
+    resolutionOverride ? { envOverride: resolutionOverride } : undefined,
   );
-  return { launch: normalized, locator };
+  const resolvedCommand =
+    resolveCommandOnPath(resolved.command, resolved.env) ?? resolved.command;
+  // If `resolvedCommand` remained a bare command name (not found on PATH), keep custom PATH override.
+  if (
+    resolvedCommand === resolved.command &&
+    !(
+      resolvedCommand.includes("/") ||
+      resolvedCommand.includes("\\") ||
+      path.isAbsolute(resolvedCommand)
+    ) &&
+    sessionEnv
+  ) {
+    for (const pathKey of BINARY_RESOLUTION_ENV_KEYS) {
+      const value = sessionEnv[pathKey];
+      if (typeof value === "string" && value !== baseLaunch.env[pathKey]) {
+        storedOverrides ??= {};
+        storedOverrides[pathKey] = value;
+      }
+    }
+  }
+
+  const key = accountKey(resolved.env);
+  const osAccountDirs = [
+    resolved.env.HOME ?? "",
+    resolved.env.USERPROFILE ?? "",
+    resolved.env.LOCALAPPDATA ?? "",
+    resolved.env.APPDATA ?? "",
+    resolved.env.XDG_CONFIG_HOME ?? "",
+  ];
+  const proxyTuple = [
+    resolved.env.HTTPS_PROXY ?? resolved.env.https_proxy ?? "",
+    resolved.env.HTTP_PROXY ?? resolved.env.http_proxy ?? "",
+    resolved.env.ALL_PROXY ?? resolved.env.all_proxy ?? "",
+    resolved.env.NO_PROXY ?? resolved.env.no_proxy ?? "",
+  ];
+
+  // Locator depends exclusively on identity-determining inputs: resolved binary, args,
+  // account directory, OS keyring dirs, boolean SSH sign-in mode, and proxy settings.
+  const locator = hashAccountKey(
+    JSON.stringify([
+      canonicalizeExecutablePath(resolvedCommand),
+      resolved.args,
+      key,
+      osAccountDirs,
+      combinedSsh,
+      proxyTuple,
+    ]),
+  );
+
+  return {
+    key,
+    locator,
+    stored: {
+      command: resolvedCommand,
+      args: [...resolved.args],
+      baseEnv: baseLaunch.env,
+      ...(storedOverrides ? { envOverrides: storedOverrides } : {}),
+    },
+  };
 }
 
 export class Usage {
-  private readonly launches = new Map<string, ProviderLaunch>();
+  private readonly launches = new Map<string, StoredUsageLaunch>();
   private readonly inFlight = new Map<string, Promise<UsageFetchResult>>();
   private readonly options: UsageOptions;
 
@@ -171,22 +262,19 @@ export class Usage {
     this.options = options;
   }
 
-  private rememberLaunch(locator: string, launch: ProviderLaunch): void {
-    if (this.launches.has(locator)) {
-      this.launches.delete(locator);
-    }
-    this.launches.set(locator, launch);
-    while (this.launches.size > MAX_CACHED_LAUNCHES) {
-      const oldest = this.launches.keys().next().value;
-      if (oldest === undefined) break;
-      this.launches.delete(oldest);
-    }
+  private rememberLaunch(locator: string, stored: StoredUsageLaunch): void {
+    // Never evict registered locators: Paseo's `UsageSourceRegistry` retains discovered
+    // `{ launch: locator }` inputs in `known` / `byAgent` and refreshes `listReports({ reportIds })`
+    // without re-running `discover()`. Because `locator` is strictly normalized to account +
+    // binary identity and `StoredUsageLaunch` shares `baseEnv` by reference, each distinct
+    // account uses a single ~150B entry.
+    this.launches.set(locator, stored);
   }
 
-  private async runFetch(locator: string, launch: ProviderLaunch): Promise<UsageFetchResult> {
+  private async runFetch(locator: string, stored: StoredUsageLaunch): Promise<UsageFetchResult> {
     const existing = this.inFlight.get(locator);
     if (existing) return existing;
-    const promise = this.executeCliFetch(launch).finally(() => {
+    const promise = this.executeCliFetch(stored).finally(() => {
       if (this.inFlight.get(locator) === promise) {
         this.inFlight.delete(locator);
       }
@@ -195,16 +283,19 @@ export class Usage {
     return promise;
   }
 
-  private async executeCliFetch(launch: ProviderLaunch): Promise<UsageFetchResult> {
-    const acpIndex = launch.args.indexOf("acp");
+  private async executeCliFetch(stored: StoredUsageLaunch): Promise<UsageFetchResult> {
+    const acpIndex = stored.args.indexOf("acp");
     if (acpIndex < 0) throw new Error("Antigravity launch does not contain the acp subcommand");
+    const execEnv = stored.envOverrides
+      ? { ...stored.baseEnv, ...stored.envOverrides }
+      : stored.baseEnv;
     let result;
     try {
       result = await execCommand(
-        launch.command,
-        [...launch.args.slice(0, acpIndex), "-p", "/usage", "--output-format", "json"],
+        stored.command,
+        [...stored.args.slice(0, acpIndex), "-p", "/usage", "--output-format", "json"],
         {
-          env: launch.env,
+          env: execEnv,
           timeout: 18_000,
           maxBuffer: 1024 * 1024,
         },
@@ -290,30 +381,22 @@ export class Usage {
             (scope.launch?.env.PASEO_ANTIGRAVITY_RESILIENT_GLOBAL_USAGE === "1" ||
               process.env.PASEO_ANTIGRAVITY_RESILIENT_GLOBAL_USAGE === "1");
           if (!globalEnabled || !scope.launch) return [];
-          const resolved = resolveEffectiveLaunch(scope.launch);
-          const { launch, locator } = canonicalLocator(resolved);
-          const key = accountKey(launch.env);
-          this.rememberLaunch(locator, launch);
+          const { key, locator, stored } = buildUsageLocatorAndLaunch(scope.launch);
+          this.rememberLaunch(locator, stored);
           return [{ key, provider: PROVIDER_ID, input: { launch: locator } }];
         }
 
         if (scope.provider !== PROVIDER_ID) return [];
         if (!scope.launch) return [];
-        const relevantOverride = pickUsageRelevantEnvOverride(scope.launch.env, scope.env);
-        const resolved = resolveEffectiveLaunch(
-          scope.launch,
-          relevantOverride ? { envOverride: relevantOverride } : undefined,
-        );
-        const { launch, locator } = canonicalLocator(resolved);
-        const key = accountKey(launch.env);
-        this.rememberLaunch(locator, launch);
+        const { key, locator, stored } = buildUsageLocatorAndLaunch(scope.launch, scope.env);
+        this.rememberLaunch(locator, stored);
         return [{ key, provider: PROVIDER_ID, input: { launch: locator } }];
       },
       fetch: async (value) => {
         const { launch: locator } = inputSchema.parse(value);
-        const launch = this.launches.get(locator);
-        if (!launch) throw new Error("Antigravity launch no longer exists");
-        return this.runFetch(locator, launch);
+        const stored = this.launches.get(locator);
+        if (!stored) throw new Error("Antigravity launch no longer exists");
+        return this.runFetch(locator, stored);
       },
     };
   }
