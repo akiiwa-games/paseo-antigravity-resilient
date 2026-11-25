@@ -451,11 +451,8 @@ async function spawnChildOnce(
       signal?.removeEventListener("abort", onAbort);
     };
     const killAbortedChild = async (): Promise<void> => {
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // Ignore if already exited or handle not ready.
-      }
+      // Call `terminateProcess` directly (without `child.kill("SIGKILL")` first) so Windows
+      // `taskkill /PID <pid> /T /F` terminates both `.cmd` wrapper shells and their grandchildren.
       await terminateProcess(child, "SIGKILL").catch(() => undefined);
       try {
         child.stdin?.destroy();
