@@ -98,15 +98,21 @@ function hasPathSeparator(command: string): boolean {
   return command.includes("/") || command.includes("\\") || path.isAbsolute(command);
 }
 
-export function isCommandOnPath(
+function normalizeWinPath(candidate: string): string {
+  return candidate.replaceAll("/", "\\").toLowerCase();
+}
+
+const registeredWindowsFallbacks = new Set<string>();
+
+export function resolveCommandOnPath(
   command: string,
   env: Readonly<Record<string, string | undefined>> = process.env,
   platform: NodeJS.Platform = process.platform,
   exists: (candidate: string) => boolean = existsSync,
-): boolean {
-  if (hasPathSeparator(command)) return exists(command);
+): string | null {
+  if (hasPathSeparator(command)) return exists(command) ? command : null;
   const pathRaw = env.PATH ?? env.Path ?? "";
-  if (!pathRaw) return false;
+  if (!pathRaw) return null;
   const dirs = pathRaw.split(platform === "win32" ? ";" : ":").filter(Boolean);
   const exts =
     platform === "win32"
@@ -116,10 +122,20 @@ export function isCommandOnPath(
       : [""];
   for (const dir of dirs) {
     for (const ext of exts) {
-      if (exists(path.join(dir, `${command}${ext}`))) return true;
+      const candidate = path.join(dir, `${command}${ext}`);
+      if (exists(candidate)) return candidate;
     }
   }
-  return false;
+  return null;
+}
+
+export function isCommandOnPath(
+  command: string,
+  env: Readonly<Record<string, string | undefined>> = process.env,
+  platform: NodeJS.Platform = process.platform,
+  exists: (candidate: string) => boolean = existsSync,
+): boolean {
+  return resolveCommandOnPath(command, env, platform, exists) !== null;
 }
 
 export function findWindowsLocalAppDataAgy(
@@ -158,7 +174,10 @@ export function resolveDefaultAgyExecutable(options?: {
       options?.home ??
       (options?.env ? (env.USERPROFILE ?? env.HOME) : homedir());
     const fallback = findWindowsLocalAppDataAgy(env, exists, home);
-    if (fallback) return fallback;
+    if (fallback) {
+      registeredWindowsFallbacks.add(normalizeWinPath(fallback));
+      return fallback;
+    }
   }
   return "agy";
 }
@@ -193,16 +212,32 @@ export function resolveEffectiveLaunch(
   let command = launch?.command ?? "agy";
   const args = launch?.args ? [...launch.args] : ["acp", "--disable-telemetry"];
 
-  if (
-    platform === "win32" &&
-    (command === "agy" || command === "agy.exe") &&
-    !isCommandOnPath(command, mergedEnv, platform, exists)
-  ) {
+  if (platform === "win32") {
     const effectiveHome =
       options?.home ??
       (launch ? (mergedEnv.USERPROFILE ?? mergedEnv.HOME) : homedir());
-    const winFallback = findWindowsLocalAppDataAgy(mergedEnv, exists, effectiveHome);
-    if (winFallback) command = winFallback;
+    const processHome = options?.home ?? processEnv.USERPROFILE ?? processEnv.HOME ?? homedir();
+    const processFallback = findWindowsLocalAppDataAgy(processEnv, exists, processHome);
+    const isRegistrationFallback =
+      registeredWindowsFallbacks.has(normalizeWinPath(command)) ||
+      (processFallback !== null && normalizeWinPath(command) === normalizeWinPath(processFallback));
+
+    if (command === "agy" || command === "agy.exe") {
+      if (!isCommandOnPath(command, mergedEnv, platform, exists)) {
+        const winFallback = findWindowsLocalAppDataAgy(mergedEnv, exists, effectiveHome);
+        if (winFallback) command = winFallback;
+      }
+    } else if (isRegistrationFallback) {
+      // Honor custom `env.PATH` or `env.LOCALAPPDATA` configured in ~/.paseo/config.json
+      // when `launch.command` came from the registration-time LocalAppData fallback.
+      const fromCustomPath = resolveCommandOnPath("agy", mergedEnv, platform, exists);
+      if (fromCustomPath) {
+        command = fromCustomPath;
+      } else {
+        const fromCustomLocalAppData = findWindowsLocalAppDataAgy(mergedEnv, exists, effectiveHome);
+        if (fromCustomLocalAppData) command = fromCustomLocalAppData;
+      }
+    }
   }
 
   return { command, args, env: mergedEnv };
@@ -420,11 +455,13 @@ export async function spawnAcpChildStream(input: {
   );
 
   const stderrLines: string[] = [];
+  let activeStderrBookmark = 0;
+  let outgoingRequestCount = 0;
   let exitState: { code: number | null; signal: NodeJS.Signals | null } | null = null;
   let spawnErr: Error | null = null;
   let protocolFailure: string | null = null;
   let agentVersion: string | null = null;
-  let latestRpcError: { code: number; message: string; data?: unknown } | null = null;
+  let recentRpcError: { code: number; message: string; data?: unknown } | null = null;
   const pendingRequests = new Map<string | number, string>();
 
   let resolveExit!: () => void;
@@ -443,7 +480,10 @@ export async function spawnAcpChildStream(input: {
       const trimmed = rawLine.trim();
       if (!trimmed) continue;
       stderrLines.push(sanitizeDiagnosticText(trimmed));
-      if (stderrLines.length > MAX_STDERR_LINES) stderrLines.shift();
+      if (stderrLines.length > MAX_STDERR_LINES) {
+        stderrLines.shift();
+        activeStderrBookmark = Math.max(0, activeStderrBookmark - 1);
+      }
     }
   };
 
@@ -480,12 +520,15 @@ export async function spawnAcpChildStream(input: {
     const reqMethod = id !== null ? pendingRequests.get(id) : undefined;
     if (id !== null && !("method" in raw)) {
       pendingRequests.delete(id);
+      if ("result" in raw) {
+        recentRpcError = null;
+      }
     }
 
     if ("error" in raw && isRecord(raw.error)) {
       const code = typeof raw.error.code === "number" ? raw.error.code : -32603;
       const message = sanitizeDiagnosticText(String(raw.error.message ?? "ACP error"));
-      latestRpcError = {
+      recentRpcError = {
         code,
         message,
         ...(raw.error.data !== undefined ? { data: raw.error.data } : {}),
@@ -666,18 +709,19 @@ export async function spawnAcpChildStream(input: {
       return formatDiagnostic(fallbackClean);
     }
 
-    if (latestRpcError) {
+    const processDiedWithPendingRpc = exitState !== null && pendingRequests.size > 0;
+    if (recentRpcError && !processDiedWithPendingRpc && exitState === null) {
       const dataText =
-        typeof latestRpcError.data === "string"
-          ? latestRpcError.data
-          : isRecord(latestRpcError.data) && typeof latestRpcError.data.details === "string"
-            ? latestRpcError.data.details
+        typeof recentRpcError.data === "string"
+          ? recentRpcError.data
+          : isRecord(recentRpcError.data) && typeof recentRpcError.data.details === "string"
+            ? recentRpcError.data.details
             : "";
-      const combined = [latestRpcError.message, dataText].filter(Boolean).join(": ");
+      const combined = [recentRpcError.message, dataText].filter(Boolean).join(": ");
       return formatDiagnostic(combined);
     }
 
-    const tail = stderrLines.slice(-6).join("\n").trim();
+    const tail = stderrLines.slice(activeStderrBookmark).slice(-6).join("\n").trim();
     const exitDetail = exitState
       ? exitState.signal
         ? `signal ${exitState.signal}`
@@ -694,6 +738,16 @@ export async function spawnAcpChildStream(input: {
     }
     if (exitDetail) {
       return `Antigravity CLI exited unexpectedly (${exitDetail})`;
+    }
+    if (recentRpcError) {
+      const dataText =
+        typeof recentRpcError.data === "string"
+          ? recentRpcError.data
+          : isRecord(recentRpcError.data) && typeof recentRpcError.data.details === "string"
+            ? recentRpcError.data.details
+            : "";
+      const combined = [recentRpcError.message, dataText].filter(Boolean).join(": ");
+      return formatDiagnostic(combined);
     }
     return fallbackClean ? formatDiagnostic(fallbackClean) : "Antigravity ACP connection closed unexpectedly";
   };
@@ -717,7 +771,12 @@ export async function spawnAcpChildStream(input: {
           typeof raw.method === "string" &&
           (typeof raw.id === "string" || typeof raw.id === "number")
         ) {
+          outgoingRequestCount += 1;
           pendingRequests.set(raw.id, raw.method);
+          recentRpcError = null;
+          if (outgoingRequestCount > 1) {
+            activeStderrBookmark = stderrLines.length;
+          }
         }
         return new Promise<void>((resolve, reject) => {
           child.stdin.write(`${JSON.stringify(message)}\n`, (error) => {
@@ -742,7 +801,7 @@ export async function spawnAcpChildStream(input: {
     exitInfo: () => exitState,
     stderrTail: () => stderrLines,
     detectedVersion: () => agentVersion,
-    lastRpcError: () => latestRpcError,
+    lastRpcError: () => recentRpcError,
     describeFailure,
     close: closeTree,
   };

@@ -68,6 +68,7 @@ import {
   isStreamInterruption,
   MODEL_REJECTION_RETRY_DELAY_MS,
   parseModelRejection,
+  parseThinkingLevelRejection,
   ProviderActionError,
   type RecoveryPolicyOptions,
   sanitizeDiagnosticText,
@@ -259,6 +260,10 @@ type AttemptOutcome = {
 interface ActiveAttempt {
   attemptClientMsgId: string;
   attemptTurnId: string;
+  innerTurnStarted: boolean;
+  crossedWireEndTurn: boolean;
+  notifyInnerStarted: () => void;
+  innerStartedOrSettled: Promise<void>;
   resolve: (outcome: AttemptOutcome) => void;
   cancelDeadline: CancelDeadline | null;
 }
@@ -284,10 +289,20 @@ interface ActiveForegroundTurn {
   recovering: boolean;
   retryCounts: TurnRetryCounts;
   openTools: Map<string, Extract<ProviderTimelineItem, { type: "tool_call" }>>;
-  attemptTools: Map<string, Extract<ProviderTimelineItem, { type: "tool_call" }>>;
+  abortedTools: Map<string, Extract<ProviderTimelineItem, { type: "tool_call" }>>;
   activeAttempt: ActiveAttempt | null;
   sleepAbort: AbortController | null;
   done: Promise<void>;
+}
+
+interface QueuedTurnEntry {
+  prompt: ProviderPrompt;
+  canceled: boolean;
+}
+
+interface PostLoadUsageWaiter {
+  promise: Promise<void>;
+  settle: () => void;
 }
 
 interface ManagedSession {
@@ -297,15 +312,21 @@ interface ManagedSession {
   capabilities: readonly string[];
   nativeSessionId: string | undefined;
   readyEmitted: boolean;
+  openingBuffer: ProviderEvent[] | null;
+  openAbort: AbortController | null;
   closedByHost: boolean;
   innerOpen: boolean;
   innerDead: boolean;
   suppressInternalOpenClose: boolean;
+  runtimeEpoch: number;
   currentChild: OwnedAcpChild | null;
-  wirePromptsInFlight: number;
+  inFlightPromptRpcIds: Set<string | number>;
+  sawUsageSinceOpen: boolean;
+  postLoadUsageWaiter: PostLoadUsageWaiter | null;
   readonly compactor: SessionCompactor;
   activeCompaction: ActiveCompaction | null;
   activeTurn: ActiveForegroundTurn | null;
+  queuedTurns: QueuedTurnEntry[];
   turnLane: Promise<void>;
   sequence: number;
 }
@@ -338,6 +359,14 @@ function isDetachedTool(item: Extract<ProviderTimelineItem, { type: "tool_call" 
     }
   }
   return false;
+}
+
+function isSyntheticTurnAbortToolError(error: unknown): boolean {
+  if (error === "ACP turn failed" || error === "Turn failed") return true;
+  return (
+    isRecord(error) &&
+    (error.message === "Turn failed" || error.message === "ACP turn failed")
+  );
 }
 
 export function createAntigravityResilientProvider(
@@ -452,7 +481,9 @@ export function createAntigravityResilientProvider(
             : undefined;
         void storeDir;
 
-        launchRateGuard.recordLaunch(ctx?.sessionId, ctx?.purpose ?? "acp");
+        if (session) {
+          launchRateGuard.recordLaunch(session.sessionId, ctx?.purpose ?? "session");
+        }
         const owned = await spawnAcpChildStream({
           launch,
           cwd: ctx?.cwd,
@@ -465,7 +496,7 @@ export function createAntigravityResilientProvider(
 
         if (session) {
           session.currentChild = owned;
-          session.wirePromptsInFlight = 0;
+          session.inFlightPromptRpcIds.clear();
           const wrappedStream = {
             readable: owned.stream.readable.pipeThrough(
               new TransformStream<AcpStreamMessage, AcpStreamMessage>({
@@ -474,17 +505,18 @@ export function createAntigravityResilientProvider(
                   if (
                     !("method" in raw) &&
                     ("result" in raw || "error" in raw) &&
-                    session.wirePromptsInFlight > 0 &&
-                    isRecord(raw.result) &&
-                    typeof raw.result.stopReason === "string"
+                    (typeof raw.id === "string" || typeof raw.id === "number") &&
+                    session.inFlightPromptRpcIds.delete(raw.id)
                   ) {
-                    session.wirePromptsInFlight = Math.max(0, session.wirePromptsInFlight - 1);
-                  } else if (
-                    !("method" in raw) &&
-                    "error" in raw &&
-                    session.wirePromptsInFlight > 0
-                  ) {
-                    session.wirePromptsInFlight = Math.max(0, session.wirePromptsInFlight - 1);
+                    if (
+                      "result" in raw &&
+                      isRecord(raw.result) &&
+                      raw.result.stopReason === "end_turn" &&
+                      session.inFlightPromptRpcIds.size === 0 &&
+                      session.activeTurn?.activeAttempt
+                    ) {
+                      session.activeTurn.activeAttempt.crossedWireEndTurn = true;
+                    }
                   }
                   controller.enqueue(frame);
                 },
@@ -493,8 +525,14 @@ export function createAntigravityResilientProvider(
             writable: new WritableStream<AcpStreamMessage>({
               write(frame) {
                 const raw = frame as Record<string, unknown>;
-                if (raw.method === "session/prompt") {
-                  session.wirePromptsInFlight += 1;
+                if (
+                  raw.method === "session/prompt" &&
+                  (typeof raw.id === "string" || typeof raw.id === "number")
+                ) {
+                  session.inFlightPromptRpcIds.add(raw.id);
+                  if (session.activeTurn?.activeAttempt) {
+                    session.activeTurn.activeAttempt.crossedWireEndTurn = false;
+                  }
                 }
                 const writer = owned.stream.writable.getWriter();
                 return writer.write(frame).finally(() => writer.releaseLock());
@@ -562,6 +600,80 @@ export function createAntigravityResilientProvider(
       for (const listener of listeners) {
         listener(event);
       }
+    };
+
+    const namespaceSessionEvent = (
+      session: ManagedSession,
+      event: ProviderEvent,
+    ): ProviderEvent => {
+      if (event.type !== "timeline.item" || session.runtimeEpoch <= 1) {
+        return event;
+      }
+      const item = event.item;
+      if (
+        (item.type === "assistant_message" ||
+          item.type === "reasoning" ||
+          item.type === "user_message") &&
+        /^(?:agent_message_chunk|agent_thought_chunk|user_message_chunk):\d+$/.test(item.id)
+      ) {
+        return {
+          ...event,
+          item: {
+            ...item,
+            id: `epoch-${session.runtimeEpoch}:${item.id}`,
+          },
+        };
+      }
+      return event;
+    };
+
+    const emitSessionEvent = (session: ManagedSession, event: ProviderEvent): void => {
+      if (session.closedByHost || connectionClosed) return;
+      const normalized = namespaceSessionEvent(session, event);
+      if (session.openingBuffer !== null) {
+        session.openingBuffer.push(normalized);
+        return;
+      }
+      emitToHost(normalized);
+    };
+
+    const armPostLoadUsageWindow = (session: ManagedSession, timeoutMs = 50): void => {
+      session.postLoadUsageWaiter?.settle();
+      let settled = false;
+      let resolvePromise!: () => void;
+      const promise = new Promise<void>((resolve) => {
+        resolvePromise = resolve;
+      });
+      const timer = setTimeout(() => {
+        settle();
+      }, timeoutMs);
+      if (typeof timer === "object" && "unref" in timer) {
+        timer.unref();
+      }
+      const settle = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (session.postLoadUsageWaiter === waiter) {
+          session.postLoadUsageWaiter = null;
+        }
+        resolvePromise();
+      };
+      const waiter: PostLoadUsageWaiter = { promise, settle };
+      session.postLoadUsageWaiter = waiter;
+    };
+
+    const isDeferredBackgroundToolWait = (session: ManagedSession): boolean => {
+      const turn = session.activeTurn;
+      const attempt = turn?.activeAttempt ?? null;
+      return Boolean(
+        turn &&
+          !turn.recovering &&
+          attempt &&
+          attempt.crossedWireEndTurn &&
+          session.inFlightPromptRpcIds.size === 0 &&
+          turn.openTools.size > 0,
+      );
     };
 
     const callInnerRequest = (
@@ -725,6 +837,9 @@ export function createAntigravityResilientProvider(
           session.innerOpen = false;
         }
 
+        session.runtimeEpoch += 1;
+        session.sawUsageSinceOpen = false;
+        session.postLoadUsageWaiter?.settle();
         const openId = `__internal_reopen_${++session.sequence}`;
         const readyPromise = new Promise<void>((resolve, reject) => {
           pendingInternalRequests.set(openId, {
@@ -751,6 +866,9 @@ export function createAntigravityResilientProvider(
             }),
         );
         await readyPromise;
+        if (!session.sawUsageSinceOpen) {
+          armPostLoadUsageWindow(session, 60);
+        }
         session.innerOpen = true;
         session.innerDead = false;
       } finally {
@@ -764,7 +882,7 @@ export function createAntigravityResilientProvider(
         isBusy: () =>
           session.activeTurn !== null ||
           session.activeCompaction !== null ||
-          session.wirePromptsInFlight > 0,
+          session.inFlightPromptRpcIds.size > 0,
         isClosed: () => session.closedByHost || connectionClosed,
         onFire: () => {
           void runAutoCompaction(session, "idle");
@@ -785,7 +903,7 @@ export function createAntigravityResilientProvider(
 
       const breaker = session.compactor.checkAutoCompactBreaker();
       if (!breaker.allowed) {
-        emitToHost({
+        emitSessionEvent(session, {
           type: "timeline.item",
           sessionId: session.sessionId,
           item: {
@@ -828,24 +946,32 @@ export function createAntigravityResilientProvider(
           }
 
           // Settle the loading compaction marker cleanly (ProviderEventSchema only permits
-          // "loading" | "completed" on compaction items) and surface explicit failure/cancel info.
-          emitToHost({
+          // "loading" | "completed", matching upstream AcpRuntime.terminalizeTransientItems so
+          // Paseo's spinner stops; only stamp `trigger: "auto"` + `preTokens` on actual success).
+          emitSessionEvent(session, {
             type: "timeline.item",
             sessionId: session.sessionId,
-            item: {
-              id: compactId,
-              type: "compaction",
-              status: "completed",
-              trigger: "auto",
-              ...(preTokens > 0 ? { preTokens } : {}),
-            },
+            item:
+              outcome === "completed"
+                ? {
+                    id: compactId,
+                    type: "compaction",
+                    status: "completed",
+                    trigger: "auto",
+                    ...(preTokens > 0 ? { preTokens } : {}),
+                  }
+                : {
+                    id: compactId,
+                    type: "compaction",
+                    status: "completed",
+                  },
           });
 
           if (outcome === "failed") {
             const detail =
               session.currentChild?.describeFailure(error?.message) ??
               formatDiagnostic(error?.message ?? "Auto-compaction failed");
-            emitToHost({
+            emitSessionEvent(session, {
               type: "timeline.item",
               sessionId: session.sessionId,
               item: {
@@ -856,7 +982,7 @@ export function createAntigravityResilientProvider(
               },
             });
           } else if (outcome === "canceled") {
-            emitToHost({
+            emitSessionEvent(session, {
               type: "timeline.item",
               sessionId: session.sessionId,
               item: {
@@ -878,7 +1004,7 @@ export function createAntigravityResilientProvider(
       };
 
       session.activeCompaction = active;
-      emitToHost({
+      emitSessionEvent(session, {
         type: "timeline.item",
         sessionId: session.sessionId,
         item: {
@@ -951,7 +1077,7 @@ export function createAntigravityResilientProvider(
         recovering: false,
         retryCounts: emptyRetryCounts(),
         openTools: new Map(),
-        attemptTools: new Map(),
+        abortedTools: new Map(),
         activeAttempt: null,
         sleepAbort: null,
         done,
@@ -1012,6 +1138,15 @@ export function createAntigravityResilientProvider(
           return;
         }
 
+        // Wait briefly if `session/load` just completed and `agy` is pushing its post-load `usage_update`.
+        if (session.postLoadUsageWaiter) {
+          await session.postLoadUsageWaiter.promise;
+        }
+        if (turn.cancelRequested || session.closedByHost || connectionClosed) {
+          finishTurn("canceled");
+          return;
+        }
+
         // 2. Run pre-turn compaction when context is cold (>=150K) or over 200K (`cc2aaee`).
         if (
           !isCommand &&
@@ -1031,14 +1166,15 @@ export function createAntigravityResilientProvider(
         // 3. Execute foreground prompt with bounded transient error recovery.
         for (let attemptIndex = 1; ; attemptIndex += 1) {
           if (turn.cancelRequested || session.closedByHost || connectionClosed) {
-            for (const tool of turn.openTools.values()) {
-              emitToHost({
+            for (const tool of [...turn.openTools.values(), ...turn.abortedTools.values()]) {
+              emitSessionEvent(session, {
                 type: "timeline.item",
                 sessionId: session.sessionId,
                 item: { ...tool, status: "canceled", error: null },
               });
             }
             turn.openTools.clear();
+            turn.abortedTools.clear();
             if (isManualCompact) {
               session.compactor.noteCompactFinished({ source: "manual", outcome: "canceled" });
             }
@@ -1064,7 +1200,7 @@ export function createAntigravityResilientProvider(
                 clientMessageId: attemptClientMsgId,
               };
 
-          turn.attemptTools.clear();
+          turn.abortedTools.clear();
           let outcome: AttemptOutcome;
           try {
             await ensureInnerSessionAlive(session);
@@ -1073,13 +1209,22 @@ export function createAntigravityResilientProvider(
             }
             outcome = await new Promise<AttemptOutcome>((resolveAttempt) => {
               let attemptSettled = false;
+              let notifyInnerStarted!: () => void;
+              const innerStartedOrSettled = new Promise<void>((resolveStarted) => {
+                notifyInnerStarted = resolveStarted;
+              });
               const activeAttempt: ActiveAttempt = {
                 attemptClientMsgId,
                 attemptTurnId,
+                innerTurnStarted: false,
+                crossedWireEndTurn: false,
+                notifyInnerStarted,
+                innerStartedOrSettled,
                 cancelDeadline: null,
                 resolve: (res) => {
                   if (attemptSettled) return;
                   attemptSettled = true;
+                  notifyInnerStarted();
                   clearCancelDeadline(activeAttempt.cancelDeadline);
                   activeAttempt.cancelDeadline = null;
                   if (turn.activeAttempt === activeAttempt) {
@@ -1129,7 +1274,7 @@ export function createAntigravityResilientProvider(
 
           if (outcome.state === "completed") {
             if (isManualCompact) {
-              emitToHost({
+              emitSessionEvent(session, {
                 type: "timeline.item",
                 sessionId: session.sessionId,
                 item: {
@@ -1142,7 +1287,7 @@ export function createAntigravityResilientProvider(
               });
               session.compactor.noteCompactFinished({ source: "manual", outcome: "completed" });
             } else if (!isCommand && turn.ranForegroundTools && !turn.hasTrailingAssistantText) {
-              emitToHost({
+              emitSessionEvent(session, {
                 type: "session.notice",
                 sessionId: session.sessionId,
                 notice: {
@@ -1162,7 +1307,7 @@ export function createAntigravityResilientProvider(
                 isBusy: () =>
                   session.activeTurn !== null ||
                   session.activeCompaction !== null ||
-                  session.wirePromptsInFlight > 0,
+                  session.inFlightPromptRpcIds.size > 0,
                 isClosed: () => session.closedByHost || connectionClosed,
                 onFire: () => {
                   void runAutoCompaction(session, "idle");
@@ -1173,14 +1318,15 @@ export function createAntigravityResilientProvider(
           }
 
           if (outcome.state === "canceled" || turn.cancelRequested || session.closedByHost) {
-            for (const tool of [...turn.openTools.values(), ...turn.attemptTools.values()]) {
-              emitToHost({
+            for (const tool of [...turn.openTools.values(), ...turn.abortedTools.values()]) {
+              emitSessionEvent(session, {
                 type: "timeline.item",
                 sessionId: session.sessionId,
                 item: { ...tool, status: "canceled", error: null },
               });
             }
             turn.openTools.clear();
+            turn.abortedTools.clear();
             if (isManualCompact) {
               session.compactor.noteCompactFinished({ source: "manual", outcome: "canceled" });
             }
@@ -1305,19 +1451,19 @@ export function createAntigravityResilientProvider(
             turn.retryCounts[decision.category] += 1;
             turn.retryCounts.total += 1;
 
-            // Clear any failed/open tool spinners from the interrupted attempt to canceled
-            // before starting the recovery attempt.
-            for (const tool of [...turn.openTools.values(), ...turn.attemptTools.values()]) {
-              emitToHost({
+            // Clear only open or synthetically-aborted tool spinners from the interrupted attempt
+            // to canceled before starting the recovery attempt (never touch completed tools!).
+            for (const tool of [...turn.openTools.values(), ...turn.abortedTools.values()]) {
+              emitSessionEvent(session, {
                 type: "timeline.item",
                 sessionId: session.sessionId,
                 item: { ...tool, status: "canceled", error: null },
               });
             }
             turn.openTools.clear();
-            turn.attemptTools.clear();
+            turn.abortedTools.clear();
 
-            emitToHost({
+            emitSessionEvent(session, {
               type: "session.notice",
               sessionId: session.sessionId,
               notice: {
@@ -1338,16 +1484,16 @@ export function createAntigravityResilientProvider(
             continue;
           }
 
-          // Permanent / exhausted failure: update any generic tool error text with real cause.
-          for (const tool of [...turn.openTools.values(), ...turn.attemptTools.values()]) {
-            emitToHost({
+          // Permanent / exhausted failure: update only open/aborted tool spinners with real cause.
+          for (const tool of [...turn.openTools.values(), ...turn.abortedTools.values()]) {
+            emitSessionEvent(session, {
               type: "timeline.item",
               sessionId: session.sessionId,
               item: { ...tool, status: "failed", error: decision.error.message },
             });
           }
           turn.openTools.clear();
-          turn.attemptTools.clear();
+          turn.abortedTools.clear();
           if (isManualCompact) {
             session.compactor.noteCompactFinished({ source: "manual", outcome: "failed" });
           }
@@ -1429,7 +1575,8 @@ export function createAntigravityResilientProvider(
 
       const session = sessions.get(event.sessionId);
       if (!session) {
-        emitToHost(event);
+        // Drop events from internal temporary ACP sessions ("catalog", "sessions",
+        // "capability-probe") or sessions already closed by the host.
         return;
       }
 
@@ -1445,7 +1592,7 @@ export function createAntigravityResilientProvider(
         session.innerOpen = true;
         session.innerDead = false;
         if (session.suppressInternalOpenClose) return;
-        emitToHost({
+        emitSessionEvent(session, {
           ...event,
           ...(enriched ? { persistence: enriched } : {}),
         });
@@ -1459,7 +1606,7 @@ export function createAntigravityResilientProvider(
           env: launch.env,
         });
         if (decoded) session.nativeSessionId = decoded;
-        emitToHost({ ...event, persistence: enriched });
+        emitSessionEvent(session, { ...event, persistence: enriched });
         return;
       }
 
@@ -1485,11 +1632,9 @@ export function createAntigravityResilientProvider(
           ...session.currentConfig,
           ...(event.config.model !== undefined ? { model: event.config.model } : {}),
           ...(event.config.mode !== undefined ? { mode: event.config.mode } : {}),
-          ...(event.config.thinkingOption !== undefined
-            ? { thinkingOption: event.config.thinkingOption }
-            : {}),
+          thinkingOption: event.config.thinkingOption,
         };
-        emitToHost(event);
+        emitSessionEvent(session, event);
         return;
       }
 
@@ -1590,7 +1735,11 @@ export function createAntigravityResilientProvider(
         }
 
         if (event.type === "session.turn" && event.turnId === attempt.attemptTurnId) {
-          if (event.state === "started") return;
+          if (event.state === "started") {
+            attempt.innerTurnStarted = true;
+            attempt.notifyInnerStarted();
+            return;
+          }
           attempt.resolve({
             state: event.state,
             error: event.error,
@@ -1614,33 +1763,42 @@ export function createAntigravityResilientProvider(
             const detached = isDetachedTool(item);
             if (item.status === "running") {
               activeTurn.openTools.set(item.id, item);
-              activeTurn.attemptTools.set(item.id, item);
-              emitToHost(event);
+              activeTurn.abortedTools.delete(item.id);
+              emitSessionEvent(session, event);
               return;
             }
             activeTurn.openTools.delete(item.id);
-            activeTurn.attemptTools.set(item.id, item);
             if (!detached) {
               activeTurn.ranForegroundTools = true;
               activeTurn.hasTrailingAssistantText = false;
             }
             session.compactor.noteStepBoundary();
-            if (item.status === "failed" && item.error === "ACP turn failed") {
-              // Suppress SDK's synthetic turn-abort tool error until recovery or final failure decides.
+            if (item.status === "failed" && isSyntheticTurnAbortToolError(item.error)) {
+              // Hold SDK's synthetic turn-abort tool update until recovery/cancel/final-fail settles it.
+              activeTurn.abortedTools.set(item.id, item);
               return;
             }
-            emitToHost(event);
+            activeTurn.abortedTools.delete(item.id);
+            emitSessionEvent(session, event);
             return;
           } else if (item.type === "compaction" && item.status === "completed") {
             session.compactor.noteNativeCompactionCompleted();
           }
-          emitToHost(event);
+          emitSessionEvent(session, event);
           return;
         }
 
         if (event.type === "session.usage") {
-          session.compactor.noteBusinessModelUsage(event.usage.contextWindowUsedTokens);
-          emitToHost({
+          session.sawUsageSinceOpen = true;
+          if (event.turnId === undefined) {
+            if (session.postLoadUsageWaiter !== null && !activeTurn.hadProgress) {
+              session.compactor.noteReplayedUsage(event.usage.contextWindowUsedTokens);
+              session.postLoadUsageWaiter.settle();
+            } else {
+              session.compactor.noteBusinessModelUsage(event.usage.contextWindowUsedTokens);
+            }
+          }
+          emitSessionEvent(session, {
             ...event,
             ...(event.turnId === attempt.attemptTurnId
               ? { turnId: activeTurn.publicTurnId }
@@ -1674,12 +1832,14 @@ export function createAntigravityResilientProvider(
         return;
       }
 
-      // 6. Replay / idle `session.usage` updates.
-      if (event.type === "session.usage" && !session.readyEmitted) {
+      // 6. Replay / post-ready / idle `session.usage` updates (cold baseline, never warms cache).
+      if (event.type === "session.usage") {
+        session.sawUsageSinceOpen = true;
         session.compactor.noteReplayedUsage(event.usage.contextWindowUsedTokens);
+        session.postLoadUsageWaiter?.settle();
       }
 
-      emitToHost(event);
+      emitSessionEvent(session, event);
     };
 
     inner.onEvent(handleInnerEvent);
@@ -1692,6 +1852,7 @@ export function createAntigravityResilientProvider(
       }
       requireProviderCapabilities(inner.capabilities, input);
 
+      const openAbort = new AbortController();
       const session: ManagedSession = {
         sessionId: input.sessionId,
         currentConfig: input.config,
@@ -1702,12 +1863,17 @@ export function createAntigravityResilientProvider(
           env: launch.env,
         }),
         readyEmitted: false,
+        openingBuffer: [],
+        openAbort,
         closedByHost: false,
         innerOpen: false,
         innerDead: false,
         suppressInternalOpenClose: false,
+        runtimeEpoch: 0,
         currentChild: null,
-        wirePromptsInFlight: 0,
+        inFlightPromptRpcIds: new Set(),
+        sawUsageSinceOpen: false,
+        postLoadUsageWaiter: null,
         compactor: new SessionCompactor({
           sessionEnv: input.config.env,
           launchEnv: launch.env,
@@ -1716,12 +1882,17 @@ export function createAntigravityResilientProvider(
         }),
         activeCompaction: null,
         activeTurn: null,
+        queuedTurns: [],
         turnLane: Promise.resolve(),
         sequence: 0,
       };
       sessions.set(input.sessionId, session);
 
       const runOpenOnce = async (): Promise<void> => {
+        session.openingBuffer = [];
+        session.runtimeEpoch += 1;
+        session.sawUsageSinceOpen = false;
+        session.postLoadUsageWaiter?.settle();
         const internalReqId = `__open_${++session.sequence}_${input.requestId}`;
         const readyPromise = new Promise<ProviderEvent>((resolve, reject) => {
           pendingInternalRequests.set(internalReqId, { resolve, reject });
@@ -1740,12 +1911,16 @@ export function createAntigravityResilientProvider(
             }),
         );
         await readyPromise;
+        if (session.nativeSessionId && input.persistence && !session.sawUsageSinceOpen) {
+          armPostLoadUsageWindow(session, 60);
+        }
       };
 
       try {
         try {
           await runOpenOnce();
         } catch (firstErr) {
+          if (session.closedByHost || connectionClosed) return;
           const rawMsg =
             session.currentChild?.describeFailure(
               isRecord(firstErr) && typeof firstErr.message === "string"
@@ -1757,6 +1932,9 @@ export function createAntigravityResilientProvider(
                 ? firstErr.message
                 : String(firstErr),
             );
+          if (parseThinkingLevelRejection(rawMsg) !== null) {
+            throw new ProviderActionError("INVALID_THINKING_LEVEL", rawMsg, rawMsg);
+          }
           const rejection = parseModelRejection(rawMsg, input.config.model);
           if (!rejection) {
             throw new ProviderActionError(
@@ -1766,10 +1944,13 @@ export function createAntigravityResilientProvider(
             );
           }
 
-          // Model rejected during session.open: re-probe live catalog once (`db19236`).
+          // Model rejected during session.open: discard buffered replay from attempt 1 and re-probe once (`db19236`).
+          session.openingBuffer = [];
           const checkDelay =
             options.recovery?.modelRejectionRetryDelayMs ?? MODEL_REJECTION_RETRY_DELAY_MS;
-          if (checkDelay > 0) await abortableSleep(checkDelay);
+          if (checkDelay > 0) await abortableSleep(checkDelay, openAbort.signal);
+          if (session.closedByHost || connectionClosed) return;
+
           let freshCatalog: ProviderCatalog | null = null;
           try {
             freshCatalog = await fetchCatalogWithResilience(input.config.cwd, {
@@ -1779,6 +1960,7 @@ export function createAntigravityResilientProvider(
           } catch {
             freshCatalog = null;
           }
+          if (session.closedByHost || connectionClosed) return;
 
           if (freshCatalog && catalogOffersModel(freshCatalog, rejection.model)) {
             await runOpenOnce();
@@ -1790,6 +1972,25 @@ export function createAntigravityResilientProvider(
           }
         }
 
+        if (session.closedByHost || connectionClosed) {
+          if (session.innerOpen) {
+            const cleanupCloseId = `__close_after_aborted_open_${++session.sequence}`;
+            session.suppressInternalOpenClose = true;
+            await callInnerRequest(
+              { type: "session.close", requestId: cleanupCloseId, sessionId: session.sessionId },
+              { purpose: "session.close", sessionId: session.sessionId },
+            ).catch(() => undefined);
+          }
+          await session.currentChild?.close().catch(() => undefined);
+          return;
+        }
+
+        const buffered = session.openingBuffer ?? [];
+        session.openingBuffer = null;
+        session.openAbort = null;
+        for (const bufferedEvent of buffered) {
+          emitToHost(bufferedEvent);
+        }
         session.readyEmitted = true;
         emitToHost({
           type: "session.ready",
@@ -1797,6 +1998,10 @@ export function createAntigravityResilientProvider(
           sessionId: input.sessionId,
         });
       } catch (error) {
+        if (session.closedByHost || connectionClosed) {
+          return;
+        }
+        session.postLoadUsageWaiter?.settle();
         sessions.delete(input.sessionId);
         launchRateGuard.clearSession(input.sessionId);
         const errPayload: ProviderError =
@@ -1820,12 +2025,22 @@ export function createAntigravityResilientProvider(
     const interruptManagedSession = async (
       session: ManagedSession,
       requestId: string,
-      interruptOptions?: { suppressAck?: boolean },
+      interruptOptions?: {
+        suppressAck?: boolean;
+        cancelCompaction?: boolean;
+        keepQueued?: boolean;
+      },
     ): Promise<void> => {
       session.compactor.clearIdleTimer();
+      const cancelCompaction = interruptOptions?.cancelCompaction ?? true;
+      if (!interruptOptions?.keepQueued) {
+        for (const entry of session.queuedTurns) {
+          entry.canceled = true;
+        }
+      }
 
       const activeTurn = session.activeTurn;
-      const activeCompaction = session.activeCompaction;
+      const activeCompaction = cancelCompaction ? session.activeCompaction : null;
 
       if (!activeTurn && !activeCompaction) {
         // Idle cancel: complete cleanly without poisoning future turns.
@@ -1859,18 +2074,33 @@ export function createAntigravityResilientProvider(
         }
       }
 
-      if (session.innerOpen && !session.innerDead) {
+      const attempt = activeTurn?.activeAttempt ?? null;
+      if (attempt && !attempt.innerTurnStarted) {
+        // Ensure AcpRuntime.prompt has registered `this.activePrompt` before `interrupt()` runs.
+        await Promise.race([attempt.innerStartedOrSettled, abortableSleep(50)]);
+      }
+
+      if (
+        (activeTurn?.activeAttempt !== null || activeCompaction !== null) &&
+        session.innerOpen &&
+        !session.innerDead
+      ) {
         const internalInterruptId = `__interrupt_${++session.sequence}`;
-        interceptedClientRequests.add(internalInterruptId);
-        await inner
-          .send({
+        await callInnerRequest(
+          {
             type: "session.interrupt",
             requestId: internalInterruptId,
             sessionId: session.sessionId,
-          })
-          .catch(() => {
-            interceptedClientRequests.delete(internalInterruptId);
-          });
+          },
+          { purpose: "session.interrupt", sessionId: session.sessionId },
+        ).catch(() => undefined);
+      }
+
+      if (activeTurn) {
+        await activeTurn.done;
+      }
+      if (activeCompaction) {
+        await activeCompaction.promise;
       }
 
       if (!interruptOptions?.suppressAck) {
@@ -1964,26 +2194,68 @@ export function createAntigravityResilientProvider(
             return;
           }
 
-          // If a previous turn is open on inner, settle it before starting the new turn:
-          // - If inner is in deferred background-tool wait (`wirePromptsInFlight === 0`),
-          //   sending the next prompt to inner settles the deferred turn as completed while
-          //   keeping background tools alive; wait for `activeTurn` to close cleanly.
-          if (session.activeTurn && !session.activeTurn.recovering) {
-            if (session.wirePromptsInFlight > 0) {
-              const cancelReq = `__replace_${++session.sequence}`;
-              await interruptManagedSession(session, cancelReq, { suppressAck: true }).catch(
-                () => undefined,
-              );
-            } else if (session.activeTurn.activeAttempt) {
-              // Deferred turn: resolve current attempt as completed so next prompt proceeds cleanly.
-              session.activeTurn.activeAttempt.resolve({
-                state: "completed",
-                processExited: false,
-              });
-            }
+          for (const queued of session.queuedTurns) {
+            queued.canceled = true;
+          }
+          const queuedEntry: QueuedTurnEntry = { prompt: input.prompt, canceled: false };
+          session.queuedTurns.push(queuedEntry);
+
+          // If a previous turn is active:
+          // - Only if inner has crossed `end_turn` into deferred background-tool wait, resolve
+          //   it as `completed` so running background tools stay alive into the follow-up turn.
+          // - Otherwise (starting, running on wire, waiting on compaction, or in recovery sleep),
+          //   interrupt and cancel it immediately before starting the replacement turn.
+          if (isDeferredBackgroundToolWait(session)) {
+            session.activeTurn?.activeAttempt?.resolve({
+              state: "completed",
+              processExited: false,
+            });
+          } else if (session.activeTurn) {
+            const cancelReq = `__replace_${++session.sequence}`;
+            void interruptManagedSession(session, cancelReq, {
+              suppressAck: true,
+              cancelCompaction: false,
+              keepQueued: true,
+            }).catch(() => undefined);
           }
 
-          const nextTurn = session.turnLane.then(() => runForegroundPrompt(session, input.prompt));
+          const nextTurn = session.turnLane.then(async () => {
+            const idx = session.queuedTurns.indexOf(queuedEntry);
+            if (idx >= 0) session.queuedTurns.splice(idx, 1);
+            if (queuedEntry.canceled || session.closedByHost || connectionClosed) {
+              const canceledTurnId = `acp:${queuedEntry.prompt.clientMessageId}`;
+              emitToHost({
+                type: "timeline.item",
+                sessionId: session.sessionId,
+                item: {
+                  type: "user_message",
+                  id: queuedEntry.prompt.clientMessageId,
+                  text: promptDisplayText(queuedEntry.prompt),
+                  clientMessageId: queuedEntry.prompt.clientMessageId,
+                },
+              });
+              emitToHost({
+                type: "session.prompt_result",
+                sessionId: session.sessionId,
+                clientMessageId: queuedEntry.prompt.clientMessageId,
+                result: { type: "turn", turnId: canceledTurnId },
+              });
+              emitToHost({
+                type: "session.turn",
+                sessionId: session.sessionId,
+                turnId: canceledTurnId,
+                state: "started",
+              });
+              emitToHost({
+                type: "session.turn",
+                sessionId: session.sessionId,
+                turnId: canceledTurnId,
+                state: "canceled",
+              });
+              return;
+            }
+            await runForegroundPrompt(session, queuedEntry.prompt);
+          });
           session.turnLane = nextTurn.catch(() => undefined);
           return;
         }
@@ -2019,6 +2291,18 @@ export function createAntigravityResilientProvider(
                 (isRecord(err) && typeof err.message === "string"
                   ? err.message
                   : formatDiagnostic(String(err)));
+              if (parseThinkingLevelRejection(rawMsg) !== null) {
+                emitToHost({
+                  type: "request.failed",
+                  requestId: input.requestId,
+                  error: {
+                    code: "INVALID_THINKING_LEVEL",
+                    message: formatDiagnostic(rawMsg),
+                    diagnostic: sanitizeDiagnosticText(rawMsg),
+                  },
+                });
+                return;
+              }
               const rejection = parseModelRejection(rawMsg, input.changes.model ?? undefined);
               if (rejection) {
                 invalidateModel(rejection.model);
@@ -2045,7 +2329,12 @@ export function createAntigravityResilientProvider(
 
         if (input.type === "session.close") {
           session.closedByHost = true;
+          session.openAbort?.abort();
+          session.postLoadUsageWaiter?.settle();
           session.compactor.clearIdleTimer();
+          for (const queued of session.queuedTurns) {
+            queued.canceled = true;
+          }
           if (session.activeTurn) {
             session.activeTurn.cancelRequested = true;
             session.activeTurn.sleepAbort?.abort();
@@ -2078,7 +2367,12 @@ export function createAntigravityResilientProvider(
         connectionClosed = true;
         for (const session of sessions.values()) {
           session.closedByHost = true;
+          session.openAbort?.abort();
+          session.postLoadUsageWaiter?.settle();
           session.compactor.clearIdleTimer();
+          for (const queued of session.queuedTurns) {
+            queued.canceled = true;
+          }
           session.activeTurn?.sleepAbort?.abort();
           session.activeTurn?.activeAttempt?.resolve({ state: "canceled", processExited: true });
           session.activeCompaction?.resolveOutcome("canceled");
@@ -2141,6 +2435,15 @@ export function createAntigravityResilientProvider(
         return { available: true, diagnostic: signIn };
       } catch (error) {
         const raw = error instanceof Error ? error.message : String(error);
+        if (
+          (error instanceof ProviderActionError && error.code === "LAUNCH_RATE_LIMITED") ||
+          /refusing to launch it again/i.test(raw)
+        ) {
+          return {
+            available: false,
+            diagnostic: `${sanitizeDiagnosticText(raw)}\n${signIn}`,
+          };
+        }
         if (/is unsupported\. Update agy/i.test(raw)) {
           return {
             available: false,

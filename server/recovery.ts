@@ -160,14 +160,37 @@ export function isSessionNotFoundError(message: string): boolean {
 }
 
 /**
+ * Matches configuration errors where the model itself is valid, but the
+ * requested thinking level is unsupported or not exposed for that model.
+ * Must NEVER trigger `invalidateModel`.
+ */
+export function parseThinkingLevelRejection(
+  text: string,
+): { thinkingLevel: string; model: string } | null {
+  const badThinking = /Thinking level\s+"([^"]+)"\s+is not offered for model\s+"([^"]+)"/i.exec(
+    text,
+  );
+  if (badThinking?.[1] && badThinking[2]) {
+    return { thinkingLevel: badThinking[1].trim(), model: badThinking[2].trim() };
+  }
+  if (/ACP session does not expose thinking configuration/i.test(text)) {
+    return { thinkingLevel: "unknown", model: "current" };
+  }
+  return null;
+}
+
+/**
  * Parses explicit model rejections from both ACP (`Unknown model ID: ...`,
- * `Invalid model "..."`, `Thinking level "..." is not offered for model "..."`)
- * and legacy CLI format strings.
+ * `Invalid model "..."`) and legacy CLI format strings.
  */
 export function parseModelRejection(
   text: string,
   configuredModel?: string,
 ): { model: string; available: string[] } | null {
+  if (parseThinkingLevelRejection(text) !== null) {
+    return null;
+  }
+
   const acpUnknown = /\bUnknown model ID:\s*([^\s"']+)/i.exec(text);
   if (acpUnknown?.[1]) {
     return { model: acpUnknown[1].trim(), available: [] };
@@ -184,11 +207,6 @@ export function parseModelRejection(
           .filter(Boolean)
       : [];
     return { model: acpInvalid[1].trim(), available };
-  }
-
-  const badThinking = /Thinking level\s+"[^"]+"\s+is not offered for model\s+"([^"]+)"/i.exec(text);
-  if (badThinking?.[1]) {
-    return { model: configuredModel || badThinking[1].trim(), available: [] };
   }
 
   const legacy =
@@ -228,6 +246,7 @@ export function isUnexpectedProcessExitError(
     isPermanentAuthError(message) ||
     isQuotaExhaustedError(message) ||
     isSessionNotFoundError(message) ||
+    parseThinkingLevelRejection(message) !== null ||
     parseModelRejection(message) !== null
   ) {
     return false;
@@ -306,6 +325,13 @@ export function classifyTurnFailure(input: {
     return {
       action: "fail",
       error: { code: "SESSION_NOT_FOUND", message: clean, diagnostic: clean },
+    };
+  }
+
+  if (parseThinkingLevelRejection(clean) !== null) {
+    return {
+      action: "fail",
+      error: { code: "INVALID_THINKING_LEVEL", message: clean, diagnostic: clean },
     };
   }
 

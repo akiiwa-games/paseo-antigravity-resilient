@@ -21,14 +21,7 @@ const REMOTE_PLUGIN_ROOT = REMOTE_REPO_ROOT;
 // The remote user's Paseo home is that host's own fact: read from the upload path, else from this host's
 // environment, never guessed in source.
 const REMOTE_PASEO_HOME = process.env.AGENTCOMPASS_REMOTE_PASEO_HOME || process.env.ROUTE_MANAGER_REMOTE_PASEO_HOME || null;
-
-function remoteConversationsDir(remoteSync) {
-  const home = remoteSync?.remotePaseoHome ?? REMOTE_PASEO_HOME;
-  if (!home) {
-    throw new Error("Remote Paseo home unknown: run the remote sync or set AGENTCOMPASS_REMOTE_PASEO_HOME");
-  }
-  return `${home}/antigravity-resilient/conversations`;
-}
+void REMOTE_PASEO_HOME;
 
 function parseArgs(argv) {
   let target = "local";
@@ -540,15 +533,11 @@ try {
     const refreshed = await client.refreshAgent(smokeAgentId);
     const timelineAfterReload = await client.fetchAgentTimeline(smokeAgentId);
     const pluginLogs = await client.getPluginLogs(PLUGIN_ID);
-    const replayLogEntries = (pluginLogs ?? []).filter((entry) =>
-      String(entry?.message ?? "").includes("Replayed"),
-    );
 
-    const remoteConvDir = options.target === "local" ? null : remoteConversationsDir(remoteSync);
     const persistedSnapshotInfo =
       options.target === "local"
         ? readLocalPersistedSnapshotInfo(conversationId)
-        : await readRemotePersistedSnapshotInfo(client, remoteConvDir, conversationId);
+        : await readRemotePersistedSnapshotInfo(client, null, conversationId);
 
     smokeSummary = {
       mode: "replay-only",
@@ -558,7 +547,7 @@ try {
       persistedSnapshotInfo,
       refreshedStatus: refreshed?.status ?? "ok",
       timelineItemsAfterReload: (timelineAfterReload?.items ?? timelineAfterReload?.entries ?? []).length,
-      replayLogEntries: replayLogEntries.slice(-5),
+      recentPluginLogs: (pluginLogs ?? []).slice(-5),
     };
 
     if (!options.keepAgent && smokeAgentId) {
@@ -588,31 +577,15 @@ try {
     const refreshed = await client.refreshAgent(smokeAgentId);
     const timelineAfterReload = await client.fetchAgentTimeline(smokeAgentId);
     const pluginLogs = await client.getPluginLogs(PLUGIN_ID);
-    const replayLogEntries = (pluginLogs ?? []).filter((entry) =>
-      String(entry?.message ?? "").includes("Replayed"),
-    );
 
-    let conversationId = extractConversationId(finishedAgent);
-    if (!conversationId && replayLogEntries.length > 0) {
-      const lastMsg = String(replayLogEntries[replayLogEntries.length - 1]?.message ?? "");
-      const match = /\bconversation\s+([A-Za-z0-9._-]+)/.exec(lastMsg);
-      if (match?.[1]) {
-        conversationId = match[1];
-      }
-    }
+    const conversationId = extractConversationId(finishedAgent);
 
     let persistedSnapshotInfo = null;
     if (conversationId) {
-      if (options.target === "local") {
-        persistedSnapshotInfo = readLocalPersistedSnapshotInfo(conversationId);
-      } else {
-        const remoteConvDir = remoteConversationsDir(remoteSync);
-        persistedSnapshotInfo = {
-          snapshotPath: `${remoteConvDir}/${conversationId}.json`,
-          eventsPath: `${remoteConvDir}/${conversationId}.jsonl`,
-          verifiedViaReplayLog: replayLogEntries.length > 0,
-        };
-      }
+      persistedSnapshotInfo =
+        options.target === "local"
+          ? readLocalPersistedSnapshotInfo(conversationId)
+          : await readRemotePersistedSnapshotInfo(client, null, conversationId);
     }
 
     smokeSummary = {
@@ -625,7 +598,7 @@ try {
       persistedSnapshotInfo,
       refreshedStatus: refreshed?.status ?? "ok",
       timelineItemsAfterReload: (timelineAfterReload?.items ?? timelineAfterReload?.entries ?? []).length,
-      replayLogEntries: replayLogEntries.slice(-5),
+      recentPluginLogs: (pluginLogs ?? []).slice(-5),
     };
 
     if (!options.keepAgent && smokeAgentId) {

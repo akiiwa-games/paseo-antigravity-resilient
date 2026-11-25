@@ -53,7 +53,7 @@ try{
     assert.equal(plugin.status,'running');
     summary.pluginPath=plugin.path;
   }else{
-    const repoRoot=process.cwd();
+    const repoRoot=path.resolve(import.meta.dirname,'..');
     const canaryDir=path.join(output,'canary-plugin');
     canaryPluginId='antigravity-resilient-canary-provider';
     providerId='antigravity-resilient-canary';

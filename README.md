@@ -39,5 +39,5 @@ Paseo 0.17+ 内置了基于 ACP（`agy acp`）的官方 Antigravity provider。�
 
 ### 4. CLI 订阅额度与 Windows 支持
 
-- **纯 CLI 额度查询**：仅调用 `agy -p /usage --output-format json` 获取各模型组额度窗口与禁用状态，不再读取操作系统凭据库，也不直接请求远端配额接口。默认仅对 `antigravity-resilient` 会话暴露额度账号，避免与内置 `antigravity` 插件在 Paseo 全局视图出现重复卡片（禁用内置插件时可设 `PASEO_ANTIGRAVITY_RESILIENT_GLOBAL_USAGE=1` 开启全局展示）。
-- **Windows 开箱即用与取消兜底**：daemon `PATH` 不含 `agy` 时自动回退 `%LOCALAPPDATA%\agy\bin\agy.exe`；使用宿主 SDK 终止完整子进程树；取消回合或压缩时附带 5 秒兜底超时（自动校正系统休眠唤醒时钟跳变）；回合仅执行了前景工具而未输出收尾正文时推送提示通知。
+- **纯 CLI 额度查询**：仅调用 `agy -p /usage --output-format json` 获取各模型组额度窗口与禁用状态，不再读取操作系统凭据库，也不直接请求远端配额接口。同账号会话共享归一化后的单个 `launch` 定位符与 5 分钟缓存（忽略 `PASEO_AGENT_ID` 等每会话变量，防止并发拉起多个 CLI 进程）；默认不在 `scope.kind === "global"` 注册全局源以避免未打开本插件会话时多跑一次查询（注：打开过 `antigravity-resilient` 会话后，Paseo 宿主的 `UsageSourceRegistry.mergeKnown()` 仍会将该会话源并入全局已知列表；若禁用了内置 `antigravity` 插件，可设 `PASEO_ANTIGRAVITY_RESILIENT_GLOBAL_USAGE=1` 开启初始全局发现）。
+- **Windows 开箱即用与取消兜底**：daemon `PATH` 不含 `agy` 时自动回退 `%LOCALAPPDATA%\agy\bin\agy.exe`，同时若用户在 `~/.paseo/config.json` 配置了自定义 `env.PATH` 或 `env.LOCALAPPDATA` 则优先使用用户配置；使用宿主 SDK 终止完整子进程树；取消回合或压缩时附带 5 秒兜底超时（自动校正系统休眠唤醒时钟跳变）；回合仅执行了前景工具而未输出收尾正文时推送提示通知。

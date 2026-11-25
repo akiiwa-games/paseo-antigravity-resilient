@@ -57,18 +57,35 @@ npm run verify:install -- E:/path/to/new-install-evidence
 
 ## 可选 Live 验收（消耗少量模型额度）
 
-针对已运行新版本插件的本地 Paseo daemon 执行端到端验证：
+在**未重载线上插件**前，可从任意目录直接执行金丝雀（canary）隔离验证（脚本会自动将源码复制到临时目录并以独立 `antigravity-resilient-canary-provider` ID 加载和卸载，不影响线上 `antigravity-resilient` 会话）：
 
 ```sh
-node scripts/verify-live.mjs --model gemini-3.8-flash --output E:/path/to/new-live-evidence
+node E:/PROJECTS/paseo-plugins/paseo-antigravity-resilient/scripts/verify-live.mjs --model gemini-3.8-flash-low --output E:/path/to/new-canary-evidence
+```
+
+在已完成代码切换、需要验证**线上已安装的 `antigravity-resilient-provider` 实例**时，在外部普通终端（非 `antigravity-resilient` 会话内）加 `--reload` 执行：
+
+```sh
+node E:/PROJECTS/paseo-plugins/paseo-antigravity-resilient/scripts/verify-live.mjs --reload --model gemini-3.8-flash-low --output E:/path/to/new-live-evidence
 ```
 
 验证流式回复、思考分块、规范化工具调用（`shell` / `write` / `edit` / `read`）、多轮续接、`refreshAgent` 历史回放以及取消回合时的子进程树回收。测试结束后自动归档并删除临时测试 agent，保留 `--output` 下的完整证据日志。
+
+## 从 `0.2.x`（`stream-json`）升级与回滚边界
+
+1. **升级切换（空闲窗口、非 `antigravity-resilient` 会话内执行）**：
+   - 先记录当前 `main` 基线提交（例如 `PRE_CUTOVER_SHA=$(git -C E:/PROJECTS/paseo-plugins/paseo-antigravity-resilient rev-parse main)`）。
+   - 将审核通过的分支合并进 `main`（保持 `HEAD` 位于 `main` 分支，切勿停留在 detached `HEAD`，否则远端同步安全门禁 `deploy-and-verify.mjs` 会按 fail-closed 拒绝同步）。
+   - 执行 `npm ci --ignore-scripts && npm run check`，随后运行 `paseo plugin reload antigravity-resilient-provider`（或上述带 `--reload` 的 `verify-live.mjs`）。
+2. **回滚已知固有限制（`0.3.0` → `0.2.x`）**：
+   - **时间线回放边界**：`0.3.0` 通过 `agy acp` 原生持久化对话（保存在 `~/.gemini/antigravity-cli/conversations/<id>.pb`），不再向 `0.2.x` 自建的 `~/.paseo/antigravity-resilient/conversations/` 写入 `.json` / `.jsonl` 快照。升级前的历史文件原样保留；但若从 `0.3.0` 回滚到 `0.2.x`，**在 `0.3.0` 运行期间新产生的对话轮次不会出现在 `0.2.x` 的自建时间线回放中**。
+   - **模型与思考档位字段**：在 `0.3.0` UI 中以基础模型 ID（如 `gemini-4-hydrogen` + 独立 `thinkingOptionId: "low"`）新建的会话，回滚到 `0.2.x` 后 `0.2.x` 不读取独立 `thinkingOptionId`，需在 `0.2.x` 下改选带后缀模型 ID（如 `gemini-4-hydrogen-low`）。
+   - **分支指针维护**：如需紧急回滚主仓库到旧提交，请保持 `main` 分支引用（而非 `git checkout <sha>` 游离 `HEAD`），在确认工作区干净且获用户确认后将 `main` 回退至记录的 `PRE_CUTOVER_SHA`（或使用 `git revert`），再执行 `npm ci --ignore-scripts` 与 `paseo plugin reload antigravity-resilient-provider`。
 
 ## 数据存放与许可证
 
 - 会话历史由本机 `agy` 原生保存在 `~/.gemini/antigravity-cli/conversations/`（或 `ANTIGRAVITY_HOME`）。
 - 旧版 `stream-json` 分支遗留的 `~/.paseo/antigravity-resilient/conversations/` 数据原样保留不作修改或删除；重开旧会话时仅只读查询其中的 `session-keys/` 映射文件。
-- 额度查询仅执行本机 `agy -p /usage --output-format json`，插件自身不读取系统凭据库，也不直接请求外部 HTTP 配额接口。默认仅在 `antigravity-resilient` 会话内发现额度账号以避免与内置 `antigravity` 插件在全局额度视图重复渲染；若已禁用内置插件，可通过环境变量 `PASEO_ANTIGRAVITY_RESILIENT_GLOBAL_USAGE=1` 开启全局额度卡片。
+- 额度查询仅执行本机 `agy -p /usage --output-format json`，插件自身不读取系统凭据库，也不直接请求外部 HTTP 配额接口。会话发现仅提取账号与可执行路径相关环境变量，使同账号所有会话共享单一缓存项与单次 CLI 调用；默认在 `scope.kind === "global"` 返回空列表以避免未打开会话时多跑一次查询（注：查看过 `antigravity-resilient` 会话后，Paseo 宿主 `UsageSourceRegistry.mergeKnown()` 仍会将该会话源并入全局列表；若已禁用内置插件，可通过 `PASEO_ANTIGRAVITY_RESILIENT_GLOBAL_USAGE=1` 开启初始全局发现）。
 
 上游代码来自 [getpaseo/paseo](https://github.com/getpaseo/paseo)，采用 Apache-2.0，全文见 [LICENSE.paseo](../LICENSE.paseo)。许可证与第三方说明见 [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)。

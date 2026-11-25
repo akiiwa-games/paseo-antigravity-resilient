@@ -14,6 +14,7 @@ import {
   isStreamInterruption,
   isTokenGap,
   parseModelRejection,
+  parseThinkingLevelRejection,
   sanitizeDiagnosticText,
 } from "../server/recovery.ts";
 import { launchStubAgent, TempDirTracker, waitFor } from "./helpers.ts";
@@ -48,14 +49,20 @@ describe("recovery classifiers and launch guards", () => {
       model: "gemini-nonexistent-99",
       available: [],
     });
-    assert.deepEqual(
+    assert.equal(
       parseModelRejection(
         'Thinking level "xhigh" is not offered for model "Gemini 3.8 Flash"',
         "gemini-3.8-flash",
       ),
+      null,
+    );
+    assert.deepEqual(
+      parseThinkingLevelRejection(
+        'Thinking level "xhigh" is not offered for model "Gemini 3.8 Flash"',
+      ),
       {
-        model: "gemini-3.8-flash",
-        available: [],
+        thinkingLevel: "xhigh",
+        model: "Gemini 3.8 Flash",
       },
     );
 
