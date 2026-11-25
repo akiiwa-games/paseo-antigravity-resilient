@@ -207,6 +207,145 @@ describe("Round 3 adversarial review regressions (R3-1 to R3-4)", () => {
     }
   });
 
+  it("[R3-1 + R2-2] single-flights concurrent prompt + configure on hung reopen and cancels/kills the single child within 650ms on session.interrupt", async () => {
+    const { directory, launch } = await launchStubAgent(
+      tracker,
+      `
+        const { createInterface } = require("node:readline");
+        const send = (m) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...m }) + "\\n");
+        createInterface({ input: process.stdin }).on("line", (line) => {
+          const { id, method } = JSON.parse(line);
+          if (method === "initialize") {
+            send({ id, result: { protocolVersion: 1, agentCapabilities: { loadSession: true } } });
+          } else if (method === "session/new") {
+            send({
+              id,
+              result: {
+                sessionId: "conv-r3-1-int",
+                modes: {
+                  currentModeId: "default",
+                  availableModes: [
+                    { id: "default", name: "Default" },
+                    { id: "plan", name: "Plan" },
+                  ],
+                },
+              },
+            });
+            send({
+              method: "session/update",
+              params: {
+                sessionId: "conv-r3-1-int",
+                update: { sessionUpdate: "available_commands_update", availableCommands: [] },
+              },
+            });
+            setTimeout(() => process.exit(0), 25);
+          } else if (method === "session/load") {
+            // Hang during session/load!
+          } else if (method === "session/set_mode") {
+            send({ id, result: {} });
+          }
+        });
+        setInterval(() => {}, 1000);
+      `,
+    );
+
+    const sessionPids: number[] = [];
+    const conn = await createAntigravityResilientProvider({
+      startupTimeoutMs: 400,
+      cancelFallbackTimeoutMs: 150,
+      spawn: ((cmd: string, args: string[], opts: any) => {
+        const child = nodeSpawn(cmd, args, opts);
+        if (child.pid) {
+          spawnedPids.add(child.pid);
+          if (opts?.env?.TRACK_R3_1_INT === "1") {
+            sessionPids.push(child.pid);
+          }
+        }
+        return child as any;
+      }) as any,
+    }).connect({
+      launch,
+      versions: [1],
+      capabilities: ["prompt.message", "session.persistence", "session.configure"],
+    });
+    const events: ProviderEvent[] = [];
+    conn.onEvent((e) => events.push(e));
+
+    try {
+      await conn.send({
+        type: "session.open",
+        requestId: "open-r3-1-int",
+        sessionId: "s-r3-1-int",
+        history: "skip",
+        config: {
+          cwd: directory,
+          env: { TRACK_R3_1_INT: "1" },
+          mode: "default",
+          mcpServers: {},
+          settings: {},
+          persist: true,
+        },
+      });
+      await waitFor(
+        () => events.find((e) => e.type === "session.ready" && e.requestId === "open-r3-1-int"),
+        { label: "open-r3-1-int ready" },
+      );
+      await new Promise((r) => setTimeout(r, 80));
+
+      await conn.send({
+        type: "session.prompt",
+        sessionId: "s-r3-1-int",
+        prompt: {
+          clientMessageId: "m-r3-1-int",
+          delivery: "auto",
+          input: { type: "message", content: [{ type: "text", text: "hello" }] },
+        },
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      await conn.send({
+        type: "session.configure",
+        requestId: "cfg-r3-1-int",
+        sessionId: "s-r3-1-int",
+        changes: { mode: "plan" },
+      });
+      await new Promise((r) => setTimeout(r, 40));
+
+      await conn.send({
+        type: "session.interrupt",
+        requestId: "int-r3-1-int",
+        sessionId: "s-r3-1-int",
+      });
+
+      await new Promise((r) => setTimeout(r, 650));
+      const reopenPids = sessionPids.slice(1);
+      assert.equal(reopenPids.length, 1, "must still spawn only 1 reopen child");
+      assert.equal(
+        events.some((e) => e.type === "request.completed" && e.requestId === "int-r3-1-int"),
+        true,
+        "session.interrupt must settle within 650ms",
+      );
+      assert.equal(
+        events.some(
+          (e) =>
+            e.type === "session.turn" &&
+            e.turnId === "acp:m-r3-1-int" &&
+            e.state === "canceled",
+        ),
+        true,
+        "foreground turn must settle as canceled within 650ms",
+      );
+      assert.equal(
+        events.some((e) => e.type === "request.failed" && e.requestId === "cfg-r3-1-int"),
+        true,
+        "concurrent session.configure sharing aborted reopenPromise must settle with request.failed",
+      );
+      assert.equal(isPidAlive(reopenPids[0]!), false, "single reopen child must be dead within 650ms");
+    } finally {
+      for (const pid of sessionPids) killPidTree(pid);
+      await conn.close();
+    }
+  });
+
   it("[R3-2] chains prior closingPromise inside new ManagedSession on synchronous open so close-1 -> open-2 -> close-2 cancels open-2 cleanly", async () => {
     const { directory, launch } = await launchStubAgent(
       tracker,

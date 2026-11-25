@@ -522,11 +522,11 @@ export function createAntigravityResilientProvider(
         void owned.closed.finally(() => {
           activeChildren.delete(owned);
         });
+        ctx?.onChild?.(owned);
         if (connectionClosed || session?.closedByHost || ctx?.signal?.aborted) {
           await owned.close({ force: true }).catch(() => undefined);
           throw new Error("Antigravity ACP launch aborted");
         }
-        ctx?.onChild?.(owned);
 
         if (session) {
           session.currentChild = owned;
@@ -1014,11 +1014,13 @@ export function createAntigravityResilientProvider(
       session.reopenAbort = reopenAbort;
       session.suppressInternalOpenClose = true;
 
+      let reopenChild: OwnedAcpChild | null = null;
       let reopenTask: Promise<void> | null = null;
       let tracked: Promise<void> | null = null;
       reopenTask = (async () => {
         try {
           if (session.innerOpen) {
+            await session.currentChild?.close({ force: true }).catch(() => undefined);
             const closeId = `__internal_close_${++session.sequence}`;
             await callInnerRequest(
               { type: "session.close", requestId: closeId, sessionId: session.sessionId },
@@ -1052,6 +1054,9 @@ export function createAntigravityResilientProvider(
               cwd: session.currentConfig.cwd,
               env: session.currentConfig.env,
               signal: reopenAbort.signal,
+              onChild: (child) => {
+                reopenChild = child;
+              },
             },
             () =>
               inner.send({
@@ -1069,10 +1074,11 @@ export function createAntigravityResilientProvider(
         } catch (err) {
           session.innerOpen = false;
           session.innerDead = true;
-          await (
-            session.currentChild?.close({ force: true }).catch(() => undefined) ??
-            Promise.resolve()
-          );
+          await Promise.all([
+            (reopenChild as OwnedAcpChild | null)?.close({ force: true }).catch(() => undefined),
+            session.currentChild?.close({ force: true }).catch(() => undefined),
+            ...[...pendingAbortedCleanups],
+          ]);
           throw err;
         } finally {
           if (session.reopenAbort === reopenAbort) {
@@ -1265,9 +1271,13 @@ export function createAntigravityResilientProvider(
             }),
         );
       } catch (error) {
-        active.resolveOutcome("failed", {
-          message: error instanceof Error ? error.message : String(error),
-        });
+        if (active.cancelRequested || session.closedByHost || connectionClosed) {
+          active.resolveOutcome("canceled");
+        } else {
+          active.resolveOutcome("failed", {
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
       }
 
       return promise;
@@ -2388,11 +2398,28 @@ export function createAntigravityResilientProvider(
         return;
       }
 
+      const isExplicitInterrupt = !interruptOptions?.keepQueued;
+      const isReopeningOrClosed =
+        session.reopenPromise !== null || !session.innerOpen || session.innerDead;
+
       if (activeTurn) {
         activeTurn.cancelRequested = true;
         activeTurn.cancelAbort.abort();
         activeTurn.sleepAbort?.abort();
         session.postLoadUsageWaiter?.settle();
+        // When an explicit Stop (`session.interrupt`) arrives while the session is inside
+        // `ensureInnerSessionAlive` (not open yet, so `session/cancel` cannot be sent),
+        // abort the pending reopen immediately instead of idling for `cancelFallbackTimeoutMs`.
+        if (
+          isExplicitInterrupt &&
+          isReopeningOrClosed &&
+          activeTurn.activeAttempt === null &&
+          (cancelCompaction || !session.activeCompaction)
+        ) {
+          abortPendingSessionOpen(session, "Antigravity session reopen canceled", {
+            killChild: true,
+          });
+        }
         // Arm a turn-level fallback deadline covering BOTH `ensureInnerSessionAlive` reopens
         // (`activeAttempt === null`) and in-flight ACP attempts (`activeAttempt !== null`).
         if (!activeTurn.cancelDeadline && (cancelCompaction || !session.activeCompaction)) {
@@ -2407,6 +2434,11 @@ export function createAntigravityResilientProvider(
 
       if (activeCompaction) {
         activeCompaction.cancelRequested = true;
+        if (isExplicitInterrupt && isReopeningOrClosed) {
+          abortPendingSessionOpen(session, "Antigravity compaction reopen canceled", {
+            killChild: true,
+          });
+        }
         if (!activeCompaction.cancelDeadline) {
           activeCompaction.cancelDeadline = armCancelDeadline(() => {
             abortPendingSessionOpen(session, "Antigravity compaction reopen canceled", {

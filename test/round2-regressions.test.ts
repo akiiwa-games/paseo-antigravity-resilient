@@ -245,7 +245,7 @@ describe("Round 2 adversarial review regressions (R2-1 to R2-5)", () => {
 
     const sessionPids: number[] = [];
     const conn = await createAntigravityResilientProvider({
-      startupTimeoutMs: 5_000,
+      startupTimeoutMs: 400,
       cancelFallbackTimeoutMs: 150,
       spawn: ((cmd: string, args: string[], opts: any) => {
         const c = nodeSpawn(cmd, args, opts);
@@ -291,22 +291,35 @@ describe("Round 2 adversarial review regressions (R2-1 to R2-5)", () => {
         sessionId: "s-r2-2",
       });
 
-      await waitFor(
-        () => events.find((e) => e.type === "request.completed" && e.requestId === "int-r2-2"),
-        { timeoutMs: 800, label: "interrupt request.completed within fallback deadline" },
+      // Exact repro-round2.ts check at 650ms (>4x cancelFallbackTimeoutMs=150ms and >startupTimeoutMs=400ms)
+      await new Promise((r) => setTimeout(r, 650));
+      const interruptAckedAfter650ms = events.some(
+        (e) => e.type === "request.completed" && e.requestId === "int-r2-2",
       );
-      assert.equal(
-        events.some(
-          (e) =>
-            e.type === "session.turn" &&
-            e.turnId === "acp:m-reopen-hang" &&
-            e.state === "canceled",
-        ),
-        true,
-        "turn must settle as canceled",
+      const turnCanceledAfter650ms = events.some(
+        (e) =>
+          e.type === "session.turn" &&
+          e.turnId === "acp:m-reopen-hang" &&
+          e.state === "canceled",
       );
       const reopenChildPid = sessionPids[sessionPids.length - 1]!;
-      assert.equal(isPidAlive(reopenChildPid), false, "hung reopen child must be terminated");
+      const reopenChildStillAliveAfter650ms = isPidAlive(reopenChildPid);
+
+      assert.equal(
+        interruptAckedAfter650ms,
+        true,
+        "session.interrupt must complete within 650ms during hung reopen",
+      );
+      assert.equal(
+        turnCanceledAfter650ms,
+        true,
+        "turn must settle as canceled within 650ms",
+      );
+      assert.equal(
+        reopenChildStillAliveAfter650ms,
+        false,
+        "hung reopen child must be terminated within 650ms",
+      );
     } finally {
       for (const pid of sessionPids) killPidTree(pid);
       await Promise.race([conn.close(), new Promise((r) => setTimeout(r, 400))]);
@@ -655,6 +668,33 @@ describe("Round 2 adversarial review regressions (R2-1 to R2-5)", () => {
           ),
         { timeoutMs: 1_000, label: "s-5a idle compaction completed" },
       );
+      await new Promise((r) => setTimeout(r, 120));
+
+      // Verify R2-5a executed strictly ONE idle `/compact` RPC on the wire, with 2 timeline
+      // status updates (`loading` -> `completed`) sharing the exact same compaction item id.
+      const compactionItemsOn5a = events
+        .filter(
+          (
+            e,
+          ): e is Extract<ProviderEvent, { type: "timeline.item" }> & {
+            item: { id: string; type: "compaction"; status: string };
+          } => e.type === "timeline.item" && e.sessionId === "s-5a" && e.item.type === "compaction",
+        )
+        .map((e) => ({ id: e.item.id, status: e.item.status }));
+      assert.equal(compactionItemsOn5a.length, 2);
+      assert.deepEqual(
+        compactionItemsOn5a.map((c) => c.status),
+        ["loading", "completed"],
+      );
+      assert.equal(compactionItemsOn5a[0]!.id, compactionItemsOn5a[1]!.id);
+
+      const wirePromptsOn5a = (await readFile(capturePath, "utf8"))
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l))
+        .filter((r) => r.method === "session/prompt" && r.params?.sessionId === "conv-r2-5a")
+        .map((r) => r.params.prompt[0].text);
+      assert.deepEqual(wirePromptsOn5a, ["first-big-turn", "/compact"]);
 
       // R2-5b: Large 225K session pushes usage_update 95ms after session.ready -> pre-turn /compact runs BEFORE turn!
       await conn.send({
