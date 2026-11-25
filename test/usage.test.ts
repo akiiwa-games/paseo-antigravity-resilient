@@ -1,448 +1,206 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
-import type { UsageScope } from "@getpaseo/plugin/server/usage";
-import contribute from "../index.server.ts";
-import {
-  parseCredentialBlob,
-  type CredentialResult,
-} from "../server/credentials.ts";
-import {
-  discover,
-  fetchUsage,
-  reportFromQuotaResponse,
-  USAGE_SOURCE_ID,
-  USAGE_SOURCE_LABEL,
-  windowsFromQuotaResponse,
-} from "../server/usage.ts";
-import { DEFAULT_KEYRING_TARGET, inputSchema } from "../shared/input.ts";
+import { writeFile } from "node:fs/promises";
+import path from "node:path";
+import { afterEach, describe, it } from "node:test";
+import { PROVIDER_ID, Usage, USAGE_SOURCE_ID } from "../server/usage.ts";
+import { TempDirTracker } from "./helpers.ts";
 
-// Synthetic quota fractions and fixed timestamps; no account telemetry.
-const QUOTA_RESPONSE = {
-  groups: [
-    {
-      buckets: [
-        {
-          bucketId: "gemini-weekly",
-          displayName: "Weekly Limit Remaining",
-          window: "weekly",
-          resetTime: "2040-01-08T00:00:00Z",
-          description:
-            "You have used some of your weekly limit, it will fully refresh in 6 days, 13 hours.",
-          remainingFraction: 0.8,
-        },
-        {
-          bucketId: "gemini-5h",
-          displayName: "Five Hour Limit Remaining",
-          window: "5h",
-          resetTime: "2040-01-02T01:00:00Z",
-          remainingFraction: 0.75,
-        },
-      ],
-      displayName: "Gemini Models",
-      description: "Models within this group: Gemini Flash, Gemini Pro",
-    },
-    {
-      buckets: [
-        {
-          bucketId: "3p-weekly",
-          displayName: "Weekly Limit Remaining",
-          window: "weekly",
-          resetTime: "2040-01-08T02:00:00Z",
-          remainingFraction: 1,
-        },
-        {
-          bucketId: "3p-5h",
-          displayName: "Five Hour Limit Remaining",
-          window: "5h",
-          resetTime: "2040-01-02T03:00:00Z",
-          remainingFraction: 1,
-        },
-      ],
-      displayName: "Claude and GPT models",
-      description: "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS",
-    },
-  ],
-  description: "Within each group, models share a weekly limit and a 5-hour limit.",
-};
+const tracker = new TempDirTracker();
 
-function base64url(value: unknown): string {
-  return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
-}
-
-function credentialBlob(overrides: {
-  accessToken?: string;
-  expiry?: string;
-  idToken?: string;
-}): string {
-  return JSON.stringify({
-    auth_method: "consumer",
-    token: {
-      access_token: overrides.accessToken ?? "ya29.antigravity-access-token",
-      token_type: "Bearer",
-      refresh_token: "1//refresh-token-should-never-be-used",
-      expiry: overrides.expiry ?? "2040-01-02T12:00:00Z",
-    },
-    id_token:
-      overrides.idToken ??
-      `${base64url({ alg: "RS256" })}.${base64url({ email: "user@example.com" })}.sig`,
-  });
-}
-
-function okCredential(blob = credentialBlob({})): CredentialResult {
-  const credential = parseCredentialBlob(blob);
-  assert.ok(credential, "test blob should parse");
-  return { ok: true, credential };
-}
-
-function stubFetch(response: {
-  status?: number;
-  body?: unknown;
-  throwError?: Error;
-}): typeof fetch {
-  return (async () => {
-    if (response.throwError) {
-      throw response.throwError;
-    }
-    const status = response.status ?? 200;
-    return {
-      ok: status >= 200 && status < 300,
-      status,
-      headers: { get: () => null },
-      json: async () => response.body,
-      text: async () => JSON.stringify(response.body ?? null),
-    };
-  }) as unknown as typeof fetch;
-}
-
-test("parseCredentialBlob reads the access token, expiry and id_token email", () => {
-  const credential = parseCredentialBlob(credentialBlob({}));
-  assert.ok(credential);
-  assert.equal(credential.accessToken, "ya29.antigravity-access-token");
-  assert.equal(credential.email, "user@example.com");
-  assert.equal(
-    credential.expiresAt,
-    Date.parse("2040-01-02T12:00:00Z"),
-  );
-
-  assert.equal(parseCredentialBlob("not json"), null);
-  assert.equal(parseCredentialBlob(JSON.stringify({ token: {} })), null);
-  assert.equal(
-    parseCredentialBlob(JSON.stringify({ token: { access_token: "   " } })),
-    null,
-  );
-
-  const noIdToken = parseCredentialBlob(
-    credentialBlob({ idToken: "opaque-not-a-jwt" }),
-  );
-  assert.ok(noIdToken);
-  assert.equal(noIdToken.email, undefined);
+afterEach(async () => {
+  await tracker.cleanup();
 });
 
-test("windowsFromQuotaResponse maps each group/bucket to a labelled window", () => {
-  const windows = windowsFromQuotaResponse(QUOTA_RESPONSE);
-  assert.equal(windows.length, 4);
-
-  const byId = new Map(windows.map((window) => [window.id, window]));
-  const weekly = byId.get("gemini-weekly");
-  assert.ok(weekly);
-  assert.equal(weekly.label, "Gemini Models · Weekly");
-  assert.equal(weekly.shortLabel, "Gemini wk");
-  assert.equal(weekly.resetsAt, "2040-01-08T00:00:00Z");
-  assert.equal(weekly.tone, "ok");
-  assert.ok(Math.abs((weekly.usedPct ?? 0) - 20) < 1e-6);
-
-  const fiveHour = byId.get("gemini-5h");
-  assert.ok(fiveHour);
-  assert.equal(fiveHour.label, "Gemini Models · 5-hour");
-  assert.equal(fiveHour.shortLabel, "Gemini 5h");
-  assert.equal(fiveHour.summary, true);
-
-  const thirdParty = byId.get("3p-weekly");
-  assert.ok(thirdParty);
-  assert.equal(thirdParty.label, "Claude and GPT models · Weekly");
-  assert.equal(thirdParty.shortLabel, "Claude+GPT wk");
-  assert.equal(thirdParty.usedPct, 0);
-  assert.equal(thirdParty.summary, undefined);
-
-  assert.equal(byId.get("3p-5h")?.shortLabel, "Claude+GPT 5h");
-
-  assert.deepEqual(windowsFromQuotaResponse({}), []);
-  assert.deepEqual(
-    windowsFromQuotaResponse({ groups: [{ buckets: [{ bucketId: "x" }] }] }),
-    [],
-  );
-});
-
-test("reportFromQuotaResponse surfaces per-group detail rows", () => {
-  const report = reportFromQuotaResponse(QUOTA_RESPONSE);
-  assert.equal(report.status, "available");
-  if (report.status !== "available") {
-    return;
-  }
-  assert.equal(report.windows.length, 4);
-  assert.deepEqual(report.details, [
-    {
-      id: "group:0",
-      label: "Gemini Models",
-      value: "Gemini Flash, Gemini Pro",
-    },
-    {
-      id: "group:1",
-      label: "Claude and GPT models",
-      value: "Claude Opus, Claude Sonnet, GPT-OSS",
-    },
-  ]);
-});
-
-test("fetchUsage returns an available report with synthetic quota windows", async () => {
-  let requestedUrl = "";
-  let authorization = "";
-  let userAgent = "";
-  const fetchApi = (async (
-    url: string,
-    init: { headers?: Record<string, string> },
-  ) => {
-    requestedUrl = url;
-    authorization = init.headers?.Authorization ?? "";
-    userAgent = init.headers?.["User-Agent"] ?? "";
-    return {
-      ok: true,
-      status: 200,
-      headers: { get: () => null },
-      json: async () => QUOTA_RESPONSE,
-      text: async () => "",
-    };
-  }) as unknown as typeof fetch;
-
-  const report = await fetchUsage(
-    { target: DEFAULT_KEYRING_TARGET },
-    { readCredential: async () => okCredential(), fetchApi, now: () => Date.parse("2040-01-01T00:00:00Z") },
-  );
-
-  assert.equal(report.status, "available");
-  if (report.status === "available") {
-    assert.equal(report.windows.length, 4);
-  }
-  assert.equal(
-    requestedUrl,
-    "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
-  );
-  // The endpoint gates on both the bearer token and an Antigravity user agent.
-  assert.equal(authorization, "Bearer ya29.antigravity-access-token");
-  assert.equal(userAgent, "antigravity/1.0");
-});
-
-test("fetchUsage reports missing, expired and rejected logins honestly", async () => {
-  const missing = await fetchUsage(
-    { target: DEFAULT_KEYRING_TARGET },
-    { readCredential: async () => ({ ok: false, problem: { kind: "missing" } }) },
-  );
-  assert.equal(missing.status, "unavailable");
-  if (missing.status === "unavailable" && missing.problem.kind === "no_quota") {
-    assert.match(missing.problem.detail, /Run `agy` and sign in/);
-  } else {
-    assert.fail(`expected no_quota, got ${JSON.stringify(missing)}`);
-  }
-
-  const unsupported = await fetchUsage(
-    { target: DEFAULT_KEYRING_TARGET },
-    {
-      readCredential: async () => ({
-        ok: false,
-        problem: { kind: "unsupported", platform: "linux" },
-      }),
-    },
-  );
-  assert.equal(unsupported.status, "unavailable");
-
-  const expired = await fetchUsage(
-    { target: DEFAULT_KEYRING_TARGET },
-    {
-      readCredential: async () =>
-        okCredential(credentialBlob({ expiry: "2020-01-01T00:00:00Z" })),
-      fetchApi: stubFetch({ status: 200, body: QUOTA_RESPONSE }),
-      now: () => Date.parse("2040-01-01T00:00:00Z"),
-    },
-  );
-  assert.equal(expired.status, "unavailable");
-  if (expired.status === "unavailable" && expired.problem.kind === "expired") {
-    assert.equal(expired.problem.refreshedBy, "agy");
-  } else {
-    assert.fail(`expected expired, got ${JSON.stringify(expired)}`);
-  }
-
-  const rejected = await fetchUsage(
-    { target: DEFAULT_KEYRING_TARGET },
-    {
-      readCredential: async () => okCredential(),
-      fetchApi: stubFetch({ status: 403 }),
-      now: () => Date.parse("2040-01-01T00:00:00Z"),
-    },
-  );
-  assert.equal(rejected.status, "unavailable");
-  if (rejected.status === "unavailable" && rejected.problem.kind === "rejected") {
-    assert.equal(rejected.problem.status, 403);
-  } else {
-    assert.fail(`expected rejected, got ${JSON.stringify(rejected)}`);
-  }
-
-  const failed = await fetchUsage(
-    { target: DEFAULT_KEYRING_TARGET },
-    {
-      readCredential: async () => okCredential(),
-      fetchApi: stubFetch({ throwError: new Error("socket hang up") }),
-      now: () => Date.parse("2040-01-01T00:00:00Z"),
-    },
-  );
-  assert.equal(failed.status, "error");
-  if (failed.status === "error") {
-    assert.match(failed.error, /socket hang up/);
-  }
-});
-
-test("discover lists the machine login for global and Antigravity sessions only", async () => {
-  const hostKeyPattern = /^[A-Za-z0-9._-]{1,128}$/;
-
-  const globalScope: UsageScope = { kind: "global" };
-  const accounts = await discover(globalScope, {
-    readCredential: async () => okCredential(),
-  });
-  assert.equal(accounts.length, 1);
-  const account = accounts[0];
-  assert.ok(account);
-  assert.match(account.key, hostKeyPattern);
-  assert.equal(account.label, "user@example.com");
-  assert.equal(account.harness, USAGE_SOURCE_LABEL);
-  assert.deepEqual(account.input, { target: DEFAULT_KEYRING_TARGET });
-
-  const sessionScope = (provider: string): UsageScope => ({
-    kind: "session",
-    provider,
-    env: {},
-  });
-  const ours = await discover(sessionScope("antigravity-resilient"), {
-    readCredential: async () => okCredential(),
-  });
-  assert.equal(ours.length, 1);
-  const bundled = await discover(sessionScope("antigravity"), {
-    readCredential: async () => okCredential(),
-  });
-  assert.equal(bundled.length, 1);
-  const other = await discover(sessionScope("claude"), {
-    readCredential: async () => okCredential(),
-  });
-  assert.deepEqual(other, []);
-
-  const signedOut = await discover(globalScope, {
-    readCredential: async () => ({ ok: false, problem: { kind: "missing" } }),
-  });
-  assert.deepEqual(signedOut, []);
-});
-
-test("inputSchema defaults and trims the keyring target", async () => {
-  assert.deepEqual(await inputSchema.parseAsync({ target: "  custom:key  " }), {
-    target: "custom:key",
-  });
-  assert.deepEqual(await inputSchema.parseAsync({}), {
-    target: DEFAULT_KEYRING_TARGET,
-  });
-  assert.deepEqual(await inputSchema.parseAsync(null), {
-    target: DEFAULT_KEYRING_TARGET,
-  });
-});
-
-test("contribute registers the provider and the Antigravity usage source", () => {
-  const registered: Array<{
-    id: string;
-    label: string;
-    hasInput: boolean;
-    hasDiscover: boolean;
-    hasFetch: boolean;
-  }> = [];
-  let providerId = "";
-  const cleanup = contribute({
-    registerProvider(definition) {
-      providerId = definition.id;
-    },
-    registerUsageSource(source) {
-      registered.push({
-        id: source.id,
-        label: source.label,
-        hasInput: typeof source.input?.parseAsync === "function",
-        hasDiscover: typeof source.discover === "function",
-        hasFetch: typeof source.fetch === "function",
-      });
-    },
-  });
-
-  assert.equal(providerId, "antigravity-resilient");
-  assert.deepEqual(registered, [
-    {
-      id: USAGE_SOURCE_ID,
-      label: USAGE_SOURCE_LABEL,
-      hasInput: true,
-      hasDiscover: true,
-      hasFetch: true,
-    },
-  ]);
-  assert.equal(typeof cleanup, "function");
-});
-
-test("fetchUsage prefers agy CLI /usage JSON payload when available", async () => {
-  const cliPayload = {
-    status: "SUCCESS",
-    command: {
-      name: "usage",
-      data: {
-        description: "Within each group, models share a weekly limit and a 5-hour limit.",
-        groups: [
+describe("Usage CLI quota source", () => {
+  it("deduplicates global discovery by default while discovering antigravity-resilient sessions and mapping CLI quota buckets", async () => {
+    const directory = await tracker.make("paseo-agy-usage-");
+    const cli = path.join(directory, "cli.cjs");
+    await writeFile(
+      cli,
+      `
+        if (JSON.stringify(process.argv.slice(2)) !== JSON.stringify(['-p', '/usage', '--output-format', 'json'])) process.exit(2);
+        console.log(JSON.stringify({ status: 'SUCCESS', command: { name: 'usage', data: { groups: [
           {
-            name: "Gemini Models",
-            description: "Models within this group: Gemini Flash, Gemini Pro",
+            name: 'Gemini Models',
+            description: 'Models within this group: Gemini 4 Carbon, Gemini 3.8 Flash',
             buckets: [
-              {
-                id: "gemini-weekly",
-                name: "Weekly Limit Remaining",
-                window: "weekly",
-                remaining_fraction: 0.6,
-                reset_time: "2040-01-08T04:00:00Z",
-              },
-              {
-                id: "gemini-5h",
-                name: "Five Hour Limit Remaining",
-                window: "5h",
-                remaining_fraction: 0.9,
-                reset_time: "2040-01-02T05:00:00Z",
-              },
-            ],
-          },
-        ],
+              { id: 'gemini-5h', name: 'Five Hour Limit Remaining', window: '5h', remaining_fraction: 0.25, reset_time: '2026-11-19T14:25:08Z' },
+              { id: 'gemini-weekly', name: 'Weekly Limit Remaining', window: 'weekly', remaining_fraction: 0.7 },
+              { id: 'disabled', name: 'Weekly', window: 'weekly', disabled: true, remaining_fraction: 1 }
+            ]
+          }
+        ] } } }));
+      `,
+      "utf8",
+    );
+
+    const usage = new Usage();
+    const launch = {
+      command: process.execPath,
+      args: [cli, "acp", "--disable-telemetry"],
+      env: { HOME: directory },
+    };
+    const source = usage.registration();
+    assert.equal(source.id, USAGE_SOURCE_ID);
+    assert.equal(source.provider, PROVIDER_ID);
+
+    // Default global discovery returns [] so built-in `antigravity-provider` is not duplicated.
+    assert.deepEqual(await source.discover({ kind: "global", launch }), []);
+
+    // Opt-in global discovery works when built-in provider is disabled.
+    const optInGlobal = await source.discover({
+      kind: "global",
+      launch: {
+        ...launch,
+        env: { ...launch.env, PASEO_ANTIGRAVITY_RESILIENT_GLOBAL_USAGE: "1" },
       },
-    },
-  };
+    });
+    assert.equal(optInGlobal.length, 1);
 
-  let httpCalled = false;
-  const report = await fetchUsage(
-    { target: DEFAULT_KEYRING_TARGET },
-    {
-      readCredential: async () => okCredential(),
-      readCliQuota: async () => cliPayload,
-      fetchApi: (async () => {
-        httpCalled = true;
-        throw new Error("should not call HTTP fallback when CLI succeeds");
-      }) as unknown as typeof fetch,
-    },
-  );
+    // Session discovery binds exclusively to `antigravity-resilient`.
+    const sessionAccounts = await source.discover({
+      kind: "session",
+      provider: "antigravity-resilient",
+      env: { HOME: directory },
+      launch,
+    });
+    assert.equal(sessionAccounts.length, 1);
+    assert.equal(sessionAccounts[0]?.provider, "antigravity-resilient");
+    assert.equal(sessionAccounts[0]?.key, optInGlobal[0]?.key);
 
-  assert.equal(httpCalled, false);
-  assert.equal(report.status, "available");
-  if (report.status === "available") {
-    assert.equal(report.windows.length, 2);
-    const weekly = report.windows.find((w) => w.id === "gemini-weekly");
-    const fiveHour = report.windows.find((w) => w.id === "gemini-5h");
-    assert.ok(weekly);
-    assert.ok(fiveHour);
-    assert.ok(Math.abs((weekly.usedPct ?? 0) - 40) < 1e-6);
-    assert.ok(Math.abs((fiveHour.usedPct ?? 0) - 10) < 1e-6);
-  }
+    assert.deepEqual(
+      await source.discover({
+        kind: "session",
+        provider: "antigravity",
+        env: { HOME: directory },
+        launch,
+      }),
+      [],
+    );
+    assert.deepEqual(
+      await source.discover({
+        kind: "session",
+        provider: "codex",
+        env: { HOME: directory },
+      }),
+      [],
+    );
+
+    const otherLaunch = { ...launch, env: { HOME: `${directory}-other` } };
+    const otherAccounts = await source.discover({
+      kind: "session",
+      provider: "antigravity-resilient",
+      env: otherLaunch.env,
+      launch: otherLaunch,
+    });
+    assert.notEqual(otherAccounts[0]?.key, sessionAccounts[0]?.key);
+    assert.notDeepEqual(otherAccounts[0]?.input, sessionAccounts[0]?.input);
+
+    const snapshot = await source.fetch(sessionAccounts[0]!.input);
+    if (snapshot.status !== "available") {
+      throw new Error("expected available snapshot");
+    }
+    assert.equal(snapshot.windows.length, 3);
+    assert.deepEqual(snapshot.windows[0], {
+      id: "gemini-5h",
+      label: "Gemini · 5h",
+      shortLabel: "5h",
+      durationSeconds: 18_000,
+      usedPct: 75,
+      remainingPct: 25,
+      resetsAt: "2026-11-19T14:25:08Z",
+      tone: "warning",
+    });
+    assert.equal(snapshot.windows[1]?.id, "gemini-weekly");
+    assert.equal(snapshot.windows[1]?.shortLabel, "wk");
+    assert.equal(snapshot.windows[1]?.summary, true);
+    assert.ok(Math.abs((snapshot.windows[1]?.usedPct ?? 0) - 30) < 0.01);
+    assert.deepEqual(snapshot.windows[2], {
+      id: "disabled",
+      label: "Gemini · Weekly · Disabled",
+      shortLabel: "wk",
+      durationSeconds: 604_800,
+      usedPct: null,
+      remainingPct: null,
+      resetsAt: null,
+      tone: "default",
+    });
+    assert.deepEqual(snapshot.details, [
+      {
+        id: "group:0",
+        label: "Gemini Models",
+        value: "Gemini 4 Carbon, Gemini 3.8 Flash",
+      },
+    ]);
+  });
+
+  it("uses compact group and period shorthands when multiple groups are reported", async () => {
+    const directory = await tracker.make("paseo-agy-usage-");
+    const cli = path.join(directory, "cli.cjs");
+    await writeFile(
+      cli,
+      `
+        console.log(JSON.stringify({ status: 'SUCCESS', command: { name: 'usage', data: { groups: [
+          { name: 'Gemini Models', buckets: [
+            { id: 'gemini-weekly', name: 'Weekly Limit Remaining', window: 'weekly', remaining_fraction: 0.9 },
+            { id: 'gemini-5h', name: 'Five Hour Limit Remaining', window: '5h', remaining_fraction: 0.8 }
+          ] },
+          { name: 'Claude and GPT models', buckets: [
+            { id: '3p-weekly', name: 'Weekly Limit Remaining', window: 'weekly', remaining_fraction: 1 }
+          ] }
+        ] } } }));
+      `,
+      "utf8",
+    );
+    const launch = { command: process.execPath, args: [cli, "acp"], env: { HOME: directory } };
+    const source = new Usage({ allowGlobalDiscovery: true }).registration();
+    const [account] = await source.discover({ kind: "global", launch });
+    const snapshot = await source.fetch(account!.input);
+    if (snapshot.status !== "available") {
+      throw new Error("expected available");
+    }
+    assert.deepEqual(
+      snapshot.windows.map((w) => ({ id: w.id, label: w.label, shortLabel: w.shortLabel })),
+      [
+        { id: "gemini-weekly", label: "Gemini · Weekly", shortLabel: "Gemini wk" },
+        { id: "gemini-5h", label: "Gemini · 5h", shortLabel: "Gemini 5h" },
+        { id: "3p-weekly", label: "Claude and GPT · Weekly", shortLabel: "Claude and GPT wk" },
+      ],
+    );
+  });
+
+  it("surfaces CLI errors and hides raw stderr on command failures", async () => {
+    const directory = await tracker.make("paseo-agy-usage-");
+    const errCli = path.join(directory, "err-cli.cjs");
+    await writeFile(
+      errCli,
+      `console.log(JSON.stringify({ status: 'ERROR', error: 'Authentication required' }));`,
+      "utf8",
+    );
+    const source = new Usage({ allowGlobalDiscovery: true }).registration();
+    const [errAccount] = await source.discover({
+      kind: "global",
+      launch: { command: process.execPath, args: [errCli, "acp"], env: { HOME: directory } },
+    });
+    await assert.rejects(() => source.fetch(errAccount!.input), /Authentication required/);
+
+    const crashCli = path.join(directory, "crash-cli.cjs");
+    await writeFile(
+      crashCli,
+      `process.stderr.write('authentication token=private-secret'); process.exit(1);`,
+      "utf8",
+    );
+    const [crashAccount] = await source.discover({
+      kind: "global",
+      launch: { command: process.execPath, args: [crashCli, "acp"], env: { HOME: `${directory}-2` } },
+    });
+    await assert.rejects(
+      () => source.fetch(crashAccount!.input),
+      (err: unknown) =>
+        err instanceof Error &&
+        err.message ===
+          "Antigravity usage command failed or timed out. Check that agy is signed in." &&
+        !err.message.includes("private-secret"),
+    );
+  });
 });

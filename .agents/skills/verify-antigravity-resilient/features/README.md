@@ -5,7 +5,7 @@ This directory is the maintained source for verifying the user-facing behavior o
 ## Baseline preconditions
 
 - The local Paseo daemon is running on `cfg.daemon.listen` (`127.0.0.1:8768`) with valid credentials in `~/.paseo/local-credential`.
-- `agy --version` reports `>= 1.1.15` and has an active authenticated session.
+- `agy --version` reports `>= 1.5.15` and has an active authenticated session.
 - `npm run typecheck` passes with exit code `0`.
 - Live probes use a dedicated disposable fixture directory (`$env:TEMP\paseo-antigravity-live-fixture`) and write proof artifacts to a fresh `--output` directory outside the repository.
 - Never cancel or modify pre-existing user agents in Paseo; only drive the agent ID created by the verification run.
@@ -19,7 +19,7 @@ This directory is the maintained source for verifying the user-facing behavior o
 ## Proof and skip reporting
 
 - Capture both real-time WebSocket stream events (`live-timeline.jsonl`) and fetched timeline snapshots (`completed-timeline.json`, `parity-timeline.json`, `replayed-timeline.json`, `canceled-timeline.json`, `summary.json`).
-- Verify side effects on disk (persisted conversation snapshot in `~/.paseo/antigravity-resilient/conversations/<conversationId>.json` and `agy` native `transcript_full.jsonl`).
+- Verify side effects on disk (native `agy` conversation files in `~/.gemini/antigravity-cli/conversations/`).
 - Report any unreachable path with the attempted command and the unmet precondition; never report a skipped check as verified.
 
 ## Feature entry contract

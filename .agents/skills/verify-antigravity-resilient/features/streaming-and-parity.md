@@ -5,10 +5,9 @@ Streaming and `agy` parity ensures that assistant messages stream incrementally 
 ## Sub-features
 
 - `stream-progress` streams pre-tool progress (`PRE_TOOL_MARKER`), tool execution, post-tool commentary (`POST_TOOL_MARKER`), and multi-chunk final text (`FINAL_MARKER` .. `END_MARKER`).
-- `native-reasoning` tails `transcript_full.jsonl` (falling back to `transcript.jsonl`) and emits `reasoning` items in step order before their corresponding message or tool steps.
-- `canonical-tools` maps `agy` 1.4.12 `run_command`, `write_file` (`Path`, `Content`), `edit_file` (`Path`, `Target`, `Replacement`), and `read_file` (`Path`, `StartLine`, `EndLine`) to `shell`, `write`, `edit`, and `read` tool details.
-- `thought-tag-parity` preserves markdown responses containing literal `` `<thought>` `` without stdout truncation (`THOUGHT_TAG_SURVIVED_MARKER`) in a single unsplit `assistant_message` bubble (`thoughtMessageBubbles === 1`) and without duplicate `:message:1` fallback bubbles.
-- `evicted-db-recovery` recovers conversation history into a new `agy` trajectory (`<CONVERSATION_HISTORY_RECOVERY>`) and migrates the durable store when `agy`'s 500-conversation cap evicts `<conversationId>.db` from `~/.gemini/antigravity-cli/conversations/`.
+- `native-reasoning` streams `agent_thought_chunk` reasoning updates in step order via `agy acp`.
+- `canonical-tools` maps `agy` `run_command`, `write_file` (`Path`, `Content`), `edit_file` (`Path`, `Target`, `Replacement`), and `read_file` (`Path`, `StartLine`, `EndLine`) to `shell`, `write`, `edit`, and `read` tool details.
+- `thought-tag-parity` preserves markdown responses containing literal `` `<thought>` `` without truncation (`THOUGHT_TAG_SURVIVED_MARKER`) in a single unsplit `assistant_message` bubble (`thoughtMessageBubbles === 1`).
 
 ## How to get to it (user POV)
 

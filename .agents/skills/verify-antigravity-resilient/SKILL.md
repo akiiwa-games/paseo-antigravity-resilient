@@ -1,11 +1,11 @@
 ---
 name: verify-antigravity-resilient
-description: "Verify the antigravity-resilient Paseo provider plugin end-to-end against a real local Paseo daemon and logged-in agy CLI, plus offline packaging/SDK linkage. Use when validating streaming, native transcript_full.jsonl parity, canonical tool details, durable replay, or process-tree cancellation."
+description: "Verify the antigravity-resilient Paseo ACP provider plugin end-to-end against a real local Paseo daemon and logged-in agy CLI (>= 1.5.15), plus offline packaging/SDK linkage. Use when validating ACP streaming, reasoning chunks, canonical tool details, session/load replay, or process-tree cancellation."
 ---
 
 # Verify `paseo-antigravity-resilient`
 
-This skill drives the real `antigravity-resilient-provider` plugin inside a live Paseo daemon (`cfg.daemon.listen`, e.g. `127.0.0.1:8768`) backed by a logged-in `agy` CLI (`>= 1.1.15`), and verifies offline packaging via `npm run verify:install`.
+This skill drives the real `antigravity-resilient-provider` plugin inside a live Paseo daemon (`cfg.daemon.listen`, e.g. `127.0.0.1:8768`) backed by a logged-in `agy` CLI (`>= 1.5.15`), and verifies offline packaging via `npm run verify:install`.
 
 ## Launch
 
@@ -19,7 +19,7 @@ This skill drives the real `antigravity-resilient-provider` plugin inside a live
 
 Run this read-only check before driving the live daemon to confirm:
 1. TypeScript compilation passes (`npm run typecheck`),
-2. `agy --version` is readable and `>= 1.1.15`,
+2. `agy --version` is readable and `>= 1.5.15`,
 3. `~/.paseo/config.json` and `~/.paseo/local-credential` exist and the Paseo daemon is listening on `daemon.listen` (`127.0.0.1:8768`):
 
 ```powershell
@@ -50,10 +50,9 @@ Every verification run writes durable proof artifacts outside the source tree so
   - `live-timeline.jsonl`: every real-time WebSocket timeline event with timestamp.
   - `completed-timeline.json`: full Paseo timeline snapshot after the streaming turn.
   - `parity-timeline.json`: full Paseo timeline snapshot proving canonical `shell`, `write`, `edit`, and `read` tool details and untruncated literal `<thought>` markdown output in a single unsplit bubble (`thoughtMessageBubbles === 1`).
-  - `replayed-timeline.json`: timeline snapshot after `client.refreshAgent(agentId)` proving durable replay.
-  - `evicted-recovery-timeline.json`: timeline snapshot after deleting `<conversationId>.db` from `~/.gemini/antigravity-cli/conversations/` and sending a continuation turn (`EVICTED_RECOVERY_MARKER beta`), proving automatic history recovery without `"Antigravity restored a different conversation; refusing to mix histories"`.
+  - `replayed-timeline.json`: timeline snapshot after `client.refreshAgent(agentId)` proving ACP `session/load` history replay.
   - `canceled-timeline.json`: timeline snapshot after `client.cancelAgent(agentId)` proving no tool remains in `"running"` state and the child `python slow.py` process (`slowPid`) exited.
-  - `summary.json`: structured pass/fail summary of all live checks (`streaming`, `continuation`, `toolAndThoughtParity`, `replay`, `evictedDbRecovery`, `cancellation`).
+  - `summary.json`: structured pass/fail summary of all live checks (`streaming`, `continuation`, `toolAndThoughtParity`, `replay`, `cancellation`).
 
 ## Cleanup
 

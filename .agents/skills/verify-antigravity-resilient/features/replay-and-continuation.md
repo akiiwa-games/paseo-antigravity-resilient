@@ -5,8 +5,7 @@ Continuation and durable timeline replay lets a user send follow-up prompts in t
 ## Sub-features
 
 - `same-conversation-continuation` reuses the `agy` conversation handle across turns so the model recalls prior turn outputs (`RESUME_MARKER 5`).
-- `durable-replay` replays the persisted timeline from `~/.paseo/antigravity-resilient/conversations/<conversationId>.json` when `client.refreshAgent(agentId)` or `session.open(..., "replay")` is called.
-- `replay-upgrade` upgrades legacy `unknown` `read_file`/`write_file`/`edit_file` tool details and legacy compaction notifications on read without mutating snapshot files on disk.
+- `durable-replay` replays the conversation history over ACP `session/load` when `client.refreshAgent(agentId)` or `session.open(..., "replay")` is called, including legacy `{ conversationId }` and `{ sessionKey }` persistence formats.
 
 ## How to get to it (user POV)
 

@@ -1,3093 +1,1055 @@
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { PassThrough } from "node:stream";
-import { test } from "node:test";
-import type {
-  ProviderCatalog,
-  ProviderEvent,
-  ProviderHost,
-  ProviderPrompt,
-  ProviderSessionConfig,
-} from "@getpaseo/plugin/server/provider";
+import { afterEach, describe, it } from "node:test";
+import type { ProviderEvent } from "@getpaseo/plugin/server/provider";
 import {
-  evaluateRemoteSyncSafety,
-  parsePorcelainStatus,
-} from "../scripts/sync-safety.mjs";
+  defaultAgyCommand,
+  resolveDefaultAgyExecutable,
+  resolveEffectiveLaunch,
+} from "../server/launch.ts";
 import {
-  DEFAULT_MODE,
-  getCatalog,
-  MODES,
-  parseModels,
-  resolveContextWindowMaxTokens,
-  type ProviderDiscovery,
-} from "../server/internal/catalog.ts";
-import { isTransientLaunchError, type SpawnFunction } from "../server/internal/process.ts";
-import {
-  AUTOCOMPACT_THRASHING_MESSAGE,
-  CONTEXT_OUTPUT_GUIDANCE,
-  DEFAULT_AUTO_COMPACT_LEAD_MS,
-  DEFAULT_AUTO_COMPACT_MAX_LATE_MS,
-  DEFAULT_AUTO_COMPACT_TOKEN_THRESHOLD,
-  DEFAULT_HOT_CACHE_TTL_MS,
-  DEFAULT_PRE_TURN_COMPACT_TOKEN_THRESHOLD,
-  isCompactPromptText,
-  isGoalPromptText,
-  MAX_CONSECUTIVE_COMPACT_FAILURES,
-  MIN_ENV_AUTO_COMPACT_TOKEN_THRESHOLD,
-  RAPID_REFILL_BREAKER_LIMIT,
-  RAPID_REFILL_REQUEST_WINDOW,
-  Session,
-  TOKEN_GAP_CONTINUE_PROMPT,
-} from "../server/internal/session.ts";
-import { ProviderActionError } from "../server/internal/signals.ts";
-import {
-  ConversationStore,
-  DEFAULT_FS_OPS,
-  defaultStoreDir,
-} from "../server/internal/store.ts";
-import {
-  diagnostic,
-  isAuthDiagnosticError,
-  isStreamInterruption,
-  isTokenGap,
-} from "../server/internal/wire.ts";
-import { antigravityResilientProvider, checkAgyStatus, PROVIDER_ID } from "../server/provider.ts";
-import {
-  beginBusinessTurn, beginCompact, emptyCompactionState, finishCompact, POST_COMPACT_SUMMARY_TOKENS,
-} from "../server/internal/compaction.ts";
+  createAntigravityResilientProvider,
+  MIN_AGY_VERSION_EXPORT,
+  PLUGIN_ID,
+  PROVIDER_ID,
+  PROVIDER_LABEL,
+} from "./provider-exports-bridge.ts";
+import { launchStubAgent, TempDirTracker, waitFor } from "./helpers.ts";
 
-class FakeChildProcess extends EventEmitter {
-  readonly args: readonly string[];
-  stdin = new PassThrough();
-  stdout = new PassThrough();
-  stderr = new PassThrough();
-  exitCode: number | null = null;
-  signalCode: string | null = null;
-  killed = false;
-  pid = 42424;
+const tracker = new TempDirTracker();
 
-  constructor(
-    args: readonly string[],
-    onPrompt: (prompt: { role: string; content: string }, child: FakeChildProcess) => void,
-  ) {
-    super();
-    this.args = args;
-    this.stdin.setEncoding("utf8");
-    let buffer = "";
-    this.stdin.on("data", (chunk: string) => {
-      buffer += chunk;
-      while (buffer.includes("\n")) {
-        const newline = buffer.indexOf("\n");
-        const line = buffer.slice(0, newline).trim();
-        buffer = buffer.slice(newline + 1);
-        if (line) {
-          onPrompt(JSON.parse(line) as { role: string; content: string }, this);
+afterEach(async () => {
+  await tracker.cleanup();
+});
+
+const minimalAcpAgent = `
+  const { createInterface } = require("node:readline");
+  createInterface({ input: process.stdin }).on("line", (line) => {
+    const { id, method } = JSON.parse(line);
+    if (method === "initialize") {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        result: {
+          protocolVersion: 1,
+          agentInfo: { name: "Antigravity ACP Server", version: "1.5.17" },
+          agentCapabilities: {}
         }
-      }
-    });
-  }
-
-  sendFrame(frame: Record<string, unknown>): void {
-    this.stdout.write(`${JSON.stringify(frame)}\n`);
-  }
-
-  kill(): boolean {
-    if (this.exitCode === null && this.signalCode === null) {
-      this.killed = true;
-      this.exitCode = 0;
-      this.stdout.end();
-      this.stderr.end();
-      this.emit("close", 0, null);
+      }) + "\\n");
     }
-    return true;
-  }
-}
+  });
+`;
 
-function sendCompletedResponse(child: FakeChildProcess, conversationId: string, text: string, stepIndex = 1): void {
-  child.sendFrame({ event: "step_update", conversation_id: conversationId,
-    step_update: { step_index: stepIndex, step_type: "agent_response", state: "DONE", text_delta: text } });
-}
+describe("provider identity and status", () => {
+  it("preserves antigravity-resilient identity and minimum agy version check", async () => {
+    assert.equal(PROVIDER_ID, "antigravity-resilient");
+    assert.equal(PLUGIN_ID, "antigravity-resilient-provider");
+    assert.equal(PROVIDER_LABEL, "Antigravity (Resilient)");
+    assert.equal(MIN_AGY_VERSION_EXPORT, "1.5.15");
 
-const TEST_CATALOG: ProviderDiscovery = {
-  models: [
-    { id: "gemini-4-argon-high", label: "Gemini 4 Argon (High)", isDefault: true },
-  ],
-  modes: MODES,
-  defaultModel: "gemini-4-argon-high",
-  defaultMode: DEFAULT_MODE,
-};
+    const { launch } = await launchStubAgent(
+      tracker,
+      `
+        process.stderr.write("Unknown command: acp\\n");
+        process.exitCode = 1;
+      `,
+    );
+    const provider = createAntigravityResilientProvider({ discoveryRetryDelayMs: 10 });
+    assert.equal(provider.id, "antigravity-resilient");
+    assert.deepEqual(provider.command?.slice(1), ["acp", "--disable-telemetry"]);
+    const status = await provider.status!({ launch });
+    assert.equal(status.available, false);
+    assert.match(status.diagnostic ?? "", /1\.5\.15/);
+  });
 
-function makeConfig(overrides: Partial<ProviderSessionConfig> = {}): ProviderSessionConfig {
-  return {
-    cwd: "/workspace/example",
-    env: { SECRET_KEY: "ya29.should_never_be_persisted_in_timeline_store" },
-    mcpServers: {},
-    model: "gemini-4-argon-high",
-    mode: "full-access",
-    settings: {},
-    persist: true,
-    ...overrides,
-  };
-}
+  it("rejects agy versions older than 1.5.15 during ACP initialize", async () => {
+    const { launch } = await launchStubAgent(
+      tracker,
+      `
+        const { createInterface } = require("node:readline");
+        createInterface({ input: process.stdin }).on("line", (line) => {
+          const { id, method } = JSON.parse(line);
+          if (method === "initialize") {
+            process.stdout.write(JSON.stringify({
+              jsonrpc: "2.0",
+              id,
+              result: {
+                protocolVersion: 1,
+                agentInfo: { name: "Antigravity ACP Server", version: "1.5.11" },
+                agentCapabilities: {}
+              }
+            }) + "\\n");
+          }
+        });
+      `,
+    );
+    const provider = createAntigravityResilientProvider({ discoveryRetryDelayMs: 10 });
+    const status = await provider.status!({ launch });
+    assert.equal(status.available, false);
+    assert.match(status.diagnostic ?? "", /Antigravity 1\.5\.11 is unsupported\. Update agy to 1\.5\.15 or later\./);
+  });
 
-function userPrompt(text: string, clientMessageId = "msg-1"): ProviderPrompt {
-  return {
-    clientMessageId,
-    delivery: "auto",
-    input: {
-      type: "message",
-      content: [{ type: "text", text }],
-    },
-  };
-}
+  it("reports SSH sign-in diagnostics accurately", async () => {
+    const { launch } = await launchStubAgent(tracker, minimalAcpAgent);
+    const provider = createAntigravityResilientProvider({ discoveryRetryDelayMs: 10 });
+    assert.deepEqual(await provider.status!({ launch }), {
+      available: true,
+      diagnostic: "SSH session: no\nSign-in: can differ from agy over SSH",
+    });
 
-function waitForTurnEnd(
-  events: ProviderEvent[],
-): Promise<Extract<ProviderEvent, { type: "session.turn" }>> {
-  return new Promise((resolve, reject) => {
-    const deadline = Date.now() + 3_000;
-    const poll = () => {
-      const done = events.find(
-        (
-          event,
-        ): event is Extract<ProviderEvent, { type: "session.turn" }> =>
-          event.type === "session.turn" &&
-          (event.state === "completed" ||
-            event.state === "failed" ||
-            event.state === "canceled"),
+    for (const variable of ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]) {
+      const env = { ...launch.env, [variable]: "set" };
+      assert.deepEqual(await provider.status!({ launch: { ...launch, env } }), {
+        available: true,
+        diagnostic: `SSH session: yes (${variable})\nSign-in: can differ from agy outside SSH`,
+      });
+    }
+
+    const failing = await launchStubAgent(tracker, `process.exit(1);`);
+    const sshFailStatus = await provider.status!({
+      launch: { ...failing.launch, env: { ...failing.launch.env, SSH_CONNECTION: "set" } },
+    });
+    assert.deepEqual(sshFailStatus, {
+      available: false,
+      diagnostic: [
+        "Antigravity ACP did not start. Install Antigravity 1.5.15 or later. If you override the command, include the acp subcommand.",
+        "SSH session: yes (SSH_CONNECTION)",
+        "Sign-in: can differ from agy outside SSH",
+      ].join("\n"),
+    });
+  });
+
+  it("inspects installation version and reports not_installed when unresolved", async () => {
+    const signal = new AbortController().signal;
+    const { launch } = await launchStubAgent(
+      tracker,
+      `
+        const args = process.argv.slice(2);
+        if (args.includes("acp")) process.exit(1);
+        if (args[0] === "--version") console.log("Antigravity CLI 1.5.17");
+      `,
+    );
+    const installation = createAntigravityResilientProvider().installation!;
+    assert.equal(
+      installation.installUrl,
+      "https://antigravity.google/docs/getting-started?tab=cli",
+    );
+    assert.equal(installation.update, undefined);
+    assert.deepEqual(
+      await installation.inspect!({ launch: { ...launch, resolved: true }, signal }),
+      { status: "installed", version: "1.5.17" },
+    );
+    assert.deepEqual(
+      await installation.inspect!({
+        launch: { command: "agy", args: ["acp"], env: {}, resolved: false },
+        signal,
+      }),
+      { status: "not_installed" },
+    );
+  });
+
+  it("falls back to %LOCALAPPDATA%\\agy\\bin\\agy.exe on Windows when agy is missing from PATH", () => {
+    const winAgy = path.join("D:", "Users", "alice", "AppData", "Local", "agy", "bin", "agy.exe");
+    const resolved = resolveDefaultAgyExecutable({
+      platform: "win32",
+      env: {
+        PATH: "C:\\Windows\\System32",
+        LOCALAPPDATA: path.join("D:", "Users", "alice", "AppData", "Local"),
+      },
+      exists: (candidate) => candidate === winAgy,
+    });
+    assert.equal(resolved, winAgy);
+    assert.deepEqual(
+      defaultAgyCommand({
+        platform: "win32",
+        env: {
+          PATH: "C:\\Windows\\System32",
+          LOCALAPPDATA: path.join("D:", "Users", "alice", "AppData", "Local"),
+        },
+        exists: (candidate) => candidate === winAgy,
+      }),
+      [winAgy, "acp", "--disable-telemetry"],
+    );
+
+    // When agy is already on PATH, keep bare "agy" so per-provider PATH overrides win.
+    const onPath = resolveDefaultAgyExecutable({
+      platform: "win32",
+      env: {
+        PATH: "D:\\custom\\bin",
+        LOCALAPPDATA: path.join("D:", "Users", "alice", "AppData", "Local"),
+      },
+      exists: (candidate) => candidate === path.join("D:\\custom\\bin", "agy.exe") || candidate === winAgy,
+    });
+    assert.equal(onPath, "agy");
+
+    const effective = resolveEffectiveLaunch(
+      {
+        command: "agy",
+        args: ["acp", "--disable-telemetry"],
+        env: {
+          PATH: "C:\\Windows\\System32",
+          LOCALAPPDATA: path.join("D:", "Users", "alice", "AppData", "Local"),
+        },
+      },
+      {
+        platform: "win32",
+        exists: (candidate) => candidate === winAgy,
+      },
+    );
+    assert.equal(effective.command, winAgy);
+  });
+});
+
+describe("official v0.17.4 ACP provider parity and legacy compatibility", () => {
+  it("publishes Antigravity skills separately from built-in commands", async () => {
+    const { directory, launch } = await launchStubAgent(
+      tracker,
+      `
+        const { createInterface } = require("node:readline");
+        const send = (message) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\\n");
+        createInterface({ input: process.stdin }).on("line", (line) => {
+          const { id, method } = JSON.parse(line);
+          if (method === "initialize") {
+            send({ id, result: { protocolVersion: 1 } });
+          }
+          if (method === "session/new") {
+            send({ id, result: { sessionId: "native", modes: {
+              currentModeId: "default", availableModes: [{ id: "default", name: "Default" }],
+            } } });
+            send({ method: "session/update", params: { sessionId: "native", update: {
+              sessionUpdate: "available_commands_update",
+              availableCommands: ["goal", "compact", "schedule", "browser", "plan", "grill-me",
+                "teamwork", "learn", "boost", "agy-customizations", "antigravity-guide", "diagnose"]
+                .map(name => ({ name, description: name })),
+            } } });
+          }
+          if (method === "session/close") send({ id, result: {} });
+        });
+      `,
+    );
+
+    const connection = await createAntigravityResilientProvider().connect({
+      launch,
+      versions: [1],
+      capabilities: [],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    try {
+      await connection.send({
+        type: "session.open",
+        requestId: "new",
+        sessionId: "test",
+        history: "skip",
+        config: { cwd: directory, env: {}, mcpServers: {}, settings: {}, persist: false },
+      });
+      const cmdEvent = await waitFor(
+        () => events.find((e): e is Extract<ProviderEvent, { type: "session.commands" }> => e.type === "session.commands"),
+        { label: "session.commands" },
       );
-      if (done) {
-        resolve(done);
-        return;
-      }
-      if (Date.now() > deadline) {
-        reject(
-          new Error(
-            `Timed out waiting for session.turn end; events=${JSON.stringify(events)}`,
+      assert.deepEqual(
+        cmdEvent.commands.map(({ name, description, kind }) => ({ name, description, kind })),
+        [
+          ...[
+            "goal",
+            "compact",
+            "schedule",
+            "browser",
+            "plan",
+            "grill-me",
+            "teamwork",
+            "learn",
+            "boost",
+          ].map((name) => ({ name, description: name, kind: "command" })),
+          ...["agy-customizations", "antigravity-guide", "diagnose"].map((name) => ({
+            name,
+            description: name,
+            kind: "skill",
+          })),
+        ],
+      );
+    } finally {
+      await connection.close();
+    }
+  });
+
+  for (const supportsSystemPrompt of [true, false]) {
+    it(`loads saved stream-json conversationId and sessionKey persistence (systemPrompt=${supportsSystemPrompt})`, async () => {
+      const { directory, capturePath, launch } = await launchStubAgent(
+        tracker,
+        `
+          const { appendFileSync } = require("node:fs");
+          const { createInterface } = require("node:readline");
+          const configOptions = [
+            { id: "model", name: "Model", category: "model", type: "select", currentValue: "gemini-4-neon",
+              options: [
+                { value: "gemini-4-neon", name: "Gemini 4 Neon" },
+                { value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
+                { value: "gemini-4-neon-high", name: "Gemini 4 Neon High" }
+              ] },
+            { id: "thought_level", name: "Thinking", category: "thought_level", type: "select", currentValue: "low",
+              options: [{ value: "low", name: "Low" }, { value: "high", name: "High" }] },
+            { id: "mode", name: "Mode", category: "mode", type: "select", currentValue: "accept-edits",
+              options: [{ value: "default", name: "Default" }, { value: "accept-edits", name: "Accept edits" }] },
+          ];
+          const send = (message) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\\n");
+          createInterface({ input: process.stdin }).on("line", (line) => {
+            appendFileSync(process.env.CAPTURE, line + "\\n");
+            const { id, method, params } = JSON.parse(line);
+            switch (method) {
+              case "initialize":
+                send({ id, result: { protocolVersion: 1, agentCapabilities: {
+                  loadSession: true,
+                  _meta: { antigravity: { systemPrompt: { append: ${supportsSystemPrompt} } } },
+                } } });
+                break;
+              case "session/load":
+                send({ method: "session/update", params: { sessionId: params.sessionId, update: {
+                  sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Saved reply" },
+                } } });
+                send({ method: "session/update", params: { sessionId: params.sessionId, update: {
+                  sessionUpdate: "tool_call", toolCallId: "write", name: "write_file", title: "File notes.txt",
+                  status: "completed", kind: "edit", rawInput: { Path: "/repo/notes.txt", Content: "hello" },
+                } } });
+                send({ id, result: { configOptions } });
+                break;
+              case "session/set_config_option":
+                configOptions.find(option => option.id === params.configId).currentValue = params.value;
+                send({ id, result: { configOptions } });
+                break;
+              case "session/close":
+                send({ id, result: {} });
+                break;
+            }
+          });
+        `,
+      );
+
+      // Also prepare a legacy `session-keys` binding directory to verify pre-init legacy persistence.
+      const legacyStoreDir = path.join(directory, "legacy-store");
+      await mkdir(path.join(legacyStoreDir, "session-keys"), { recursive: true });
+      await writeFile(
+        path.join(legacyStoreDir, "session-keys", "legacy-session-key-1.json"),
+        JSON.stringify({ version: 1, conversationId: "bound-conversation-id" }),
+        "utf8",
+      );
+
+      const provider = createAntigravityResilientProvider({ legacyStoreDir });
+      const connection = await provider.connect({
+        launch,
+        versions: [1],
+        capabilities: ["session.configure", "session.persistence"],
+      });
+      const events: ProviderEvent[] = [];
+      connection.onEvent((event) => events.push(event));
+      try {
+        await connection.send({
+          type: "session.open",
+          requestId: "restore",
+          sessionId: "test",
+          history: "replay",
+          persistence: {
+            version: 1,
+            data: supportsSystemPrompt
+              ? { conversationId: "saved-conversation", sessionKey: "ignored-when-conv-present" }
+              : { sessionKey: "legacy-session-key-1" },
+          },
+          config: {
+            cwd: directory,
+            model: "gemini-3.8-flash-high",
+            mode: "full-access",
+            systemPrompt: "A test system instruction",
+            env: {},
+            mcpServers: {},
+            settings: {},
+            persist: true,
+          },
+        });
+        await waitFor(
+          () => events.find((e) => e.type === "session.ready" || e.type === "request.failed"),
+          { label: "session.ready" },
+        );
+        const expectedSessionId = supportsSystemPrompt
+          ? "saved-conversation"
+          : "bound-conversation-id";
+
+        const opened = events.find((e) => e.type === "session.opened");
+        if (!opened || opened.type !== "session.opened") {
+          throw new Error("Expected session.opened event");
+        }
+        assert.deepEqual(opened.persistence, {
+          version: 1,
+          data: {
+            sessionId: expectedSessionId,
+            conversationId: expectedSessionId,
+          },
+        });
+
+        assert.ok(
+          events.some(
+            (e) =>
+              e.type === "timeline.item" &&
+              e.item.type === "assistant_message" &&
+              e.item.text === "Saved reply",
           ),
         );
-        return;
-      }
-      setTimeout(poll, 10);
-    };
-    poll();
-  });
-}
-
-/** A native transcript holding the conversation's first model request, which
- * anchors the post-compact estimate (first request + summary). */
-function writeFirstRequest(brainDir: string, conv: string, tokens: number): void {
-  const logs = path.join(brainDir, conv, ".system_generated", "logs");
-  mkdirSync(logs, { recursive: true });
-  const at = new Date(Date.now() - 60_000).toISOString();
-  writeFileSync(path.join(logs, "transcript.jsonl"), [
-    { step_index: 0, type: "USER_INPUT", status: "DONE", created_at: at, content: "first request" },
-    { step_index: 1, type: "PLANNER_RESPONSE", status: "DONE", created_at: at, input_tokens: tokens },
-  ].map((row) => JSON.stringify(row)).join("\n") + "\n");
-}
-
-function usageSamples(events: ProviderEvent[]): Array<Extract<ProviderEvent, { type: "session.usage" }>> {
-  return events.filter((e): e is Extract<ProviderEvent, { type: "session.usage" }> => e.type === "session.usage");
-}
-
-test("401 refresh-race before progress retries once with original prompt and succeeds", async () => {
-  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-test-"));
-  try {
-    const events: ProviderEvent[] = [];
-    const prompts: Array<{ args: readonly string[]; content: string }> = [];
-
-    const spawn: SpawnFunction = (_command, args) => {
-      const attempt = prompts.length + 1;
-      const child = new FakeChildProcess(args, (prompt) => {
-        prompts.push({ args, content: prompt.content });
-        if (attempt === 1) {
-          child.sendFrame({
-            event: "result",
-            conversation_id: "conv-401-no-progress",
-            status: "error",
-            errors: [
-              "UNAUTHENTICATED (code 401): Request had invalid authentication credentials. Expected OAuth 2 access token, login cookie or other valid authentication credential.",
-            ],
-          });
-          return;
-        }
-        child.sendFrame({
-          event: "message",
-          conversation_id: "conv-401-no-progress",
-          role: "assistant",
-          content: "Completed after token refresh",
-        });
-        child.sendFrame({
-          event: "result",
-          conversation_id: "conv-401-no-progress",
-          status: "success",
-          response: "Completed after token refresh",
-        });
-      });
-      queueMicrotask(() => {
-        child.sendFrame({
-          event: "init",
-          conversation_id: "conv-401-no-progress",
-        });
-      });
-      return child as unknown as ReturnType<SpawnFunction>;
-    };
-
-    const session = new Session(
-      "session-1",
-      "agy",
-      [],
-      {},
-      makeConfig(),
-      undefined,
-      TEST_CATALOG,
-      (event) => events.push(event),
-      { spawn, storeDir: tempDir, tokenGapRetryDelayMs: 10 },
-    );
-
-    await session.prompt(userPrompt("Run the check"));
-    const finalTurn = await waitForTurnEnd(events);
-
-    assert.equal(finalTurn.state, "completed");
-    assert.equal(prompts.length, 2);
-    assert.equal(prompts[0]?.content, `${CONTEXT_OUTPUT_GUIDANCE}\n\nRun the check`);
-    assert.equal(prompts[1]?.content, prompts[0]?.content);
-    assert.ok(prompts[1]?.args.includes("--conversation"));
-    assert.ok(prompts[1]?.args.includes("conv-401-no-progress"));
-    assert.equal(
-      events.some(
-        (event) => event.type === "session.turn" && event.state === "failed",
-      ),
-      false,
-    );
-  } finally {
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-test("401 refresh-race after partial progress retries once with continuation prompt", async () => {
-  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-test-"));
-  try {
-    const events: ProviderEvent[] = [];
-    const prompts: string[] = [];
-
-    const spawn: SpawnFunction = (_command, args) => {
-      const attempt = prompts.length + 1;
-      const child = new FakeChildProcess(args, (prompt) => {
-        prompts.push(prompt.content);
-        if (attempt === 1) {
-          child.sendFrame({
-            event: "message",
-            conversation_id: "conv-401-progress",
-            role: "assistant",
-            content: "Step 1 done.",
-          });
-          child.sendFrame({
-            event: "result",
-            conversation_id: "conv-401-progress",
-            status: "error",
-            errors: [
-              "pre-invocation hook: context summarization: UNAUTHENTICATED (code 401): Request had invalid authentication credentials.",
-            ],
-          });
-          return;
-        }
-        child.sendFrame({
-          event: "message",
-          conversation_id: "conv-401-progress",
-          role: "assistant",
-          content: "Step 2 done.",
-        });
-        child.sendFrame({
-          event: "result",
-          conversation_id: "conv-401-progress",
-          status: "success",
-          response: "Step 2 done.",
-        });
-      });
-      queueMicrotask(() => {
-        child.sendFrame({
-          event: "init",
-          conversation_id: "conv-401-progress",
-        });
-      });
-      return child as unknown as ReturnType<SpawnFunction>;
-    };
-
-    const session = new Session(
-      "session-2",
-      "agy",
-      [],
-      {},
-      makeConfig(),
-      { version: 1, data: { conversationId: "conv-401-progress" } },
-      TEST_CATALOG,
-      (event) => events.push(event),
-      { spawn, storeDir: tempDir, tokenGapRetryDelayMs: 10 },
-    );
-
-    await session.prompt(userPrompt("Do two steps"));
-    const finalTurn = await waitForTurnEnd(events);
-
-    assert.equal(finalTurn.state, "completed");
-    assert.deepEqual(prompts, [`${CONTEXT_OUTPUT_GUIDANCE}\n\nDo two steps`, TOKEN_GAP_CONTINUE_PROMPT]);
-  } finally {
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-test("repeated 401 fails once after single retry without infinite loop", async () => {
-  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-test-"));
-  try {
-    const events: ProviderEvent[] = [];
-    let spawns = 0;
-
-    const spawn: SpawnFunction = (_command, args) => {
-      spawns += 1;
-      const child = new FakeChildProcess(args, () => {
-        child.sendFrame({
-          event: "result",
-          conversation_id: "conv-401-twice",
-          status: "error",
-          errors: [
-            "UNAUTHENTICATED (code 401): Request had invalid authentication credentials.",
-          ],
-        });
-      });
-      queueMicrotask(() => {
-        child.sendFrame({
-          event: "init",
-          conversation_id: "conv-401-twice",
-        });
-      });
-      return child as unknown as ReturnType<SpawnFunction>;
-    };
-
-    const session = new Session(
-      "session-3",
-      "agy",
-      [],
-      {},
-      makeConfig(),
-      { version: 1, data: { conversationId: "conv-401-twice" } },
-      TEST_CATALOG,
-      (event) => events.push(event),
-      { spawn, storeDir: tempDir, tokenGapRetryDelayMs: 10 },
-    );
-
-    await session.prompt(userPrompt("Check auth"));
-    const finalTurn = await waitForTurnEnd(events);
-
-    assert.equal(spawns, 2);
-    assert.equal(finalTurn.state, "failed");
-    assert.match(
-      finalTurn.error?.message ?? "",
-      /Antigravity authentication failed/,
-    );
-  } finally {
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-test("narrowed diagnostic does not rewrite non-auth errors containing 'author' or 'auth'", async () => {
-  assert.equal(
-    isAuthDiagnosticError("Invalid author field in package.json"),
-    false,
-  );
-  assert.equal(
-    diagnostic("Invalid author field in package.json"),
-    "Invalid author field in package.json",
-  );
-  assert.equal(
-    diagnostic("You are not logged into Antigravity."),
-    "Antigravity authentication failed. Run `agy` and sign in, then retry.",
-  );
-  assert.equal(
-    isTokenGap(
-      'GetToken failed: oauth2: cannot fetch token: Post "https://oauth2.googleapis.com/token": net/http: TLS handshake timeout',
-    ),
-    true,
-  );
-  assert.equal(
-    isStreamInterruption(
-      "The stream was interrupted. Please continue the task you were working on.",
-    ),
-    true,
-  );
-});
-
-test("sticky stream-interruption error on a completed turn is ignored instead of failing the turn", async () => {
-  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-test-"));
-  try {
-    const events: ProviderEvent[] = [];
-    let spawns = 0;
-
-    const spawn: SpawnFunction = (_command, args) => {
-      spawns += 1;
-      const child = new FakeChildProcess(args, () => {
-        sendCompletedResponse(child, "conv-sticky-stream", "Full response completed after internal retry.");
-        child.sendFrame({
-          event: "result",
-          conversation_id: "conv-sticky-stream",
-          status: "error",
-          errors: [
-            "The stream was interrupted. Please continue the task you were working on.",
-          ],
-          response: "Full response completed after internal retry.",
-        });
-      });
-      queueMicrotask(() => {
-        child.sendFrame({
-          event: "init",
-          conversation_id: "conv-sticky-stream",
-        });
-      });
-      return child as unknown as ReturnType<SpawnFunction>;
-    };
-
-    const session = new Session(
-      "session-sticky",
-      "agy",
-      [],
-      {},
-      makeConfig(),
-      { version: 1, data: { conversationId: "conv-sticky-stream" } },
-      TEST_CATALOG,
-      (event) => events.push(event),
-      { spawn, storeDir: tempDir },
-    );
-
-    await session.prompt(userPrompt("Render scene"));
-    const finalTurn = await waitForTurnEnd(events);
-
-    assert.equal(finalTurn.state, "completed");
-    assert.equal(spawns, 1);
-  } finally {
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-test("unrecovered mid-turn stream interruption retries once and succeeds even if trajectory error remains sticky", async () => {
-  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-test-"));
-  try {
-    const events: ProviderEvent[] = [];
-    const prompts: string[] = [];
-
-    const spawn: SpawnFunction = (_command, args) => {
-      const attempt = prompts.length + 1;
-      const child = new FakeChildProcess(args, (prompt) => {
-        prompts.push(prompt.content);
-        if (attempt === 1) {
-          child.sendFrame({
-            event: "thinking",
-            conversation_id: "conv-mid-interrupt",
-            content: "Planning scene...",
-          });
-          child.sendFrame({
-            event: "result",
-            conversation_id: "conv-mid-interrupt",
-            status: "error",
-            errors: [
-              "The stream was interrupted. Please continue the task you were working on.",
-            ],
-          });
-          return;
-        }
-        sendCompletedResponse(child, "conv-mid-interrupt", "Recovered and finished.");
-        child.sendFrame({
-          event: "result",
-          conversation_id: "conv-mid-interrupt",
-          status: "error",
-          errors: [
-            "The stream was interrupted. Please continue the task you were working on.",
-          ],
-          response: "Recovered and finished.",
-        });
-      });
-      queueMicrotask(() => {
-        child.sendFrame({
-          event: "init",
-          conversation_id: "conv-mid-interrupt",
-        });
-      });
-      return child as unknown as ReturnType<SpawnFunction>;
-    };
-
-    const session = new Session(
-      "session-interrupt",
-      "agy",
-      [],
-      {},
-      makeConfig(),
-      { version: 1, data: { conversationId: "conv-mid-interrupt" } },
-      TEST_CATALOG,
-      (event) => events.push(event),
-      { spawn, storeDir: tempDir, streamInterruptRetryDelayMs: 10 },
-    );
-
-    await session.prompt(userPrompt("Build scene"));
-    const finalTurn = await waitForTurnEnd(events);
-
-    assert.equal(finalTurn.state, "completed");
-    assert.deepEqual(prompts, [`${CONTEXT_OUTPUT_GUIDANCE}\n\nBuild scene`, `${CONTEXT_OUTPUT_GUIDANCE}\n\nBuild scene`]);
-  } finally {
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-test("OAuth recovery never marks unrelated result errors as recovered", async () => {
-  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-oauth-mixed-"));
-  let session: Session | undefined;
-  try {
-    const events: ProviderEvent[] = [];
-    let attempts = 0;
-    const spawn: SpawnFunction = (_command, args) => {
-      const child = new FakeChildProcess(args, () => {
-        attempts++;
-        child.sendFrame({
-          event: "result", status: "error", response: "Partial output",
-          errors: ["UNAUTHENTICATED (code 401)", "Unrelated fatal error"],
-        });
-      });
-      queueMicrotask(() => child.sendFrame({ event: "init", conversation_id: "conv-oauth-mixed" }));
-      return child as unknown as ReturnType<SpawnFunction>;
-    };
-    session = new Session("session-oauth-mixed", "agy", [], {}, makeConfig(),
-      { version: 1, data: { conversationId: "conv-oauth-mixed" } }, TEST_CATALOG,
-      (event) => events.push(event), { spawn, storeDir: tempDir, tokenGapRetryDelayMs: 1 });
-    await session.prompt(userPrompt("Finish task"));
-    assert.equal((await waitForTurnEnd(events)).state, "failed");
-    assert.equal(attempts, 2);
-  } finally {
-    await session?.close("test-cleanup");
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-const IDLE_TIMEOUT_ERROR =
-  "API error (attempt 1): request failed: stream idle timeout (5m0s): context deadline exceeded";
-const SSE_EOF_ERROR =
-  'API error (attempt 1): request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF';
-const SSE_WSASEND_ERROR =
-  'API error (attempt 1): request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": write tcp 192.0.2.10:58547->198.51.100.20:443: wsasend: An existing connection was forcibly closed by the remote host.';
-const SSE_WSARECV_ERROR =
-  'API error (attempt 1): request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": read tcp 192.0.2.10:64935->203.0.113.30:443: wsarecv: An existing connection was forcibly closed by the remote host.';
-const SSE_CLOSED_CONN_ERROR =
-  'API error (attempt 2): request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": write tcp 192.0.2.10:58438->198.51.100.20:443: use of closed network connection';
-
-test("idle timeout and SSE transport classification matches retryable stream errors without swallowing unrelated errors", () => {
-  assert.equal(isStreamInterruption(IDLE_TIMEOUT_ERROR), true);
-  assert.equal(isStreamInterruption(SSE_EOF_ERROR), true);
-  assert.equal(isStreamInterruption(SSE_WSASEND_ERROR), true);
-  assert.equal(isStreamInterruption(SSE_WSARECV_ERROR), true);
-  assert.equal(isStreamInterruption(SSE_CLOSED_CONN_ERROR), true);
-  assert.equal(
-    isStreamInterruption("The model backend had a brief, transient interruption. Please retry."),
-    true,
-  );
-  assert.equal(
-    isStreamInterruption("API error (attempt 1): incomplete envelope: unexpected EOF"),
-    true,
-  );
-  assert.equal(isStreamInterruption("context deadline exceeded"), false);
-  assert.equal(isStreamInterruption("Tool execution timed out"), false);
-  assert.equal(isStreamInterruption("API error (attempt 1): Error 400: invalid argument"), false);
-  assert.equal(isAuthDiagnosticError(IDLE_TIMEOUT_ERROR), false);
-  assert.equal(isAuthDiagnosticError(SSE_EOF_ERROR), false);
-});
-
-test("mid-stream ACTIVE cutoff, early finished_reason, and trailing native ERROR_MESSAGE are not falsely marked sticky_recovered", async () => {
-  for (const mode of ["active_cutoff", "legacy_chunks", "finished_reason_print_timeout", "trailing_native_error"] as const) {
-    const tempDir = mkdtempSync(path.join(tmpdir(), `agy-nonsticky-${mode}-`));
-    let session: Session | undefined;
-    try {
-      const convId = `conv-${mode}`;
-      if (mode === "trailing_native_error") {
-        const logDir = path.join(tempDir, convId, ".system_generated", "logs");
-        mkdirSync(logDir, { recursive: true });
-        writeFileSync(
-          path.join(logDir, "transcript.jsonl"),
-          [
-            JSON.stringify({ step_index: 0, type: "USER_INPUT", status: "DONE", content: "Run check" }),
-            JSON.stringify({ step_index: 1, type: "PLANNER_RESPONSE", status: "DONE", content: "Intermediate output" }),
-            JSON.stringify({ step_index: 2, type: "ERROR_MESSAGE", status: "DONE", error: SSE_EOF_ERROR }),
-          ].join("\n") + "\n",
-          "utf8",
+        assert.ok(
+          events.some(
+            (e) =>
+              e.type === "timeline.item" &&
+              e.item.type === "tool_call" &&
+              e.item.detail.type === "write" &&
+              e.item.detail.filePath === "/repo/notes.txt" &&
+              e.item.detail.content === "hello",
+          ),
         );
-      }
-      const events: ProviderEvent[] = [];
-      let attempts = 0;
-      const spawn: SpawnFunction = (_command, args) => {
-        const child = new FakeChildProcess(args, () => {
-          attempts += 1;
-          if (mode === "legacy_chunks") child.sendFrame({event: "message", role: "assistant", content: "Intermediate output"});
-          else child.sendFrame({
-            event: "step_update",
-            step_update: {
-              conversation_id: convId,
-              step_index: 1,
-              state: mode === "active_cutoff" ? "ACTIVE" : "DONE",
-              step_type: "agent_response",
-              text_delta: "Intermediate output",
-            },
-          });
-          child.sendFrame({
-            event: "result",
-            result: {
-              conversation_id: convId,
-              status: "ERROR",
-              error: SSE_EOF_ERROR,
-              response: "Intermediate output",
-              finished_reason: mode === "finished_reason_print_timeout" ? "print_timeout" : "error",
-            },
-          });
-        });
-        queueMicrotask(() => child.sendFrame({ event: "init", conversation_id: convId }));
-        return child as unknown as ReturnType<SpawnFunction>;
-      };
-      session = new Session(
-        `session-${mode}`,
-        "agy",
-        [],
-        {},
-        makeConfig(),
-        { version: 1, data: { conversationId: convId } },
-        TEST_CATALOG,
-        (event) => events.push(event),
-        { spawn, storeDir: tempDir, brainDir: tempDir, streamInterruptRetryDelayMs: 1 },
-      );
-      await session.prompt(userPrompt("Run check"));
-      const finalTurn = await waitForTurnEnd(events);
-      assert.equal(finalTurn.state, "failed", `${mode} must fail after retry instead of falsely completing`);
-      assert.equal(attempts, 2, `${mode} must retry once before failing`);
-    } finally {
-      await session?.close("test-cleanup");
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  }
-});
-
-for (const scenario of [
-  { name: "legacy sticky result", response: true, nested: false, progress: false, recover: false, mixed: false, expected: "completed", attempts: 1 },
-  { name: "nested sticky result", response: true, nested: true, progress: false, recover: false, mixed: false, expected: "completed", attempts: 1 },
-  { name: "interruption without progress", response: false, nested: true, progress: false, recover: true, mixed: false, expected: "completed", attempts: 2 },
-  { name: "interruption after progress", response: false, nested: true, progress: true, recover: true, mixed: false, expected: "completed", attempts: 2 },
-  { name: "persistent timeout stops after one retry", response: false, nested: true, progress: false, recover: false, mixed: false, expected: "failed", attempts: 2 },
-  { name: "unrelated result error is not hidden", response: true, nested: false, progress: false, recover: false, mixed: true, expected: "failed", attempts: 2 },
-]) {
-  test(`idle timeout: ${scenario.name}`, async () => {
-    const tempDir = mkdtempSync(path.join(tmpdir(), "agy-idle-timeout-test-"));
-    let session: Session | undefined;
-    try {
-      const events: ProviderEvent[] = [];
-      const prompts: string[] = [];
-      const children: FakeChildProcess[] = [];
-      const spawn: SpawnFunction = (_command, args) => {
-        const child = new FakeChildProcess(args, (prompt) => {
-          prompts.push(prompt.content);
-          if (scenario.progress) {
-            child.sendFrame({ event: "message", role: "assistant", content: "Partial progress" });
-          }
-          const response = scenario.response || (scenario.recover && prompts.length > 1)
-            ? "Completed after CLI recovery."
-            : "";
-          if (response) sendCompletedResponse(child, "conv-idle-timeout", response);
-          child.sendFrame(scenario.nested ? {
-            event: "result",
-            result: { status: "ERROR", finished_reason: "error", error: IDLE_TIMEOUT_ERROR, response },
-          } : {
-            event: "result",
-            status: "error",
-            errors: scenario.mixed ? [IDLE_TIMEOUT_ERROR, "Unrelated fatal error"] : [IDLE_TIMEOUT_ERROR],
-            response,
-          });
-        });
-        children.push(child);
-        queueMicrotask(() => child.sendFrame({ event: "init", conversation_id: "conv-idle-timeout" }));
-        return child as unknown as ReturnType<SpawnFunction>;
-      };
-      session = new Session(
-        "session-idle-timeout", "agy", [], {}, makeConfig(),
-        { version: 1, data: { conversationId: "conv-idle-timeout" } },
-        TEST_CATALOG, (event) => events.push(event),
-        { spawn, storeDir: tempDir, streamInterruptRetryDelayMs: 1 },
-      );
-      await session.prompt(userPrompt("Finish task"));
-      const finalTurn = await waitForTurnEnd(events);
-      assert.equal(finalTurn.state, scenario.expected);
-      assert.equal(children.length, scenario.attempts);
-      if (scenario.attempts === 2) {
-        assert.equal(children[0].killed, true);
-        assert.equal(prompts[1], scenario.progress || scenario.response ? TOKEN_GAP_CONTINUE_PROMPT : `${CONTEXT_OUTPUT_GUIDANCE}\n\nFinish task`);
-      }
-    } finally {
-      await session?.close("test-cleanup");
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  });
-}
-
-test("durable timeline persistence, replay before session.ready, multi-turn ID continuity, and corruption recovery", async () => {
-  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-store-"));
-  try {
-    const turn1Events: ProviderEvent[] = [];
-
-    const spawnTurn1: SpawnFunction = (_command, args) => {
-      const child = new FakeChildProcess(args, () => {
-        child.sendFrame({
-          event: "thinking",
-          conversation_id: "conv-replay-1",
-          content: "Thinking chunk 1. ",
-          timestamp: "2040-01-01T16:00:01Z",
-        });
-        child.sendFrame({
-          event: "thinking",
-          conversation_id: "conv-replay-1",
-          content: "Thinking chunk 2.",
-          timestamp: "2040-01-01T16:00:02Z",
-        });
-        child.sendFrame({
-          event: "tool_call",
-          conversation_id: "conv-replay-1",
-          id: "call-1",
-          name: "run_command",
-          arguments: { CommandLine: "echo hello", Cwd: "/workspace/example" },
-          timestamp: "2040-01-01T16:00:03Z",
-        });
-        child.sendFrame({
-          event: "tool_result",
-          conversation_id: "conv-replay-1",
-          id: "call-1",
-          name: "run_command",
-          content: "hello token ya29.secret_oauth_token_1234567890abcdef",
-          is_error: false,
-          timestamp: "2040-01-01T16:00:04Z",
-        });
-        child.sendFrame({
-          event: "message",
-          conversation_id: "conv-replay-1",
-          role: "assistant",
-          content: "Hello ",
-          timestamp: "2040-01-01T16:00:05Z",
-        });
-        child.sendFrame({
-          event: "message",
-          conversation_id: "conv-replay-1",
-          role: "assistant",
-          content: "world!",
-          timestamp: "2040-01-01T16:00:06Z",
-        });
-        child.sendFrame({
-          event: "result",
-          conversation_id: "conv-replay-1",
-          status: "success",
-          response: "Hello world!",
-        });
-      });
-      queueMicrotask(() => {
-        child.sendFrame({
-          event: "init",
-          conversation_id: "conv-replay-1",
-        });
-      });
-      return child as unknown as ReturnType<SpawnFunction>;
-    };
-
-    const session1 = new Session(
-      "s-1",
-      "agy",
-      [],
-      { SECRET_ENV: "ya29.env_token_should_not_leak_1234567890" },
-      makeConfig(),
-      undefined,
-      TEST_CATALOG,
-      (event) => turn1Events.push(event),
-      { spawn: spawnTurn1, storeDir: tempDir },
-    );
-    session1.open("req-open-1", ["prompt.message", "session.persistence"], "skip");
-    await session1.prompt(userPrompt("First user message", "client-msg-1"));
-    const turn1End = await waitForTurnEnd(turn1Events);
-    assert.equal(turn1End.state, "completed");
-
-    // Verify snapshot file exists on disk, journal is compacted after turn completion,
-    // and no credentials/env are leaked
-    const snapshotPath = path.join(tempDir, "conv-replay-1.json");
-    const journalPath = path.join(tempDir, "conv-replay-1.jsonl");
-    assert.equal(existsSync(snapshotPath), true);
-    assert.equal(readFileSync(journalPath, "utf8").trim(), "");
-    const rawSnapshot = readFileSync(snapshotPath, "utf8");
-    assert.doesNotMatch(rawSnapshot, /ya29\./);
-    assert.doesNotMatch(rawSnapshot, /SECRET_KEY/);
-    assert.doesNotMatch(rawSnapshot, /SECRET_ENV/);
-    assert.match(rawSnapshot, /<REDACTED_OAUTH_TOKEN>/);
-
-    // Simulate daemon restart / plugin reload: open Session 2 with history="replay"
-    const replayEvents: ProviderEvent[] = [];
-    const session2 = new Session(
-      "s-2",
-      "agy",
-      [],
-      {},
-      makeConfig(),
-      { version: 1, data: { conversationId: "conv-replay-1" } },
-      TEST_CATALOG,
-      (event) => replayEvents.push(event),
-      { storeDir: tempDir },
-    );
-    session2.open(
-      "req-open-2",
-      ["prompt.message", "session.persistence"],
-      "replay",
-    );
-
-    const openedIdx = replayEvents.findIndex((e) => e.type === "session.opened");
-    const readyIdx = replayEvents.findIndex((e) => e.type === "session.ready");
-    const timelineEvents = replayEvents
-      .map((event, index) => ({ event, index }))
-      .filter(
-        (
-          entry,
-        ): entry is {
-          event: Extract<ProviderEvent, { type: "timeline.item" }>;
-          index: number;
-        } => entry.event.type === "timeline.item",
-      );
-
-    assert.equal(timelineEvents.length, 4);
-    for (const entry of timelineEvents) {
-      assert.ok(
-        entry.index > openedIdx && entry.index < readyIdx,
-        "Replayed timeline.item must be emitted after session.opened and before session.ready",
-      );
-    }
-
-    assert.deepEqual(
-      timelineEvents.map((entry) => ({
-        id: entry.event.item.id,
-        type: entry.event.item.type,
-      })),
-      [
-        { id: "user:client-msg-1", type: "user_message" },
-        { id: "turn-1:reasoning:1", type: "reasoning" },
-        { id: "tool:call-1", type: "tool_call" },
-        { id: "turn-1:message:1", type: "assistant_message" },
-      ],
-    );
-    const replayedAssistant = timelineEvents[3]?.event.item;
-    assert.equal(
-      replayedAssistant?.type === "assistant_message"
-        ? replayedAssistant.text
-        : "",
-      "Hello world!",
-    );
-    const replayedTool = timelineEvents[2]?.event.item;
-    assert.equal(
-      replayedTool?.type === "tool_call" ? replayedTool.status : "",
-      "completed",
-    );
-
-    // Perform a second flush so .json.bak holds the 4-item snapshot, then corrupt
-    // the primary .json snapshot and verify recovery from .json.bak
-    session2.getStore().upsert("conv-replay-1", {
-      id: "turn-2:message:1",
-      type: "assistant_message",
-      text: "Second turn reply",
-    });
-    session2.getStore().flush("conv-replay-1");
-    writeFileSync(snapshotPath, "{corrupted json", "utf8");
-    const recoveredStore = new ConversationStore({ storeDir: tempDir });
-    const recoveredItems = recoveredStore.load("conv-replay-1");
-    assert.equal(recoveredItems.length, 4);
-    assert.equal(recoveredItems[0]?.id, "user:client-msg-1");
-    assert.equal(recoveredItems[3]?.id, "turn-1:message:1");
-    // Primary snapshot should now be healed on disk
-    const healedParsed = JSON.parse(readFileSync(snapshotPath, "utf8")) as {
-      version: number;
-      items: unknown[];
-    };
-    assert.equal(healedParsed.version, 1);
-    assert.equal(healedParsed.items.length, 4);
-  } finally {
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-test("streaming updates append only to journal until flush/compaction, recover before compaction, and auto-compact when exceeding threshold", async () => {
-  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-journal-"));
-  try {
-    let snapshotTmpWrites = 0;
-    let journalAppends = 0;
-
-    const store = new ConversationStore({
-      storeDir: tempDir,
-      maxJournalEntriesBeforeCompact: 100,
-      fsOps: {
-        appendFileSync(filePath, data, options) {
-          journalAppends += 1;
-          return DEFAULT_FS_OPS.appendFileSync(filePath, data, options);
-        },
-        writeFileSync(filePath, data, options) {
-          const pathStr = String(filePath);
-          if (
-            pathStr.endsWith(".tmp") &&
-            !pathStr.endsWith(".journal.tmp") &&
-            !pathStr.endsWith(".bak.tmp")
-          ) {
-            snapshotTmpWrites += 1;
-          }
-          return DEFAULT_FS_OPS.writeFileSync(filePath, data, options);
-        },
-      },
-    });
-
-    const convId = "conv-streaming-perf";
-    store.upsert(
-      convId,
-      { id: "user:msg-1", type: "user_message", text: "Stream 40 deltas" },
-      "2040-01-01T17:00:00Z",
-    );
-
-    let accumulated = "";
-    for (let i = 1; i <= 40; i += 1) {
-      accumulated += `token-${i} `;
-      store.upsert(
-        convId,
-        {
-          id: "turn-1:message:1",
-          type: "assistant_message",
-          text: accumulated,
-        },
-        `2026-10-15T05:00:${String(i).padStart(2, "0")}.000Z`,
-      );
-    }
-
-    // 41 updates should have appended to .jsonl 41 times with ZERO full-snapshot writes
-    assert.equal(journalAppends, 41);
-    assert.equal(snapshotTmpWrites, 0);
-    assert.equal(existsSync(store.snapshotPath(convId)), false);
-    assert.equal(store.uncompactedJournalCount(convId), 41);
-
-    // Simulate a crash before flush(): a fresh ConversationStore must recover all 41
-    // updates from the .jsonl journal, heal the .json snapshot, and compact .jsonl!
-    const crashedRecoveryStore = new ConversationStore({ storeDir: tempDir });
-    const recovered = crashedRecoveryStore.load(convId);
-    assert.equal(recovered.length, 2);
-    assert.equal(recovered[0]?.id, "user:msg-1");
-    assert.equal(recovered[1]?.id, "turn-1:message:1");
-    assert.equal(
-      recovered[1]?.item.type === "assistant_message"
-        ? recovered[1].item.text
-        : "",
-      accumulated,
-    );
-    assert.equal(existsSync(crashedRecoveryStore.snapshotPath(convId)), true);
-    assert.equal(
-      readFileSync(crashedRecoveryStore.journalPath(convId), "utf8").trim(),
-      "",
-    );
-    assert.equal(crashedRecoveryStore.uncompactedJournalCount(convId), 0);
-
-    // Also verify bounded auto-compaction when streaming updates exceed maxJournalEntriesBeforeCompact
-    const boundedStore = new ConversationStore({
-      storeDir: tempDir,
-      maxJournalEntriesBeforeCompact: 10,
-    });
-    const boundedConvId = "conv-bounded-journal";
-    for (let i = 1; i <= 25; i += 1) {
-      boundedStore.upsert(boundedConvId, {
-        id: "turn-1:message:1",
-        type: "assistant_message",
-        text: `chunk-${i}`,
-      });
-    }
-    // 25 updates with threshold 10 compacts at 10 and 20, leaving 5 uncompacted entries
-    assert.equal(boundedStore.uncompactedJournalCount(boundedConvId), 5);
-    assert.equal(existsSync(boundedStore.snapshotPath(boundedConvId)), true);
-    boundedStore.flush(boundedConvId);
-    assert.equal(boundedStore.uncompactedJournalCount(boundedConvId), 0);
-    assert.equal(
-      readFileSync(boundedStore.journalPath(boundedConvId), "utf8").trim(),
-      "",
-    );
-  } finally {
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-test("Windows-safe atomic replacement never overwrites primary in-place and preserves valid snapshot + journal on rename failure", async () => {
-  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-atomic-"));
-  try {
-    const convId = "conv-atomic-fault";
-    const snapPath = path.join(tempDir, `${convId}.json`);
-    const bakPath = path.join(tempDir, `${convId}.json.bak`);
-
-    let failDirectOverwriteRename = false;
-    let failAllSnapRenames = false;
-    const directSnapWrites: string[] = [];
-
-    const store = new ConversationStore({
-      storeDir: tempDir,
-      fsOps: {
-        writeFileSync(filePath, data, options) {
-          const target = String(filePath);
-          if (target === snapPath || target === bakPath) {
-            directSnapWrites.push(target);
-          }
-          return DEFAULT_FS_OPS.writeFileSync(filePath, data, options);
-        },
-        renameSync(oldPath, newPath) {
-          const src = String(oldPath);
-          const dst = String(newPath);
-          if (dst === snapPath && src.endsWith(".tmp") && !src.endsWith(".snap.prev.tmp")) {
-            if (failAllSnapRenames) {
-              throw Object.assign(new Error("Simulated EIO replacing snapshot"), {
-                code: "EIO",
-              });
-            }
-            if (failDirectOverwriteRename && existsSync(snapPath)) {
-              throw Object.assign(
-                new Error("Simulated Windows EPERM on existing destination"),
-                { code: "EPERM" },
-              );
-            }
-          }
-          return DEFAULT_FS_OPS.renameSync(oldPath, newPath);
-        },
-      },
-    });
-
-    // Turn 1: initial flush creates conv-atomic-fault.json
-    store.upsert(convId, {
-      id: "user:1",
-      type: "user_message",
-      text: "Turn 1 user",
-    });
-    assert.equal(store.flush(convId), true);
-    assert.equal(existsSync(snapPath), true);
-
-    // Turn 2: simulate Windows blocking direct rename over existing snapPath,
-    // forcing the 2-step displaced move (snapPath -> prev.tmp, tmp -> snapPath)
-    failDirectOverwriteRename = true;
-    store.upsert(convId, {
-      id: "turn-1:message:1",
-      type: "assistant_message",
-      text: "Turn 1 assistant",
-    });
-    assert.equal(store.flush(convId), true);
-    assert.equal(directSnapWrites.length, 0);
-    const afterTwoStep = JSON.parse(readFileSync(snapPath, "utf8")) as {
-      items: Array<{ id: string }>;
-    };
-    assert.equal(afterTwoStep.items.length, 2);
-    assert.equal(existsSync(bakPath), true);
-
-    // Turn 3: simulate total failure of renaming tmp -> snapPath even after moving
-    // snapPath -> prev.tmp. Rollback must restore snapPath to the 2-item snapshot,
-    // never call writeFileSync(snapPath), and keep the 3rd item in .jsonl!
-    failAllSnapRenames = true;
-    store.upsert(convId, {
-      id: "user:2",
-      type: "user_message",
-      text: "Turn 2 user",
-    });
-    assert.equal(store.flush(convId), false);
-    assert.equal(directSnapWrites.length, 0);
-
-    // Primary snapshot must still be valid and contain the 2 items from Turn 2
-    const preservedSnap = JSON.parse(readFileSync(snapPath, "utf8")) as {
-      items: Array<{ id: string }>;
-    };
-    assert.equal(preservedSnap.items.length, 2);
-
-    // Journal was NOT compacted because flush() failed, so a fresh store recovers all 3 items!
-    const recoveredStore = new ConversationStore({ storeDir: tempDir });
-    const allItems = recoveredStore.load(convId);
-    assert.equal(allItems.length, 3);
-    assert.deepEqual(
-      allItems.map((entry) => entry.id),
-      ["user:1", "turn-1:message:1", "user:2"],
-    );
-  } finally {
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-test("provider exposes only full-access mode and rejects unverified modes", async () => {
-  assert.deepEqual(
-    MODES.map((mode) => mode.id),
-    ["full-access"],
-  );
-  assert.equal(DEFAULT_MODE, "full-access");
-
-  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-modes-"));
-  try {
-    assert.throws(
-      () =>
-        new Session(
-          "s-invalid-mode",
-          "agy",
-          [],
-          {},
-          makeConfig({ mode: "read-only" }),
-          undefined,
-          TEST_CATALOG,
-          () => undefined,
-          { storeDir: tempDir },
-        ),
-      (err: unknown) =>
-        err instanceof ProviderActionError &&
-        err.code === "INVALID_MODE" &&
-        /Unknown Antigravity mode: read-only/.test(err.message),
-    );
-
-    const session = new Session(
-      "s-valid-mode",
-      "agy",
-      [],
-      {},
-      makeConfig({ mode: "full-access" }),
-      undefined,
-      TEST_CATALOG,
-      () => undefined,
-      { storeDir: tempDir },
-    );
-
-    await assert.rejects(
-      () =>
-        session.configure(
-          "req-cfg-1",
-          { mode: "auto" },
-          async (model) => model,
-        ),
-      (err: unknown) =>
-        err instanceof ProviderActionError &&
-        err.code === "INVALID_MODE" &&
-        /Unknown Antigravity mode: auto/.test(err.message),
-    );
-  } finally {
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-test("full-access notice is emitted once per new session, never on resume or unchanged config", async () => {
-  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-test-"));
-  try {
-    const isModeNotice = (e: ProviderEvent) =>
-      e.type === "session.notice" && e.notice.id === "antigravity-mode";
-
-    const freshEvents: ProviderEvent[] = [];
-    const fresh = new Session(
-      "s-notice-new", "agy", [], {}, makeConfig({ mode: "full-access" }), undefined,
-      TEST_CATALOG, (event) => freshEvents.push(event), { storeDir: tempDir },
-    );
-    fresh.open("req-open", ["prompt.message", "session.persistence"], "skip");
-    await fresh.configure("req-cfg", { mode: "full-access" }, async (model) => model);
-    assert.equal(freshEvents.filter(isModeNotice).length, 1);
-
-    const opened = freshEvents.find(
-      (e): e is Extract<ProviderEvent, { type: "session.opened" }> => e.type === "session.opened",
-    );
-    const resumedEvents: ProviderEvent[] = [];
-    const resumed = new Session(
-      "s-notice-resumed", "agy", [], {}, makeConfig({ mode: "full-access" }), opened?.persistence,
-      TEST_CATALOG, (event) => resumedEvents.push(event), { storeDir: tempDir },
-    );
-    resumed.open("req-open-resumed", ["prompt.message", "session.persistence"], "replay");
-    await resumed.configure("req-cfg-resumed", { mode: "full-access" }, async (model) => model);
-    assert.equal(resumedEvents.filter(isModeNotice).length, 0);
-  } finally {
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-test("remote git sync safety evaluator enforces fail-closed fast-forward rules", () => {
-  const parsed = parsePorcelainStatus(
-    " M setup/router_gate_hook.py\n?? scratch/notes.txt\n?? paseo-antigravity-resilient/scripts/sync-safety.mjs\n",
-  );
-  assert.deepEqual(parsed.trackedDirty, [
-    { status: "M", path: "setup/router_gate_hook.py" },
-  ]);
-  assert.deepEqual(parsed.untracked, [
-    "scratch/notes.txt",
-    "paseo-antigravity-resilient/scripts/sync-safety.mjs",
-  ]);
-
-  // 1. Clean fast-forward on main
-  const cleanFf = evaluateRemoteSyncSafety({
-    branch: "main",
-    remoteHead: "0928fda990e368e015ac5afe4d69f952df5f95ea",
-    localHead: "1111111111111111111111111111111111111111",
-    isAncestor: true,
-    porcelainStatus: "?? scratch/unrelated-local-note.txt\n",
-    incomingChangedFiles: [
-      "paseo-antigravity-resilient/server/internal/store.ts",
-    ],
-  });
-  assert.equal(cleanFf.safe, true);
-  assert.equal(cleanFf.action, "fast-forward");
-  assert.deepEqual(cleanFf.nonCollidingUntracked, [
-    "scratch/unrelated-local-note.txt",
-  ]);
-
-  // 2. Already up-to-date (noop)
-  const noop = evaluateRemoteSyncSafety({
-    branch: "main",
-    remoteHead: "0928fda990e368e015ac5afe4d69f952df5f95ea",
-    localHead: "0928fda990e368e015ac5afe4d69f952df5f95ea",
-    isAncestor: true,
-    porcelainStatus: "",
-    incomingChangedFiles: [],
-  });
-  assert.equal(noop.safe, true);
-  assert.equal(noop.action, "noop");
-
-  // 3. Refuse when tracked files are dirty
-  const dirtyTracked = evaluateRemoteSyncSafety({
-    branch: "main",
-    remoteHead: "0928fda990e368e015ac5afe4d69f952df5f95ea",
-    localHead: "1111111111111111111111111111111111111111",
-    isAncestor: true,
-    porcelainStatus: " M paseo-antigravity-resilient/README.md\n",
-    incomingChangedFiles: ["paseo-antigravity-resilient/README.md"],
-  });
-  assert.equal(dirtyTracked.safe, false);
-  assert.equal(dirtyTracked.action, "refuse");
-  assert.ok(
-    dirtyTracked.reasons.some((r) => /uncommitted tracked change/.test(r)),
-  );
-
-  // 4. Refuse when untracked file would be overwritten by incoming changes
-  const collidingUntracked = evaluateRemoteSyncSafety({
-    branch: "main",
-    remoteHead: "0928fda990e368e015ac5afe4d69f952df5f95ea",
-    localHead: "1111111111111111111111111111111111111111",
-    isAncestor: true,
-    porcelainStatus:
-      "?? paseo-antigravity-resilient/scripts/sync-safety.mjs\n",
-    incomingChangedFiles: [
-      "paseo-antigravity-resilient/scripts/sync-safety.mjs",
-    ],
-  });
-  assert.equal(collidingUntracked.safe, false);
-  assert.equal(collidingUntracked.action, "refuse");
-  assert.deepEqual(collidingUntracked.collidingUntracked, [
-    "paseo-antigravity-resilient/scripts/sync-safety.mjs",
-  ]);
-
-  // 5. Refuse when remote history has diverged
-  const diverged = evaluateRemoteSyncSafety({
-    branch: "main",
-    remoteHead: "2222222222222222222222222222222222222222",
-    localHead: "1111111111111111111111111111111111111111",
-    isAncestor: false,
-    porcelainStatus: "",
-    incomingChangedFiles: [],
-  });
-  assert.equal(diverged.safe, false);
-  assert.equal(diverged.action, "refuse");
-  assert.ok(diverged.reasons.some((r) => /diverged/.test(r)));
-
-  // 6. Refuse when remote checkout is not on main
-  const wrongBranch = evaluateRemoteSyncSafety({
-    branch: "feature/experimental",
-    remoteHead: "0928fda990e368e015ac5afe4d69f952df5f95ea",
-    localHead: "1111111111111111111111111111111111111111",
-    isAncestor: true,
-    porcelainStatus: "",
-    incomingChangedFiles: [],
-  });
-  assert.equal(wrongBranch.safe, false);
-  assert.equal(wrongBranch.action, "refuse");
-  assert.ok(wrongBranch.reasons.some((r) => /expected "main"/.test(r)));
-});
-
-test("native transcript.jsonl fallback seeds replay when store has no prior snapshot", async () => {
-  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-native-"));
-  try {
-    const storeDir = path.join(tempDir, "store");
-    const brainDir = path.join(tempDir, "brain");
-    const convId = "conv-native-fallback";
-    const logsDir = path.join(brainDir, convId, ".system_generated", "logs");
-    mkdirSync(logsDir, { recursive: true });
-    writeFileSync(
-      path.join(logsDir, "transcript.jsonl"),
-      [
-        JSON.stringify({
-          step_index: 0,
-          type: "USER_INPUT",
-          status: "DONE",
-          created_at: "2040-01-01T13:00:00Z",
-          content: "<USER_REQUEST>\nCheck status\n</USER_REQUEST>",
-        }),
-        JSON.stringify({
-          step_index: 1,
-          type: "PLANNER_RESPONSE",
-          status: "DONE",
-          created_at: "2040-01-01T13:00:02Z",
-          thinking: "Checking status...",
-          content: "All systems operational.",
-        }),
-      ].join("\n"),
-      "utf8",
-    );
-
-    const store = new ConversationStore({ storeDir, brainDir });
-    const records = store.load(convId);
-    assert.equal(records.length, 3);
-    assert.equal(records[0]?.item.type, "user_message");
-    assert.equal(
-      records[0]?.item.type === "user_message" ? records[0].item.text : "",
-      "Check status",
-    );
-    assert.equal(records[1]?.item.type, "reasoning");
-    assert.equal(records[2]?.item.type, "assistant_message");
-  } finally {
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-test("catalog discovery filters banner lines, retries transient 503/timeout, and re-probes on unknown model", async () => {
-  const parsed = parseModels(
-    "Fetching available models...\ngemini-4-argon-medium\tGemini 4 Argon (Medium)\ngemini-4-argon-high\tGemini 4 Argon (High)\n",
-  );
-  assert.equal(parsed.length, 2);
-  assert.equal(parsed[0]?.id, "gemini-4-argon-medium");
-  assert.equal(parsed[1]?.id, "gemini-4-argon-high");
-
-  let cachedCatalog: ProviderCatalog | null = null;
-  const host: ProviderHost = {
-    async readCatalogCache() {
-      return cachedCatalog;
-    },
-    async writeCatalogCache(_key, catalog) {
-      cachedCatalog = catalog;
-    },
-  };
-
-  let probeCalls = 0;
-  const catalog = await getCatalog(host, "agy", [], {}, {
-    retryDelayMs: 5,
-    probeImpl: async () => {
-      probeCalls += 1;
-      if (probeCalls === 1) {
-        return {
-          exitCode: 1,
-          stdout: "",
-          stderr:
-            "Eligibility check failed: UNAVAILABLE (code 503): No capacity available",
-        };
-      }
-      return {
-        exitCode: 0,
-        stdout:
-          "Fetching available models...\ngemini-4-argon-medium\tGemini 4 Argon (Medium)\n",
-        stderr: "",
-      };
-    },
-  });
-
-  assert.equal(probeCalls, 2);
-  assert.equal(catalog.models.length, 1);
-  assert.equal(catalog.models[0]?.id, "gemini-4-argon-medium");
-  assert.deepEqual(
-    catalog.modes.map((m) => m.id),
-    ["full-access"],
-  );
-  assert.equal(antigravityResilientProvider.id, PROVIDER_ID);
-});
-
-test("new persistent session emits valid sessionKey persistence on session.opened and resolves bound conversationId on resume", async () => {
-  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-sessionkey-"));
-  try {
-    const initialEvents: ProviderEvent[] = [];
-    const spawnTurn: SpawnFunction = (_cmd, args) => {
-      const child = new FakeChildProcess(args, (_prompt, proc) => {
-        proc.sendFrame({
-          event: "message",
-          conversation_id: "conv-bound-from-key",
-          role: "assistant",
-          content: "Bound reply",
-          timestamp: "2040-01-01T18:00:01Z",
-        });
-        proc.sendFrame({
-          event: "result",
-          conversation_id: "conv-bound-from-key",
-          status: "success",
-          response: "Bound reply",
-        });
-      });
-      queueMicrotask(() => {
-        child.sendFrame({
-          event: "init",
-          conversation_id: "conv-bound-from-key",
-        });
-      });
-      return child as unknown as ReturnType<SpawnFunction>;
-    };
-
-    const session1 = new Session(
-      "sess-new-1",
-      "agy",
-      [],
-      {},
-      makeConfig(),
-      undefined,
-      TEST_CATALOG,
-      (event) => initialEvents.push(event),
-      { spawn: spawnTurn, storeDir: tempDir },
-    );
-    session1.open("req-open-new", ["prompt.message", "session.persistence"], "skip");
-
-    const openedEvent = initialEvents.find(
-      (e): e is Extract<ProviderEvent, { type: "session.opened" }> =>
-        e.type === "session.opened",
-    );
-    assert.ok(openedEvent?.persistence, "session.opened must include persistence even before first turn");
-    assert.deepEqual(openedEvent?.persistence, {
-      version: 1,
-      data: { sessionKey: "sess-new-1" },
-    });
-
-    // Resuming from the initial sessionKey-only handle BEFORE any turn starts must succeed cleanly
-    const preTurnReplayEvents: ProviderEvent[] = [];
-    const preTurnResumed = new Session(
-      "sess-resumed-pre-turn",
-      "agy",
-      [],
-      {},
-      makeConfig(),
-      openedEvent.persistence,
-      TEST_CATALOG,
-      (event) => preTurnReplayEvents.push(event),
-      { storeDir: tempDir },
-    );
-    preTurnResumed.open("req-open-pre", ["prompt.message", "session.persistence"], "replay");
-    assert.ok(preTurnReplayEvents.some((e) => e.type === "session.ready"));
-
-    // Now run Turn 1 on session1 so agy emits conv-bound-from-key
-    await session1.prompt(userPrompt("Hello via sessionKey", "client-key-1"));
-    const turnEnd = await waitForTurnEnd(initialEvents);
-    assert.equal(turnEnd.state, "completed");
-
-    // Resuming using ONLY the initial sessionKey persistence handle (as happens if Paseo
-    // saved agent.persistence at session creation before Turn 1 finalized) must resolve
-    // conv-bound-from-key from disk and replay the full transcript!
-    const postTurnReplayEvents: ProviderEvent[] = [];
-    const postTurnResumed = new Session(
-      "sess-resumed-post-turn",
-      "agy",
-      [],
-      {},
-      makeConfig(),
-      openedEvent.persistence,
-      TEST_CATALOG,
-      (event) => postTurnReplayEvents.push(event),
-      { storeDir: tempDir },
-    );
-    postTurnResumed.open("req-open-post", ["prompt.message", "session.persistence"], "replay");
-
-    const replayedItems = postTurnReplayEvents.filter(
-      (e): e is Extract<ProviderEvent, { type: "timeline.item" }> =>
-        e.type === "timeline.item",
-    );
-    assert.equal(replayedItems.length, 2);
-    assert.equal(replayedItems[0]?.item.type, "user_message");
-    assert.equal(replayedItems[1]?.item.type, "assistant_message");
-    assert.equal(
-      replayedItems[1]?.item.type === "assistant_message"
-        ? replayedItems[1].item.text
-        : "",
-      "Bound reply",
-    );
-  } finally {
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-test("pre-cache-expiry auto-compaction triggers 2.5m before 5m hot cache TTL only when >=150k tokens and not yet compacted", async () => {
-  assert.equal(DEFAULT_HOT_CACHE_TTL_MS, 300_000);
-  assert.equal(DEFAULT_AUTO_COMPACT_LEAD_MS, 150_000);
-  assert.equal(DEFAULT_AUTO_COMPACT_MAX_LATE_MS, 60_000);
-  assert.equal(DEFAULT_AUTO_COMPACT_TOKEN_THRESHOLD, 150_000);
-  assert.equal(MIN_ENV_AUTO_COMPACT_TOKEN_THRESHOLD, 100_000);
-  assert.equal(RAPID_REFILL_REQUEST_WINDOW, 10);
-  assert.equal(RAPID_REFILL_BREAKER_LIMIT, 3);
-  assert.equal(MAX_CONSECUTIVE_COMPACT_FAILURES, 3);
-  assert.equal(isCompactPromptText("/compact"), true);
-  assert.equal(isCompactPromptText("  /compact focus on auth"), true);
-  assert.equal(isCompactPromptText("/compactness"), false);
-
-  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-autocompact-"));
-  try {
-    const events: ProviderEvent[] = [];
-    const invocations: Array<{ args: readonly string[]; content: string }> = [];
-    let spawns = 0;
-
-    const spawn: SpawnFunction = (_cmd, args) => {
-      spawns += 1;
-      const child = new FakeChildProcess(args, (prompt, proc) => {
-        invocations.push({ args: [...args], content: prompt.content });
-
-        if (invocations.length === 1) {
-          // Turn 1: 120,000 tokens (below 150k threshold) -> must NOT auto-compact
-          proc.sendFrame({
-            event: "message",
-            conversation_id: "conv-autocompact-1",
-            role: "assistant",
-            content: "Turn 1 below 150k threshold",
-          });
-          proc.sendFrame({
-            event: "result",
-            conversation_id: "conv-autocompact-1",
-            status: "success",
-            response: "Turn 1 below 150k threshold",
-            stats: {
-              input_tokens: 10_000,
-              cache_read_tokens: 109_000,
-              output_tokens: 1_000,
-              total_tokens: 120_000,
-            },
-          });
-          return;
+        const cfgEvent = events.find((e) => e.type === "session.config");
+        if (!cfgEvent || cfgEvent.type !== "session.config") {
+          throw new Error("Expected session.config event");
         }
+        assert.equal(cfgEvent.config.mode, "full-access");
+        assert.equal(cfgEvent.config.model, "gemini-3.8-flash");
+        assert.equal(cfgEvent.config.thinkingOption, "high");
 
-        if (invocations.length === 2) {
-          // Turn 2: reaches 225,000 tokens (>= 150k threshold) -> schedules auto-compact
-          proc.sendFrame({
-            event: "message",
-            conversation_id: "conv-autocompact-1",
-            role: "assistant",
-            content: "Turn 2 above 150k threshold",
-          });
-          proc.sendFrame({
-            event: "result",
-            conversation_id: "conv-autocompact-1",
-            status: "success",
-            response: "Turn 2 above 150k threshold",
-            stats: {
-              input_tokens: 14_000,
-              cache_read_tokens: 210_000,
-              output_tokens: 1_000,
-              total_tokens: 225_000,
-            },
-          });
-          return;
-        }
-
-        // Invocation 3: automatic /compact turn on the same resident slash-enabled
-        // process. Real agy repeats the conversation's cumulative totals here.
-        proc.sendFrame({
-          event: "result",
-          conversation_id: "conv-autocompact-1",
-          status: "success",
-          stats: {
-            input_tokens: 24_000,
-            cache_read_tokens: 319_000,
-            output_tokens: 2_000,
-            total_tokens: 26_000,
-          },
+        await connection.send({
+          type: "session.configure",
+          requestId: "native-model",
+          sessionId: "test",
+          changes: { model: "gemini-4-neon-high" },
         });
-      });
+        await waitFor(
+          () =>
+            events.find(
+              (e) => e.type === "session.config" && e.config.model === "gemini-4-neon-high",
+            ),
+          { label: "configure native-model" },
+        );
 
-      queueMicrotask(() => {
-        child.sendFrame({
-          event: "init",
-          conversation_id: "conv-autocompact-1",
-        });
-      });
-      return child as unknown as ReturnType<SpawnFunction>;
-    };
-
-    const brainDir = path.join(tempDir, "brain");
-    writeFirstRequest(brainDir, "conv-autocompact-1", 17_000);
-    const session = new Session(
-      "sess-autocompact-1",
-      "agy",
-      [],
-      {},
-      makeConfig(),
-      undefined,
-      TEST_CATALOG,
-      (event) => events.push(event),
-      {
-        spawn,
-        storeDir: tempDir,
-        brainDir,
-        hotCacheTtlMs: 80,
-        autoCompactLeadMs: 40,
-      },
-    );
-
-    // 1) Turn 1 finishes at 120,000 tokens (< 150,000): wait 90ms and confirm NO auto-compact runs
-    await session.prompt(userPrompt("First turn under 150k", "msg-under"));
-    await waitForTurnEnd(events);
-    assert.equal(session.getLastContextTokens(), 120_000);
-    assert.equal(session.hasCompactedSinceLastTurn(), false);
-    assert.equal(session.getLastIdleSkipReason(), "small");
-    await new Promise((resolve) => setTimeout(resolve, 90));
-    assert.equal(invocations.length, 1);
-
-    // 2) Turn 2 finishes at 225,000 tokens (>= 150,000): auto-compact fires after ~40ms
-    events.length = 0;
-    await session.prompt(userPrompt("Second turn over 150k", "msg-over"));
-    await waitForTurnEnd(events);
-    assert.equal(session.getLastContextTokens(), 225_000);
-    assert.equal(session.hasCompactedSinceLastTurn(), false);
-    assert.equal(
-      invocations[1]?.args.includes("--disable-slash-commands"),
-      false,
-      "Plain-text turns run on the resident slash-enabled process",
-    );
-    assert.equal(spawns, 1);
-
-    // Clear turn-2 events so we can verify background auto-compaction does not emit session.turn
-    events.length = 0;
-
-    // Wait for auto-compaction turn (turn-3) to complete
-    await new Promise<void>((resolve, reject) => {
-      const deadline = Date.now() + 2_000;
-      const poll = () => {
-        if (session.hasCompactedSinceLastTurn()) {
-          resolve();
-          return;
-        }
-        if (Date.now() > deadline) {
-          reject(new Error("Timed out waiting for auto-compaction turn"));
-          return;
-        }
-        setTimeout(poll, 10);
-      };
-      poll();
-    });
-
-    assert.equal(invocations.length, 3);
-    assert.equal(invocations[2]?.content, "/compact");
-    assert.equal(
-      invocations[2]?.args.includes("--disable-slash-commands"),
-      false,
-      "Auto-compaction must run on agy without --disable-slash-commands so /compact expands into SlashCommandScopeItem",
-    );
-    assert.equal(spawns, 1, "Auto-compaction must reuse the resident agy process instead of respawning it");
-    assert.equal(session.hasCompactedSinceLastTurn(), true);
-    const postCompactTokens = 17_000 + POST_COMPACT_SUMMARY_TOKENS;
-    assert.equal(
-      session.getLastContextTokens(),
-      postCompactTokens,
-      "Post-compaction context is the first request plus the summary, never the cumulative result totals",
-    );
-    assert.equal(
-      events.some((e) => e.type === "session.turn"),
-      false,
-      "Background idle auto-compaction must not emit foreground session.turn events",
-    );
-    const compactUsage = usageSamples(events).at(-1);
-    assert.equal(compactUsage?.usage.contextWindowUsedTokens, postCompactTokens,
-      "Background compaction must move Paseo's context meter off the pre-compaction size");
-    assert.equal(compactUsage?.usage.contextWindowMaxTokens, 262_144);
-    assert.equal(compactUsage?.turnId, undefined, "Background compaction has no Paseo turn");
-
-    const compactNotif = events.find(
-      (
-        e,
-      ): e is Extract<ProviderEvent, { type: "timeline.item" }> =>
-        e.type === "timeline.item" &&
-        e.item.type === "compaction" &&
-        e.item.preTokens === 225_000 && e.item.status === "completed",
-    );
-    assert.ok(compactNotif, "Expected native compaction event, never a replayed startup notification");
-    assert.ok(compactNotif.timestamp, "Live compaction must retain its original event time");
-
-    // 3) Because compactedSinceLastTurn is now true, staying idle must NOT trigger a second compaction
-    await new Promise((resolve) => setTimeout(resolve, 90));
-    assert.equal(invocations.length, 3);
-    await session.dispose();
-  } finally {
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-test("new user prompt cancels pending auto-compaction timer and manual /compact marks session compacted", async () => {
-  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-cancel-compact-"));
-  try {
-    const events: ProviderEvent[] = [];
-    const invocations: Array<{ args: readonly string[]; content: string }> = [];
-
-    const spawn: SpawnFunction = (_cmd, args) => {
-      const child = new FakeChildProcess(args, (prompt, proc) => {
-        invocations.push({ args: [...args], content: prompt.content });
-        proc.sendFrame({
-          event: "result",
-          conversation_id: "conv-cancel-compact",
-          status: "success",
-          response: prompt.content.startsWith("/compact") ? "" : "OK",
-          stats: {
-            input_tokens: 10_000,
-            cache_read_tokens: 205_000,
-            output_tokens: 500,
-            total_tokens: 215_500,
-          },
-        });
-      });
-      queueMicrotask(() => {
-        child.sendFrame({
-          event: "init",
-          conversation_id: "conv-cancel-compact",
-        });
-      });
-      return child as unknown as ReturnType<SpawnFunction>;
-    };
-
-    const brainDir = path.join(tempDir, "brain");
-    writeFirstRequest(brainDir, "conv-cancel-compact", 17_000);
-    const session = new Session(
-      "sess-cancel-compact",
-      "agy",
-      [],
-      {},
-      makeConfig({ systemPrompt: "System rules here" }),
-      undefined,
-      TEST_CATALOG,
-      (event) => events.push(event),
-      {
-        spawn,
-        storeDir: tempDir,
-        brainDir,
-        hotCacheTtlMs: 120,
-        autoCompactLeadMs: 40, // 80ms delay
-      },
-    );
-
-    // Turn 1 reaches 215,500 tokens and schedules an 80ms auto-compact timer
-    await session.prompt(userPrompt("Turn 1", "m-1"));
-    await waitForTurnEnd(events);
-    assert.equal(session.getLastContextTokens(), 215_500);
-    assert.equal(session.hasCompactedSinceLastTurn(), false);
-
-    // After 30ms (before the 80ms timer fires), user sends a manual /compact command
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    events.length = 0;
-    await session.prompt({
-      clientMessageId: "m-compact",
-      delivery: "auto",
-      input: {
-        type: "command",
-        name: "compact",
-        arguments: "focus on active task",
-      },
-    });
-    await waitForTurnEnd(events);
-
-    assert.equal(invocations.length, 2);
-    assert.equal(invocations[1]?.content, "/compact focus on active task");
-    assert.equal(
-      invocations[1]?.args.includes("--disable-slash-commands"),
-      false,
-    );
-    assert.equal(session.hasCompactedSinceLastTurn(), true);
-    assert.equal(
-      session.getLastContextTokens(),
-      17_000 + POST_COMPACT_SUMMARY_TOKENS,
-      "Manual /compact records the estimated compacted size, not its unchanged result totals",
-    );
-    const manualUsage = usageSamples(events).at(-1);
-    assert.equal(manualUsage?.usage.contextWindowUsedTokens, 17_000 + POST_COMPACT_SUMMARY_TOKENS);
-    assert.ok(manualUsage?.turnId, "A foreground compaction reports usage on its own turn");
-
-    // Wait another 120ms to confirm no background auto-compact timer fires after manual /compact
-    await new Promise((resolve) => setTimeout(resolve, 120));
-    assert.equal(invocations.length, 2);
-    await session.dispose();
-  } finally {
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-test("Claude Code idle compaction gates: skips when prompt cache has lapsed, isolates post-compaction tokens across follow-up turns, and honors rapid-refill + failure circuit breakers", async () => {
-  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-claude-gates-"));
-  try {
-    // 1) Cache-lapsed gate ("lapsed"): if clock advances past cacheExpiresAt before timer callback runs, skip compaction
-    let fakeNow = 1_000_000;
-    const lapsedPrompts: string[] = [];
-    const spawnLapsed: SpawnFunction = (_cmd, args) => {
-      const child = new FakeChildProcess(args, (prompt, proc) => {
-        lapsedPrompts.push(prompt.content);
-        proc.sendFrame({
-          event: "result",
-          conversation_id: "conv-lapsed",
-          status: "success",
-          response: "OK",
-          stats: {
-            input_tokens: 15_000,
-            cache_read_tokens: 210_000,
-            output_tokens: 1_000,
-            total_tokens: 226_000,
-          },
-        });
-      });
-      queueMicrotask(() => {
-        child.sendFrame({ event: "init", conversation_id: "conv-lapsed" });
-      });
-      return child as unknown as ReturnType<SpawnFunction>;
-    };
-
-    const lapsedEvents: ProviderEvent[] = [];
-    const lapsedSession = new Session(
-      "sess-lapsed",
-      "agy",
-      [],
-      {},
-      makeConfig(),
-      undefined,
-      TEST_CATALOG,
-      (e) => lapsedEvents.push(e),
-      {
-        spawn: spawnLapsed,
-        storeDir: tempDir,
-        now: () => fakeNow,
-        hotCacheTtlMs: 80,
-        autoCompactLeadMs: 40,
-        autoCompactMaxLateMs: 30,
-      },
-    );
-
-    await lapsedSession.prompt(userPrompt("Turn before sleep", "m-sleep"));
-    await waitForTurnEnd(lapsedEvents);
-    // Simulate machine sleep: clock jumps past cacheExpiresAt (1_000_000 + 80 = 1_000_080) before the 40ms timer fires
-    fakeNow = 1_000_200;
-    await new Promise((resolve) => setTimeout(resolve, 70));
-    assert.deepEqual(lapsedPrompts, [`${CONTEXT_OUTPUT_GUIDANCE}\n\nTurn before sleep`]);
-    assert.equal(lapsedSession.getLastIdleSkipReason(), "lapsed");
-    assert.equal(lapsedSession.hasCompactedSinceLastTurn(), false);
-    await lapsedSession.dispose();
-
-    // 2) Rapid-refill thrashing circuit breaker (3 consecutive refills within
-    //    < RAPID_REFILL_REQUEST_WINDOW agy model requests each) AND post-compaction
-    //    token isolation when a follow-up turn is small (< 150k). The fake agy
-    //    writes its native transcript as agy does; the session counts model
-    //    requests from it.
-    const brainDir = path.join(tempDir, "brain");
-    let nextTurnTokens = 240_000;
-    const spawnRefilling = (conv: string, requestsPerTurn: number, prompts: string[]): SpawnFunction => {
-      const logs = path.join(brainDir, conv, ".system_generated", "logs");
-      mkdirSync(logs, { recursive: true });
-      const rows: string[] = [];
-      const log = (type: string, extra: Record<string, unknown> = {}) => rows.push(JSON.stringify({
-        step_index: rows.length, type, status: "DONE", created_at: new Date().toISOString(), ...extra }));
-      return (_cmd, args) => {
-        const child = new FakeChildProcess(args, (prompt, proc) => {
-          prompts.push(prompt.content);
-          log("USER_INPUT", { content: prompt.content });
-          if (prompt.content === "/compact") log("CHECKPOINT");
-          // The conversation's first request is the system prompt, tools and task.
-          else for (let i = 0; i < requestsPerTurn; i++) log("PLANNER_RESPONSE", { input_tokens: rows.length === 1 ? 20_000 : nextTurnTokens });
-          writeFileSync(path.join(logs, "transcript.jsonl"), rows.join("\n") + "\n");
-          if (prompt.content === "/compact") {
-            // Real agy /compact frame: result usage repeats the conversation's
-            // cumulative totals and says nothing about the compacted size.
-            proc.sendFrame({
-              event: "result",
-              conversation_id: conv,
-              status: "success",
-              stats: {
-                input_tokens: 2_000,
-                cache_read_tokens: 240_000,
-                output_tokens: 1_500,
-                total_tokens: 243_500,
+        const requests = (await readFile(capturePath, "utf8"))
+          .trim()
+          .split("\n")
+          .map(
+            (line: string) =>
+              JSON.parse(line) as {
+                method: string;
+                params: { sessionId?: string; _meta?: { antigravity?: unknown } };
               },
-            });
-            return;
-          }
-          proc.sendFrame({
-            event: "result",
-            conversation_id: conv,
-            status: "success",
-            response: "Turn reply",
-            stats: {
-              input_tokens: 20_000,
-              cache_read_tokens: Math.max(0, nextTurnTokens - 21_000),
-              output_tokens: 1_000,
-              total_tokens: nextTurnTokens,
+          );
+        const load = requests.find((req) => req.method === "session/load");
+        assert.ok(load);
+        assert.equal(load.params.sessionId, expectedSessionId);
+        assert.deepEqual(
+          load.params._meta?.antigravity,
+          supportsSystemPrompt
+            ? { systemPrompt: { append: "A test system instruction" } }
+            : undefined,
+        );
+      } finally {
+        await connection.close();
+      }
+    });
+  }
+
+  const completedToolCalls = [
+    {
+      toolCallId: "shell",
+      name: "run_command",
+      kind: "execute",
+      rawInput: {
+        CommandLine: "printf test; exit 7",
+        WaitMsBeforeAsync: 5000,
+        toolSummary: "Run exit code test",
+      },
+      rawOutput: { output: "Command exited with code 7.\n\nCommand output:\ntest", exit_code: 7 },
+    },
+    {
+      toolCallId: "read",
+      name: "read_file",
+      kind: "read",
+      locations: [{ path: "/repo/probe.txt" }],
+      rawInput: { Path: "/repo/probe.txt", StartLine: 2, EndLine: 2 },
+    },
+    {
+      toolCallId: "write",
+      name: "write_file",
+      kind: "edit",
+      locations: [{ path: "/repo/probe.txt" }],
+      rawInput: { Path: "/repo/probe.txt", Content: "alpha\nbeta\ngamma\n", Overwrite: true },
+      rawOutput: {},
+      content: [{ type: "diff", path: "/repo/probe.txt", newText: "alpha\nbeta\ngamma\n" }],
+    },
+    {
+      toolCallId: "edit",
+      name: "edit_file",
+      kind: "edit",
+      locations: [{ path: "/repo/probe.txt" }],
+      rawInput: { Path: "/repo/probe.txt", Target: "beta", Replacement: "delta" },
+      rawOutput: {},
+      content: [
+        {
+          type: "diff",
+          path: "/repo/probe.txt",
+          oldText: "alpha\nbeta\ngamma\n",
+          newText: "alpha\ndelta\ngamma\n",
+        },
+      ],
+    },
+    {
+      toolCallId: "web",
+      name: "search_web",
+      kind: "search",
+      rawInput: { query: "IANA example domains" },
+    },
+    {
+      toolCallId: "paseo",
+      name: "mcp_paseo_send_agent_prompt",
+      kind: "other",
+      rawInput: { agentId: "agent-1", prompt: "Hello", toolSummary: "Send message" },
+    },
+    {
+      toolCallId: "mcp",
+      name: "mcp_local_tools_echo_message",
+      kind: "other",
+      rawInput: { message: "hello", toolSummary: "Echo message hello" },
+    },
+    {
+      toolCallId: "ambiguous",
+      name: "mcp_paseo_get_agent_status",
+      kind: "other",
+      rawInput: { agentId: "agent-1", toolSummary: "Get agent status" },
+    },
+  ];
+
+  for (const source of ["live", "replay"] as const) {
+    it(`maps Antigravity tool calls in ${source} timelines`, async () => {
+      const { directory, launch } = await launchStubAgent(
+        tracker,
+        `
+          const { createInterface } = require("node:readline");
+          const send = (message) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\\n");
+          const tools = ${JSON.stringify(completedToolCalls)};
+          const modes = { currentModeId: "default", availableModes: [{ id: "default", name: "Default" }] };
+          createInterface({ input: process.stdin }).on("line", (line) => {
+            const { id, method, params } = JSON.parse(line);
+            const update = (u) => send({ method: "session/update", params: { sessionId: params.sessionId ?? "agy-session", update: u } });
+            switch (method) {
+              case "initialize":
+                send({ id, result: { protocolVersion: 1, agentCapabilities: { loadSession: true } } });
+                break;
+              case "session/new":
+                send({ id, result: { sessionId: "agy-session", modes } });
+                update({ sessionUpdate: "available_commands_update", availableCommands: [] });
+                break;
+              case "session/load":
+              case "session/prompt":
+                for (const { rawOutput, content, ...tool } of tools) {
+                  const completed = { status: "completed", rawOutput, content };
+                  if (method === "session/load") {
+                    update({ sessionUpdate: "tool_call", title: tool.name, ...tool, ...completed });
+                  } else {
+                    update({ sessionUpdate: "tool_call", title: tool.name, ...tool, status: "in_progress" });
+                    update({ sessionUpdate: "tool_call_update", toolCallId: tool.toolCallId, ...completed });
+                  }
+                }
+                if (method === "session/prompt") {
+                  update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Done." } });
+                }
+                send({ id, result: method === "session/load" ? { modes } : { stopReason: "end_turn" } });
+                break;
+              case "session/close":
+                send({ id, result: {} });
+                break;
+            }
+          });
+        `,
+      );
+
+      const connection = await createAntigravityResilientProvider().connect({
+        launch,
+        versions: [1],
+        capabilities: ["session.persistence", "prompt.message"],
+      });
+      const events: ProviderEvent[] = [];
+      connection.onEvent((event) => events.push(event));
+      try {
+        await connection.send({
+          type: "session.open",
+          requestId: "open",
+          sessionId: "test",
+          history: source === "replay" ? "replay" : "skip",
+          persistence:
+            source === "replay" ? { version: 1, data: { sessionId: "agy-session" } } : undefined,
+          config: {
+            cwd: directory,
+            env: {},
+            mcpServers: {
+              paseo_get: { type: "stdio", command: "other-server" },
+              local_tools: { type: "stdio", command: "echo-mcp" },
+            },
+            settings: {},
+            persist: true,
+          },
+        });
+        await waitFor(() => events.find((e) => e.type === "session.ready"), {
+          label: "session.ready",
+        });
+
+        if (source === "live") {
+          await connection.send({
+            type: "session.prompt",
+            sessionId: "test",
+            prompt: {
+              clientMessageId: "exercise-tools",
+              delivery: "auto",
+              input: { type: "message", content: [{ type: "text", text: "Exercise tools" }] },
             },
           });
-        });
-        queueMicrotask(() => {
-          child.sendFrame({ event: "init", conversation_id: conv });
-        });
-        return child as unknown as ReturnType<SpawnFunction>;
-      };
-    };
+        }
 
-    const thrashEvents: ProviderEvent[] = [];
-    const thrashPrompts: string[] = [];
-    const thrashSession = new Session(
-      "sess-thrash",
-      "agy",
-      [],
-      {},
-      makeConfig(),
-      undefined,
-      TEST_CATALOG,
-      (e) => thrashEvents.push(e),
-      {
-        spawn: spawnRefilling("conv-thrash", 3, thrashPrompts),
-        storeDir: tempDir,
-        brainDir,
-        hotCacheTtlMs: 60,
-        autoCompactLeadMs: 30,
-      },
-    );
+        const calls = () =>
+          events.flatMap((event) =>
+            event.type === "timeline.item" && event.item.type === "tool_call" ? [event.item] : [],
+          );
+        await waitFor(
+          () => calls().filter((call) => call.status === "completed").length === completedToolCalls.length,
+          { label: "all tool calls completed" },
+        );
 
-    const waitForCompactDone = (session: Session) =>
-      new Promise<void>((resolve, reject) => {
-        const deadline = Date.now() + 2_000;
-        const poll = () => {
-          if (session.hasCompactedSinceLastTurn()) {
-            resolve();
-            return;
-          }
-          if (Date.now() > deadline) {
-            reject(new Error("Timed out waiting for compact"));
-            return;
-          }
-          setTimeout(poll, 10);
+        const completed = Object.fromEntries(
+          calls()
+            .filter((call) => call.status === "completed")
+            .map((call) => [call.id, call]),
+        );
+        assert.deepEqual(completed.shell?.detail, {
+          type: "shell",
+          command: "printf test; exit 7",
+          output: "Command exited with code 7.\n\nCommand output:\ntest",
+          exitCode: 7,
+        });
+        assert.deepEqual(completed.read?.detail, {
+          type: "read",
+          filePath: "/repo/probe.txt",
+          offset: 2,
+          limit: 1,
+        });
+        assert.deepEqual(completed.write?.detail, {
+          type: "write",
+          filePath: "/repo/probe.txt",
+          content: "alpha\nbeta\ngamma\n",
+        });
+        assert.deepEqual(completed.edit?.detail, {
+          type: "edit",
+          filePath: "/repo/probe.txt",
+          oldString: "alpha\nbeta\ngamma\n",
+          newString: "alpha\ndelta\ngamma\n",
+          unifiedDiff: undefined,
+        });
+        assert.deepEqual(completed.web?.detail, {
+          type: "search",
+          toolName: "web_search",
+          query: "IANA example domains",
+        });
+        assert.equal(completed.paseo?.name, "paseo.send_agent_prompt");
+        assert.deepEqual(completed.paseo?.detail, {
+          type: "unknown",
+          input: { agentId: "agent-1", prompt: "Hello" },
+          output: null,
+        });
+        assert.equal(completed.mcp?.name, "local_tools.echo_message");
+        assert.deepEqual(completed.mcp?.detail, {
+          type: "unknown",
+          input: { message: "hello" },
+          output: null,
+        });
+        assert.equal(completed.ambiguous?.name, "mcp_paseo_get_agent_status");
+      } finally {
+        await connection.close();
+      }
+    });
+  }
+
+  it("offers per-model thinkingOptions, attaches legacy effort aliases, and opens Orchestrator cleanly", async () => {
+    const { directory, launch } = await launchStubAgent(
+      tracker,
+      `
+        const { createInterface } = require("node:readline");
+        const levels = (...values) => values.map((value) => ({ value, name: value }));
+        const thinking = {
+          "gemini-4-neon": { currentValue: "high", options: levels("low", "medium", "high", "xhigh") },
+          "gemini-4-hydrogen": { currentValue: "high", options: levels("low", "medium", "high") },
+          "claude-opus-5-5": { currentValue: "medium", options: levels("low", "medium", "high") },
         };
-        poll();
-      });
-
-    // Compaction #1 (initial compaction: consecutiveRapidRefills = 0)
-    thrashEvents.length = 0;
-    await thrashSession.prompt(userPrompt("Big turn 1", "t-1"));
-    await waitForTurnEnd(thrashEvents);
-    await waitForCompactDone(thrashSession);
-    assert.equal(thrashSession.getLastContextTokens(), 20_000 + POST_COMPACT_SUMMARY_TOKENS);
-    assert.equal(thrashSession.getConsecutiveRapidRefills(), 0);
-
-    // Follow-up small turn (e.g. STATUS_POLL at 25,000 tokens < 150k): must NOT re-trigger compaction!
-    nextTurnTokens = 25_000;
-    thrashEvents.length = 0;
-    await thrashSession.prompt(userPrompt("STATUS_POLL", "t-monitor"));
-    await waitForTurnEnd(thrashEvents);
-    assert.equal(thrashSession.getLastContextTokens(), 25_000);
-    assert.equal(thrashSession.getLastIdleSkipReason(), "small");
-    await new Promise((resolve) => setTimeout(resolve, 60));
-    assert.equal(thrashPrompts.filter((p) => p === "/compact").length, 1);
-
-    // Compaction #2 after 6 model requests (< 10 -> consecutiveRapidRefills = 1)
-    nextTurnTokens = 240_000;
-    thrashEvents.length = 0;
-    await thrashSession.prompt(userPrompt("Big turn 2", "t-2"));
-    await waitForTurnEnd(thrashEvents);
-    await waitForCompactDone(thrashSession);
-    assert.equal(thrashSession.getConsecutiveRapidRefills(), 1);
-
-    // Compaction #3 after 3 model requests (consecutiveRapidRefills = 2)
-    thrashEvents.length = 0;
-    await thrashSession.prompt(userPrompt("Big turn 3", "t-3"));
-    await waitForTurnEnd(thrashEvents);
-    await waitForCompactDone(thrashSession);
-    assert.equal(thrashSession.getConsecutiveRapidRefills(), 2);
-
-    // 4th refill after 3 model requests (consecutiveRapidRefills = 3 -> TRIPS BREAKER!)
-    thrashEvents.length = 0;
-    await thrashSession.prompt(userPrompt("Big turn 4", "t-4"));
-    await waitForTurnEnd(thrashEvents);
-    await new Promise((resolve) => setTimeout(resolve, 70));
-    assert.equal(thrashSession.isRapidRefillBreakerTripped(), true);
-    assert.equal(thrashSession.getConsecutiveRapidRefills(), 3);
-    assert.equal(thrashSession.getLastIdleSkipReason(), "rapid_refill_breaker_open");
-    assert.equal(
-      thrashPrompts.filter((p) => p === "/compact").length,
-      3,
-      "4th rapid refill must be blocked by the rapid-refill circuit breaker",
-    );
-    const isThrashNotif = (e: ProviderEvent) =>
-      e.type === "timeline.item" &&
-      e.item.type === "notification" &&
-      e.item.message === AUTOCOMPACT_THRASHING_MESSAGE;
-    assert.ok(thrashEvents.some(isThrashNotif), "Expected Claude Code thrashing circuit-breaker warning notification");
-    await thrashSession.dispose();
-
-    // The same prompts doing 40 agy requests each are normal long work, even
-    // though every refill is a single Paseo prompt: every idle compact runs.
-    const longEvents: ProviderEvent[] = [];
-    const longPrompts: string[] = [];
-    const longSession = new Session(
-      "sess-long",
-      "agy",
-      [],
-      {},
-      makeConfig(),
-      undefined,
-      TEST_CATALOG,
-      (e) => longEvents.push(e),
-      {
-        spawn: spawnRefilling("conv-long", 40, longPrompts),
-        storeDir: tempDir,
-        brainDir,
-        hotCacheTtlMs: 60,
-        autoCompactLeadMs: 30,
-      },
-    );
-    let longThrashNotices = 0;
-    for (let i = 1; i <= 4; i++) {
-      longEvents.length = 0;
-      await longSession.prompt(userPrompt(`Long turn ${i}`, `l-${i}`));
-      await waitForTurnEnd(longEvents);
-      await waitForCompactDone(longSession);
-      longThrashNotices += longEvents.filter(isThrashNotif).length;
-    }
-    assert.equal(longPrompts.filter((p) => p === "/compact").length, 4);
-    assert.equal(longSession.getConsecutiveRapidRefills(), 0);
-    assert.equal(longSession.isRapidRefillBreakerTripped(), false);
-    assert.equal(longThrashNotices, 0);
-    await longSession.dispose();
-
-    // 3) Consecutive failure circuit breaker (3 consecutive failures trips breaker)
-    //    AND incoming foreground user prompt waiting cleanly while background auto-compact is in flight
-    const failEvents: ProviderEvent[] = [];
-    const failPrompts: string[] = [];
-    let holdCompact = false;
-    let releaseHeldCompact: (() => void) | null = null;
-
-    const spawnFail: SpawnFunction = (_cmd, args) => {
-      const child = new FakeChildProcess(args, (prompt, proc) => {
-        failPrompts.push(prompt.content);
-        if (prompt.content === "/compact") {
-          const finishCompact = () => {
-            proc.sendFrame({
-              event: "result",
-              conversation_id: "conv-fail-breaker",
-              status: "error",
-              errors: ["Compaction backend failure"],
-            });
-          };
-          if (holdCompact) {
-            releaseHeldCompact = finishCompact;
-          } else {
-            finishCompact();
+        let model = "gemini-4-neon";
+        const configOptions = () => [
+          { id: "model", name: "Model", category: "model", type: "select", currentValue: model, options: [
+            { value: "gemini-4-neon", name: "Gemini 4 Neon" },
+            { value: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen" },
+            { value: "gemini-pro-orchestrator-neon", name: "Orchestrator (Neon)" },
+            { value: "claude-opus-5-5", name: "Claude Opus 5.5" },
+          ] },
+          ...(thinking[model] ? [{ id: "thought_level", name: "Thinking", category: "thought_level", type: "select", ...thinking[model] }] : []),
+          { id: "mode", name: "Mode", category: "mode", type: "select", currentValue: "default",
+            options: [{ value: "default", name: "Default" }, { value: "plan", name: "Plan" }] },
+        ];
+        const send = (message) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\\n");
+        createInterface({ input: process.stdin }).on("line", (line) => {
+          const { id, method, params } = JSON.parse(line);
+          if (method === "initialize") send({ id, result: { protocolVersion: 1, agentCapabilities: {} } });
+          if (method === "session/new") {
+            model = "gemini-4-neon";
+            send({ id, result: { sessionId: "native", configOptions: configOptions() } });
           }
-          return;
-        }
-        proc.sendFrame({
-          event: "result",
-          conversation_id: "conv-fail-breaker",
-          status: "success",
-          response: `Reply to ${prompt.content}`,
-          stats: {
-            input_tokens: 15_000,
-            cache_read_tokens: 200_000,
-            output_tokens: 1_000,
-            total_tokens: 216_000,
-          },
+          if (method === "session/set_config_option") {
+            if (params.configId === "thought_level" && !thinking[model]) {
+              send({ id, error: { code: -32602, message: "unknown config option" } });
+              return;
+            }
+            if (params.configId === "model") model = params.value;
+            else if (params.configId === "thought_level") thinking[model].currentValue = params.value;
+            send({ id, result: { configOptions: configOptions() } });
+          }
+          if (method === "session/close") send({ id, result: {} });
         });
-      });
-      queueMicrotask(() => {
-        child.sendFrame({ event: "init", conversation_id: "conv-fail-breaker" });
-      });
-      return child as unknown as ReturnType<SpawnFunction>;
-    };
-
-    const failSession = new Session(
-      "sess-fail-breaker",
-      "agy",
-      [],
-      {},
-      makeConfig(),
-      undefined,
-      TEST_CATALOG,
-      (e) => failEvents.push(e),
-      {
-        spawn: spawnFail,
-        storeDir: tempDir,
-        hotCacheTtlMs: 50,
-        autoCompactLeadMs: 25,
-      },
+      `,
     );
 
-    // Failures 1 and 2
-    for (let i = 1; i <= 2; i += 1) {
-      failEvents.length = 0;
-      await failSession.prompt(userPrompt(`Turn ${i}`, `f-${i}`));
-      await waitForTurnEnd(failEvents);
-      await new Promise((resolve) => setTimeout(resolve, 60));
-      assert.equal(failSession.getConsecutiveCompactFailures(), i);
-      assert.equal(failSession.isFailureBreakerOpen(), false);
+    const connection = await createAntigravityResilientProvider().connect({
+      launch,
+      versions: [1],
+      capabilities: ["session.configure"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    try {
+      await connection.send({ type: "catalog", requestId: "catalog", cwd: directory });
+      const catalogEvent = await waitFor(
+        () => events.find((e): e is Extract<ProviderEvent, { type: "catalog" }> => e.type === "catalog"),
+        { label: "catalog" },
+      );
+
+      const byModel = Object.fromEntries(
+        catalogEvent.catalog.models.map((m) => [
+          m.id,
+          {
+            options: m.thinkingOptions?.map((o) => o.id),
+            default: m.defaultThinkingOptionId,
+            aliases: m.aliases,
+          },
+        ]),
+      );
+      assert.deepEqual(byModel["gemini-4-neon"], {
+        options: ["low", "medium", "high", "xhigh"],
+        default: "high",
+        aliases: [
+          "gemini-4-neon-low",
+          "gemini-4-neon-medium",
+          "gemini-4-neon-high",
+          "gemini-4-neon-xhigh",
+        ],
+      });
+      assert.deepEqual(byModel["gemini-4-hydrogen"], {
+        options: ["low", "medium", "high"],
+        default: "high",
+        aliases: [
+          "gemini-4-hydrogen-low",
+          "gemini-4-hydrogen-medium",
+          "gemini-4-hydrogen-high",
+        ],
+      });
+      assert.deepEqual(byModel["gemini-pro-orchestrator-neon"], {
+        options: [],
+        default: undefined,
+        aliases: undefined,
+      });
+
+      // Open Orchestrator with undefined thinking option AND open a legacy suffixed model ID on new session.
+      await connection.send({
+        type: "session.open",
+        requestId: "open-orch",
+        sessionId: "orchestrator",
+        history: "skip",
+        config: {
+          cwd: directory,
+          model: "gemini-pro-orchestrator-neon",
+          mode: "full-access",
+          thinkingOption: byModel["gemini-pro-orchestrator-neon"]!.default,
+          env: {},
+          mcpServers: {},
+          settings: {},
+          persist: true,
+        },
+      });
+      await waitFor(
+        () =>
+          events.find(
+            (e) => e.type === "session.ready" && e.sessionId === "orchestrator",
+          ),
+        { label: "orchestrator ready" },
+      );
+
+      await connection.send({
+        type: "session.open",
+        requestId: "open-legacy-model",
+        sessionId: "hydrogen-session",
+        history: "skip",
+        config: {
+          cwd: directory,
+          model: "gemini-4-hydrogen-medium",
+          mode: "full-access",
+          env: {},
+          mcpServers: {},
+          settings: {},
+          persist: true,
+        },
+      });
+      await waitFor(
+        () =>
+          events.find(
+            (e) => e.type === "session.ready" && e.sessionId === "hydrogen-session",
+          ),
+        { label: "hydrogen-session ready" },
+      );
+      const hydrogenCfg = events.find(
+        (e): e is Extract<ProviderEvent, { type: "session.config" }> =>
+          e.type === "session.config" && e.sessionId === "hydrogen-session",
+      );
+      if (!hydrogenCfg) throw new Error("Expected hydrogen-session config");
+      assert.equal(hydrogenCfg.config.model, "gemini-4-hydrogen");
+      assert.equal(hydrogenCfg.config.thinkingOption, "medium");
+    } finally {
+      await connection.close();
     }
-
-    // Turn 3: hold the 3rd background /compact in-flight and send a foreground user prompt ("Turn 4 while compacting")
-    holdCompact = true;
-    failEvents.length = 0;
-    await failSession.prompt(userPrompt("Turn 3", "f-3"));
-    await waitForTurnEnd(failEvents);
-    await new Promise((resolve) => setTimeout(resolve, 40));
-    assert.ok(releaseHeldCompact, "3rd background auto-compact should be in flight");
-
-    failEvents.length = 0;
-    const turn4Promise = failSession.prompt(
-      userPrompt("Turn 4 while compacting", "f-4"),
-    );
-    // Release the held background auto-compact after 20ms
-    setTimeout(() => {
-      holdCompact = false;
-      releaseHeldCompact?.();
-    }, 20);
-    await turn4Promise;
-    const turn4End = await waitForTurnEnd(failEvents);
-    assert.equal(turn4End.state, "completed");
-    assert.equal(failSession.getConsecutiveCompactFailures(), 3);
-    assert.equal(failSession.isFailureBreakerOpen(), true);
-    assert.equal(failSession.getLastIdleSkipReason(), "failure_breaker_open");
-
-    // Wait another 60ms after Turn 4: because failure breaker is open (3 failures), NO 4th /compact is attempted
-    await new Promise((resolve) => setTimeout(resolve, 60));
-    assert.equal(
-      failPrompts.filter((p) => p === "/compact").length,
-      3,
-      "Failure circuit breaker must prevent any 4th auto-compaction attempt",
-    );
-    await failSession.dispose();
-  } finally {
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-test("context window resolution maps model families and getCatalog enriches the catalogue", async () => {
-  assert.equal(resolveContextWindowMaxTokens("gemini-4-argon-high"), 262_144);
-  assert.equal(resolveContextWindowMaxTokens("gemini-3.8-flash-low"), 262_144);
-  assert.equal(resolveContextWindowMaxTokens("claude-opus-5-5-high"), 200_000);
-  assert.equal(resolveContextWindowMaxTokens("claude-sonnet-5-5-medium"), 200_000);
-  assert.equal(resolveContextWindowMaxTokens("gpt-oss-120b-medium"), 131_072);
-  assert.equal(resolveContextWindowMaxTokens(undefined), 262_144);
-  assert.equal(resolveContextWindowMaxTokens("some-unknown-model"), 262_144);
-
-  const host: ProviderHost = {
-    async readCatalogCache() {
-      return null;
-    },
-    async writeCatalogCache() {},
-  };
-  const catalog = await getCatalog(host, "agy", [], {}, {
-    probeImpl: async () => ({
-      exitCode: 0,
-      stdout:
-        "gemini-4-argon-medium\tGemini 4 Argon (Medium)\nclaude-sonnet-5-5-high\tClaude Sonnet 5.5 (High)\n",
-      stderr: "",
-    }),
   });
-  assert.equal(catalog.models[0]?.contextWindowMaxTokens, 262_144);
-  assert.equal(catalog.models[1]?.contextWindowMaxTokens, 200_000);
-});
 
-test("session.usage reports a context window max from the nested result.usage frame", async () => {
-  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-window-"));
-  try {
+  it("completes recurring schedule turns immediately and defers non-daemon background run_command turns", async () => {
+    const { directory, launch } = await launchStubAgent(
+      tracker,
+      `
+        const { createInterface } = require("node:readline");
+        const send = (message) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\\n");
+        let turn = 0;
+        createInterface({ input: process.stdin }).on("line", (line) => {
+          const { id, method, params } = JSON.parse(line);
+          const update = (u) => send({ method: "session/update", params: { sessionId: params.sessionId ?? "agy-session", update: u } });
+          switch (method) {
+            case "initialize":
+              send({ id, result: { protocolVersion: 1, agentCapabilities: {} } });
+              break;
+            case "session/new":
+              send({ id, result: { sessionId: "agy-session", configOptions: [
+                { id: "mode", name: "Mode", category: "mode", type: "select", currentValue: "default",
+                  options: [{ value: "default", name: "Default" }] },
+              ] } });
+              update({ sessionUpdate: "available_commands_update", availableCommands: [] });
+              break;
+            case "session/prompt":
+              turn += 1;
+              if (turn === 1) {
+                const args = { CronExpression: "*/15 * * * *", Prompt: "ping" };
+                update({ sessionUpdate: "tool_call", toolCallId: "cron", name: "schedule", status: "in_progress", kind: "other", title: "Run schedule", rawInput: args });
+                send({ id, result: { stopReason: "end_turn" } });
+              } else if (turn === 2) {
+                update({ sessionUpdate: "tool_call", toolCallId: "daemon-1", name: "run_command", title: "Dev server", status: "in_progress", rawInput: { CommandLine: "npm run dev", IsDaemon: true } });
+                send({ id, result: { stopReason: "end_turn" } });
+              } else {
+                update({ sessionUpdate: "tool_call", toolCallId: "bg-1", name: "run_command", title: "Background build", status: "in_progress", rawInput: { CommandLine: "sleep 1" } });
+                send({ id, result: { stopReason: "end_turn" } });
+                setTimeout(() => {
+                  update({ sessionUpdate: "tool_call_update", toolCallId: "bg-1", status: "completed" });
+                  update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Build finished." } });
+                  update({ sessionUpdate: "usage_update", used: 50, size: 1000 });
+                }, 80);
+              }
+              break;
+            case "session/close":
+              send({ id, result: {} });
+              break;
+          }
+        });
+      `,
+    );
+
+    const connection = await createAntigravityResilientProvider().connect({
+      launch,
+      versions: [1],
+      capabilities: ["prompt.message"],
+    });
     const events: ProviderEvent[] = [];
-    const spawn: SpawnFunction = (_cmd, args) => {
-      const child = new FakeChildProcess(args, (_prompt, proc) => {
-        proc.sendFrame({
-          event: "message",
-          conversation_id: "conv-window",
-          role: "assistant",
-          content: "ok",
-        });
-        // Real `agy --output-format stream-json` shape: totals live under
-        // result.usage, not a top-level stats object.
-        proc.sendFrame({
-          event: "result",
-          result: {
-            conversation_id: "conv-window",
-            status: "SUCCESS",
-            response: "ok\n",
-            duration_seconds: 3.5,
-            num_turns: 1,
-            usage: {
-              input_tokens: 14_559,
-              output_tokens: 5,
-              thinking_tokens: 0,
-              cache_read_tokens: 0,
-              total_tokens: 14_564,
-            },
-          },
-        });
+    connection.onEvent((event) => events.push(event));
+    try {
+      await connection.send({
+        type: "session.open",
+        requestId: "open",
+        sessionId: "test",
+        history: "skip",
+        config: { cwd: directory, env: {}, mcpServers: {}, settings: {}, persist: false },
       });
-      queueMicrotask(() => {
-        child.sendFrame({ event: "init", conversation_id: "conv-window" });
+      await waitFor(() => events.find((e) => e.type === "session.ready"), { label: "ready" });
+
+      // Turn 1: recurring schedule completes immediately despite in_progress status.
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "test",
+        prompt: {
+          clientMessageId: "schedule-turn",
+          delivery: "auto",
+          input: { type: "message", content: [{ type: "text", text: "schedule" }] },
+        },
       });
-      return child as unknown as ReturnType<SpawnFunction>;
-    };
+      await waitFor(
+        () =>
+          events.find(
+            (e) =>
+              e.type === "session.turn" &&
+              e.turnId === "acp:schedule-turn" &&
+              e.state === "completed",
+          ),
+        { label: "schedule-turn completed" },
+      );
 
-    const session = new Session(
-      "sess-window",
-      "agy",
-      [],
-      {},
-      makeConfig(),
-      undefined,
-      TEST_CATALOG,
-      (event) => events.push(event),
-      { spawn, storeDir: tempDir },
-    );
-    await session.prompt(userPrompt("hi", "msg-window"));
-    await waitForTurnEnd(events);
-
-    const usageEvents = events.filter(
-      (event): event is Extract<ProviderEvent, { type: "session.usage" }> =>
-        event.type === "session.usage",
-    );
-    assert.equal(usageEvents.length, 1);
-    const usage = usageEvents[0]?.usage;
-    assert.equal(usage?.contextWindowUsedTokens, 14_564);
-    assert.equal(usage?.contextWindowMaxTokens, 262_144);
-    await session.dispose();
-  } finally {
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-test("providerOptions.contextWindowMaxTokens overrides the model-family default", async () => {
-  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-window-override-"));
-  try {
-    const events: ProviderEvent[] = [];
-    const spawn: SpawnFunction = (_cmd, args) => {
-      const child = new FakeChildProcess(args, (_prompt, proc) => {
-        proc.sendFrame({
-          event: "result",
-          result: {
-            conversation_id: "conv-window-override",
-            status: "SUCCESS",
-            response: "ok",
-            usage: { input_tokens: 1_000, output_tokens: 10, total_tokens: 1_010 },
-          },
-        });
+      // Turn 2: IsDaemon completes immediately.
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "test",
+        prompt: {
+          clientMessageId: "daemon-turn",
+          delivery: "auto",
+          input: { type: "message", content: [{ type: "text", text: "daemon" }] },
+        },
       });
-      queueMicrotask(() => {
-        child.sendFrame({
-          event: "init",
-          conversation_id: "conv-window-override",
-        });
+      await waitFor(
+        () =>
+          events.find(
+            (e) =>
+              e.type === "session.turn" &&
+              e.turnId === "acp:daemon-turn" &&
+              e.state === "completed",
+          ),
+        { label: "daemon-turn completed" },
+      );
+
+      // Turn 3: non-daemon background run_command stays open until completion + reply + usage_update.
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "test",
+        prompt: {
+          clientMessageId: "bg-turn",
+          delivery: "auto",
+          input: { type: "message", content: [{ type: "text", text: "build" }] },
+        },
       });
-      return child as unknown as ReturnType<SpawnFunction>;
-    };
-
-    const session = new Session(
-      "sess-window-override",
-      "agy",
-      [],
-      {},
-      makeConfig({ providerOptions: { contextWindowMaxTokens: 250_000 } }),
-      undefined,
-      TEST_CATALOG,
-      (event) => events.push(event),
-      { spawn, storeDir: tempDir },
-    );
-    await session.prompt(userPrompt("hi", "msg-window-override"));
-    await waitForTurnEnd(events);
-
-    const usage = events.find(
-      (event): event is Extract<ProviderEvent, { type: "session.usage" }> =>
-        event.type === "session.usage",
-    )?.usage;
-    assert.equal(usage?.contextWindowMaxTokens, 250_000);
-    await session.dispose();
-  } finally {
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-test("conversation breaker survives reopen and does not block explicit manual compact", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "agy-breaker-reopen-"));
-  const sessions: Session[] = [];
-  try {
-    for (const kind of ["failure", "rapid"] as const) {
-      const conv = `conv-reopen-${kind}`;
-      const state = emptyCompactionState();
-      for (let i = 0; i < (kind === "failure" ? 3 : 4); i++) {
-        beginBusinessTurn(state);
-        state.modelRequests = i; // one model request between compacts: real thrashing
-        beginCompact(state, `turn-${i + 1}:auto-compact`, "idle", Date.now() - 50_000 + i * 1_000);
-        // Leave the last failed attempt pending to exercise interrupted recovery.
-        if (kind !== "failure" || i < 2) finishCompact(state, `turn-${i + 1}:auto-compact`, kind === "rapid", Date.now() - 40_000 + i, 10_000);
-      }
-      new ConversationStore({ storeDir: dir, brainDir: dir }).saveCompaction(conv, state);
-      writeFirstRequest(dir, conv, 11_000);
-      const prompts: string[] = [];
-      const events: ProviderEvent[] = [];
-      const spawn: SpawnFunction = (_cmd, args) => {
-        const child = new FakeChildProcess(args, (prompt, proc) => {
-          prompts.push(prompt.content);
-          proc.sendFrame({ event: "result", conversation_id: conv, status: "success", response: "OK",
-            stats: { input_tokens: 240_000, output_tokens: prompt.content === "/compact" ? 15_000 : 1_000 } });
-        });
-        queueMicrotask(() => child.sendFrame({ event: "init", conversation_id: conv }));
-        return child as unknown as ReturnType<SpawnFunction>;
-      };
-      const makeSession = () => new Session("reopened", "agy", [], {}, makeConfig(),
-        { version: 1, data: { conversationId: conv, sessionKey: conv } }, TEST_CATALOG, (e) => events.push(e),
-        { storeDir: dir, brainDir: dir, spawn, hotCacheTtlMs: 80, autoCompactLeadMs: 40 });
-      let session = makeSession(); sessions.push(session);
-      assert.equal(kind === "failure" ? session.isFailureBreakerOpen() : session.isRapidRefillBreakerTripped(), true);
-      session.open("open", [], "replay");
-      assert.equal(events.some((e) => e.type === "session.turn"), false);
-      events.length = 0;
-      await session.prompt(userPrompt("real work", "reopen-work"));
-      await waitForTurnEnd(events);
-      await new Promise((resolve) => setTimeout(resolve, 90));
-      assert.deepEqual(prompts, [`${CONTEXT_OUTPUT_GUIDANCE}\n\nreal work`], "guidance accompanies real work; no automatic compact or synthetic turn");
-      await session.dispose();
-      events.length = 0;
-      session = makeSession(); sessions.push(session);
-      assert.equal(kind === "failure" ? session.isFailureBreakerOpen() : session.isRapidRefillBreakerTripped(), true);
-      await session.prompt(userPrompt("/compact", "explicit-escape"));
-      await waitForTurnEnd(events);
-      assert.equal(session.isFailureBreakerOpen(), false);
-      assert.equal(session.isRapidRefillBreakerTripped(), false);
-      assert.equal(session.getLastContextTokens(), 11_000 + POST_COMPACT_SUMMARY_TOKENS);
-      await session.dispose();
-      const restored = makeSession(); sessions.push(restored);
-      assert.equal(restored.hasCompactedSinceLastTurn(), true);
-      assert.equal(restored.getLastContextTokens(), 11_000 + POST_COMPACT_SUMMARY_TOKENS);
+      await waitFor(
+        () =>
+          events.find(
+            (e) =>
+              e.type === "timeline.item" &&
+              e.item.type === "tool_call" &&
+              e.item.id === "bg-1" &&
+              e.item.status === "running",
+          ),
+        { label: "bg-1 running" },
+      );
+      assert.equal(
+        events.some(
+          (e) =>
+            e.type === "session.turn" && e.turnId === "acp:bg-turn" && e.state === "completed",
+        ),
+        false,
+      );
+      await waitFor(
+        () =>
+          events.find(
+            (e) =>
+              e.type === "session.turn" && e.turnId === "acp:bg-turn" && e.state === "completed",
+          ),
+        { label: "bg-turn completed" },
+      );
+      assert.ok(
+        events.some(
+          (e) =>
+            e.type === "timeline.item" &&
+            e.item.type === "assistant_message" &&
+            e.item.text === "Build finished.",
+        ),
+      );
+      // Verify no internal __attempt_* turn IDs ever leaked to the host.
+      assert.equal(
+        events.some(
+          (e) => e.type === "session.turn" && e.turnId.startsWith("acp:__attempt_"),
+        ),
+        false,
+      );
+    } finally {
+      await connection.close();
     }
-  } finally {
-    for (const session of sessions) await session.dispose();
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
+  });
 
-test("flat native history plus live CHECKPOINT updates context without replaying old compactions or counting manual twice", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "agy-native-compact-"));
-  let session: Session | undefined;
-  try {
-    const conv = "conv-native-mixed";
-    const logs = path.join(dir, "brain", conv, ".system_generated", "logs");
-    mkdirSync(logs, { recursive: true });
-    const file = path.join(logs, "transcript.jsonl");
-    let now = Date.parse("2040-01-02T20:00:00Z");
-    const rows: Record<string, unknown>[] = [
-      { step_index: 0, type: "USER_INPUT", status: "DONE", created_at: new Date(now - 30_000).toISOString(), content: "old task" },
-      { step_index: 1, type: "CHECKPOINT", status: "DONE", created_at: new Date(now - 20_000).toISOString(), content: "old summary" },
-      { step_index: 2, type: "PLANNER_RESPONSE", status: "DONE", created_at: new Date(now - 10_000).toISOString(), input_tokens: 20_000 },
-    ];
-    const saveLog = () => writeFileSync(file, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
-    saveLog();
-    const events: ProviderEvent[] = [];
-    let nextStep = 3;
-    const spawn: SpawnFunction = (_cmd, args) => {
-      const child = new FakeChildProcess(args, (prompt, proc) => {
-        // The CLI can replay an old checkpoint at a new timeline position.
-        proc.sendFrame({ event: "step_update", conversation_id: conv, timestamp: rows[1].created_at,
-          step_update: { step_index: 1, step_type: "CHECKPOINT", state: "DONE" } });
-        rows.push({ step_index: nextStep++, type: "USER_INPUT", status: "DONE", created_at: new Date(now).toISOString(), content: prompt.content });
-        const step = nextStep++;
-        rows.push({ step_index: step, type: "CHECKPOINT", status: "DONE", created_at: new Date(now).toISOString(), content: "new summary" });
-        saveLog();
-        proc.sendFrame({ event: "step_update", conversation_id: conv, timestamp: new Date(now).toISOString(),
-          step_update: { step_index: step, step_type: "CHECKPOINT", state: "DONE" } });
-        if (prompt.content !== "/compact") {
-          const usageStep = nextStep++;
-          rows.push({ step_index: usageStep, type: "PLANNER_RESPONSE", status: "DONE", created_at: new Date(now + 100).toISOString(), input_tokens: 22_000 });
-          saveLog();
-          proc.sendFrame({ event: "step_update", conversation_id: conv, timestamp: new Date(now + 100).toISOString(),
-            step_update: { step_index: usageStep, step_type: "agent_response", state: "DONE", usage: { input_tokens: 22_000 } } });
-        }
-        proc.sendFrame({ event: "result", conversation_id: conv, status: "success", response: "OK",
-          stats: { input_tokens: 300_000, output_tokens: 14_000, total_tokens: 314_000 } });
-      });
-      queueMicrotask(() => child.sendFrame({ event: "init", conversation_id: conv }));
-      return child as unknown as ReturnType<SpawnFunction>;
-    };
-    const makeSession = () => new Session("mixed", "agy", [], {}, makeConfig(),
-      { version: 1, data: { conversationId: conv, sessionKey: conv } }, TEST_CATALOG, (e) => events.push(e),
-      { storeDir: dir, brainDir: path.join(dir, "brain"), spawn, now: () => now, hotCacheTtlMs: 80, autoCompactLeadMs: 40 });
-    session = makeSession();
-    assert.equal(session.getLastContextTokens(), 20_000);
-    session.open("open", [], "skip");
-    assert.equal(events.some((e) => e.type === "timeline.item" && e.item.type === "compaction"), false);
-    events.length = 0;
-    await session.prompt(userPrompt("current work", "native-turn"));
-    await waitForTurnEnd(events);
-    assert.equal(session.getLastContextTokens(), 22_000, "result aggregate must not restore pre-compact input size");
-    assert.equal(events.filter((e) => e.type === "timeline.item" && e.item.type === "compaction").length, 1);
-    assert.equal(session.hasCompactedSinceLastTurn(), true);
-    assert.deepEqual(usageSamples(events).map((e) => e.usage.contextWindowUsedTokens),
-      [20_000 + POST_COMPACT_SUMMARY_TOKENS, 22_000, 22_000],
-      "the meter drops when the checkpoint lands, then follows real requests");
-    now += 5_000;
-    events.length = 0;
-    await session.prompt(userPrompt("/compact", "manual-turn"));
-    await waitForTurnEnd(events);
-    assert.equal(events.filter((e) => e.type === "timeline.item" && e.item.type === "compaction").length, 1);
-    assert.equal(session.getLastContextTokens(), 20_000 + POST_COMPACT_SUMMARY_TOKENS);
-    await session.dispose();
-    events.length = 0;
-    session = makeSession();
-    assert.equal(session.getStore().loadCompaction(conv).events.length, 3, "old native + current native + one manual checkpoint");
-    assert.equal(session.getLastContextTokens(), 20_000 + POST_COMPACT_SUMMARY_TOKENS);
-    assert.equal(session.isRapidRefillBreakerTripped(), false);
-    assert.equal(events.length, 0, "rehydration only loads control state");
-  } finally { await session?.dispose(); rmSync(dir, { recursive: true, force: true }); }
-});
-
-test("idle native checkpoint shares one event, ignores sticky error with empty response, and guidance never alters persisted user text", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "agy-idle-checkpoint-"));
-  let session: Session | undefined;
-  try {
-    const conv = "conv-idle-native";
-    const prompts: string[] = [];
-    const events: ProviderEvent[] = [];
-    const spawn: SpawnFunction = (_cmd, args) => {
-      const child = new FakeChildProcess(args, (prompt, proc) => {
-        prompts.push(prompt.content);
-        if (prompt.content === "/compact") {
-          proc.sendFrame({ event: "step_update", conversation_id: conv, timestamp: new Date().toISOString(),
-            step_update: { step_index: 10, step_type: "CHECKPOINT", state: "DONE" } });
-          proc.sendFrame({ event: "result", conversation_id: conv, status: "error", errors: [IDLE_TIMEOUT_ERROR], response: "",
-            stats: { input_tokens: 250_000, output_tokens: 12_000 } });
-          return;
-        }
-        sendCompletedResponse(proc, conv, "OK");
-        proc.sendFrame({ event: "result", conversation_id: conv, status: "error", errors: [IDLE_TIMEOUT_ERROR], response: "OK",
-          stats: { input_tokens: 250_000, output_tokens: 100 } });
-      });
-      queueMicrotask(() => child.sendFrame({ event: "init", conversation_id: conv }));
-      return child as unknown as ReturnType<SpawnFunction>;
-    };
-    session = new Session("idle-native", "agy", [], {}, makeConfig(), undefined, TEST_CATALOG,
-      (e) => events.push(e), { storeDir: dir, brainDir: dir, spawn, hotCacheTtlMs: 80, autoCompactLeadMs: 40, streamInterruptRetryDelayMs: 5 });
-    await session.prompt(userPrompt("Original research request", "original"));
-    await waitForTurnEnd(events);
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    assert.equal(prompts.length, 2, "must not retry /compact when native CHECKPOINT succeeded despite sticky result error");
-    assert.equal(prompts[0], `${CONTEXT_OUTPUT_GUIDANCE}\n\nOriginal research request`);
-    const userItem = session.getStore().load(conv).find((r) => r.item.type === "user_message")?.item;
-    assert.equal(userItem?.type === "user_message" ? userItem.text : undefined, "Original research request");
-    assert.equal(events.filter((e) => e.type === "timeline.item" && e.item.type === "compaction").length, 1);
-    const state = session.getStore().loadCompaction(conv);
-    assert.equal(state.events.length, 1);
-    assert.equal(state.events[0].source, "idle");
-    assert.equal(state.events[0].nativeStep, 10);
-    assert.equal(state.lastContextTokens, 0, "without a native transcript the compacted size is unknown, never the result totals");
-    const idleUsage = usageSamples(events).at(-1);
-    assert.equal(idleUsage?.turnId, undefined);
-    assert.equal(idleUsage?.usage.contextWindowUsedTokens, undefined,
-      "an unknown size clears the meter instead of keeping the pre-compaction value");
-    assert.equal(state.consecutiveCompactFailures, 0);
-    assert.equal(state.consecutiveRapidRefills, 0);
-  } finally { await session?.dispose(); rmSync(dir, { recursive: true, force: true }); }
-});
-
-test("new and restored sessions inject guidance only once on the next real non-command prompt", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "agy-runtime-guidance-"));
-  const sessions: Session[] = [];
-  try {
-    for (const restored of [false, true]) {
-      const conv = `guidance-${restored}`;
-      const prompts: string[] = [];
-      const events: ProviderEvent[] = [];
-      const spawn: SpawnFunction = (_cmd, args) => {
-        const child = new FakeChildProcess(args, (prompt, proc) => {
-          prompts.push(prompt.content);
-          proc.sendFrame({ event: "result", conversation_id: conv, status: "success", response: "OK" });
+  it("emits an info notice when a turn finishes foreground tools without a final message", async () => {
+    const { directory, launch } = await launchStubAgent(
+      tracker,
+      `
+        const { createInterface } = require("node:readline");
+        const send = (message) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\\n");
+        createInterface({ input: process.stdin }).on("line", (line) => {
+          const { id, method, params } = JSON.parse(line);
+          const update = (u) => send({ method: "session/update", params: { sessionId: params.sessionId ?? "agy-session", update: u } });
+          if (method === "initialize") send({ id, result: { protocolVersion: 1, agentCapabilities: {} } });
+          if (method === "session/new") {
+            send({ id, result: { sessionId: "agy-session", modes: { currentModeId: "default", availableModes: [{ id: "default", name: "Default" }] } } });
+            update({ sessionUpdate: "available_commands_update", availableCommands: [] });
+          }
+          if (method === "session/prompt") {
+            update({ sessionUpdate: "tool_call", toolCallId: "t1", title: "Read /a.txt", name: "read_file", kind: "read", status: "completed", locations: [{ path: "/a.txt" }], rawInput: { Path: "/a.txt" } });
+            send({ id, result: { stopReason: "end_turn" } });
+          }
+          if (method === "session/close") send({ id, result: {} });
         });
-        queueMicrotask(() => child.sendFrame({ event: "init", conversation_id: conv }));
-        return child as unknown as ReturnType<SpawnFunction>;
-      };
-      const session = new Session(`session-${conv}`, "agy", [], {}, makeConfig({ systemPrompt: "Original configured system instructions" }),
-        restored ? { version: 1, data: { conversationId: conv, sessionKey: conv } } : undefined,
-        TEST_CATALOG, (e) => events.push(e), { storeDir: dir, brainDir: dir, spawn, autoCompactEnabled: false });
-      sessions.push(session);
-      session.open("open", [], "skip");
-      assert.equal(prompts.length, 0, "open does not send an unsolicited prompt");
-      assert.equal(events.some((e) => e.type === "session.turn"), false);
-      const inputs: ProviderPrompt[] = [
-        userPrompt("/compact", "command-compact-first"),
-        { clientMessageId: "typed-command", delivery: "auto", input: { type: "command", name: "status", arguments: "" } },
-        userPrompt("/help details", "text-command"),
-        userPrompt("First real research request", "first-real"),
-        userPrompt("Second real research request", "second-real"),
-        userPrompt("/compact", "command-compact-last"),
-      ];
-      for (const prompt of inputs) {
-        events.length = 0;
-        await session.prompt(prompt);
-        assert.equal((await waitForTurnEnd(events)).state, "completed");
-      }
-      const prefix = restored ? CONTEXT_OUTPUT_GUIDANCE
-        : `Original configured system instructions\n\n${CONTEXT_OUTPUT_GUIDANCE}`;
-      assert.deepEqual(prompts, ["/compact", "/status", "/help details",
-        `${prefix}\n\nFirst real research request`, "Second real research request", "/compact"]);
-      const storedUserText = session.getStore().load(conv).flatMap((r) => r.item.type === "user_message" ? [r.item.text] : []);
-      assert.deepEqual(storedUserText, ["/compact", "/status", "/help details",
-        "First real research request", "Second real research request", "/compact"]);
-      assert.equal(prompts.filter((text) => text.includes(CONTEXT_OUTPUT_GUIDANCE)).length, 1);
+      `,
+    );
+
+    const connection = await createAntigravityResilientProvider().connect({
+      launch,
+      versions: [1],
+      capabilities: ["prompt.message"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    try {
+      await connection.send({
+        type: "session.open",
+        requestId: "open",
+        sessionId: "test",
+        history: "skip",
+        config: { cwd: directory, env: {}, mcpServers: {}, settings: {}, persist: false },
+      });
+      await waitFor(() => events.find((e) => e.type === "session.ready"), { label: "ready" });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "test",
+        prompt: {
+          clientMessageId: "tool-only",
+          delivery: "auto",
+          input: { type: "message", content: [{ type: "text", text: "read a.txt" }] },
+        },
+      });
+      await waitFor(
+        () =>
+          events.find(
+            (e) => e.type === "session.turn" && e.turnId === "acp:tool-only" && e.state === "completed",
+          ),
+        { label: "tool-only completed" },
+      );
+      assert.ok(
+        events.some(
+          (e) =>
+            e.type === "session.notice" &&
+            e.notice.title === "Turn finished without a final message",
+        ),
+      );
+    } finally {
+      await connection.close();
     }
-  } finally {
-    for (const session of sessions) await session.dispose();
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-
-
-test("one resident agy process serves plain turns and /compact; only literal leading-slash text needs a slash-disabled process", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "agy-resident-driver-"));
-  let session: Session | undefined;
-  try {
-    const conv = "conv-resident";
-    const events: ProviderEvent[] = [];
-    const children: FakeChildProcess[] = [];
-    const sent: Array<{ child: number; content: string }> = [];
-    const spawn: SpawnFunction = (_cmd, args) => {
-      const index = children.length;
-      const child = new FakeChildProcess(args, (prompt, proc) => {
-        sent.push({ child: index, content: prompt.content });
-        proc.sendFrame({ event: "result", conversation_id: conv, status: "success",
-          response: prompt.content.startsWith("/compact") ? "" : "OK",
-          stats: { input_tokens: 1_000, output_tokens: 100 } });
-      });
-      children.push(child);
-      queueMicrotask(() => child.sendFrame({ event: "init", conversation_id: conv }));
-      return child as unknown as ReturnType<SpawnFunction>;
-    };
-    session = new Session("resident", "agy", [], {}, makeConfig(), undefined, TEST_CATALOG,
-      (e) => events.push(e), { storeDir: dir, brainDir: dir, spawn, autoCompactEnabled: false });
-    const turn = async (text: string, id: string) => {
-      events.length = 0;
-      await session!.prompt(userPrompt(text, id));
-      const end = await waitForTurnEnd(events);
-      assert.equal(end.state, "completed", text);
-    };
-    const disabled = (index: number) => children[index]?.args.includes("--disable-slash-commands");
-
-    await turn("hello", "r1");
-    await turn("/compact", "r2");
-    await turn("plain follow-up", "r3");
-    assert.equal(children.length, 1, "plain -> /compact -> plain must not respawn agy");
-    assert.equal(disabled(0), false);
-    assert.equal(children[0].killed, false);
-
-    await turn("/etc/hosts looks wrong", "r4");
-    assert.equal(children.length, 2, "literal leading-slash text needs --disable-slash-commands");
-    assert.equal(disabled(1), true);
-    assert.equal(children[0].killed, true, "the replaced process is stopped, never leaked");
-    assert.ok(children[1].args.includes("--conversation"));
-    assert.equal(sent.at(-1)?.content, "/etc/hosts looks wrong", "literal text is sent unmodified");
-
-    await turn("plain again", "r5");
-    assert.equal(children.length, 2, "plain text reuses whichever process is resident");
-    await turn("/compact", "r6");
-    assert.equal(children.length, 3);
-    assert.equal(disabled(2), false);
-    assert.deepEqual(sent.map((s) => s.child), [0, 0, 0, 1, 1, 2]);
-    await session.dispose();
-    assert.ok(children.every((c) => c.killed), "dispose stops the resident process");
-  } finally { await session?.dispose(); rmSync(dir, { recursive: true, force: true }); }
-});
-
-test("idle compact, business, failed and retried manual compact turns converge through sticky errors", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "agy-turn-converge-"));
-  let session: Session | undefined;
-  try {
-    const conv = "conv-converge";
-    const events: ProviderEvent[] = [];
-    const prompts: string[] = [];
-    let spawns = 0;
-    let step = 0;
-    const result = (proc: FakeChildProcess, status: string, errors: string[], response: string,
-      stats: Record<string, number>) => proc.sendFrame({ event: "result", conversation_id: conv, status, errors, response, stats });
-    const checkpoint = (proc: FakeChildProcess) => proc.sendFrame({ event: "step_update", conversation_id: conv,
-      timestamp: new Date().toISOString(), step_update: { step_index: (step += 10), step_type: "CHECKPOINT", state: "DONE" } });
-    const script: Array<(proc: FakeChildProcess) => void> = [
-      // 1. business turn fills the context and arms the idle compact.
-      (proc) => result(proc, "success", [], "Turn one", { input_tokens: 240_000, output_tokens: 1_000 }),
-      // 2. idle /compact: checkpoint lands, then a sticky idle-timeout error with an empty response.
-      (proc) => { checkpoint(proc); result(proc, "error", [IDLE_TIMEOUT_ERROR], "", { input_tokens: 240_000, output_tokens: 9_000 }); },
-      // 3. business turn answered despite the sticky trajectory error.
-      (proc) => { sendCompletedResponse(proc, conv, "Turn two", (step += 10));
-        result(proc, "error", [IDLE_TIMEOUT_ERROR], "Turn two", { input_tokens: 20_000, output_tokens: 100 }); },
-      // 4. manual /compact with an unrelated, unrecoverable error.
-      (proc) => result(proc, "error", ["Model refused the request"], "", {}),
-      // 5. manual /compact interrupted before any checkpoint: retried once.
-      (proc) => result(proc, "error", [IDLE_TIMEOUT_ERROR], "", {}),
-      // 6. the retry compacts.
-      (proc) => { checkpoint(proc); result(proc, "success", [], "", { input_tokens: 30_000, output_tokens: 3_000 }); },
-    ];
-    const spawn: SpawnFunction = (_cmd, args) => {
-      spawns += 1;
-      const child = new FakeChildProcess(args, (prompt, proc) => {
-        prompts.push(prompt.content);
-        script[prompts.length - 1]?.(proc);
-      });
-      queueMicrotask(() => child.sendFrame({ event: "init", conversation_id: conv }));
-      return child as unknown as ReturnType<SpawnFunction>;
-    };
-    writeFirstRequest(dir, conv, 18_000);
-    session = new Session("converge", "agy", [], {}, makeConfig(), undefined, TEST_CATALOG,
-      (e) => events.push(e), { storeDir: dir, brainDir: dir, spawn, hotCacheTtlMs: 80, autoCompactLeadMs: 40,
-        streamInterruptRetryDelayMs: 5 });
-    const terminal = () => events.filter((e): e is Extract<ProviderEvent, { type: "session.turn" }> =>
-      e.type === "session.turn" && e.state !== "started").map((e) => e.state);
-    const compactionRows = () => events.filter((e) => e.type === "timeline.item" && e.item.type === "compaction");
-
-    await session.prompt(userPrompt("Large research turn", "c1"));
-    await waitForTurnEnd(events);
-    assert.equal(session.hasCompactedSinceLastTurn(), false);
-    events.length = 0;
-    const deadline = Date.now() + 2_000;
-    while (!session.hasCompactedSinceLastTurn() || prompts.length < 2) {
-      assert.ok(Date.now() < deadline, "idle compaction did not complete");
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.equal(prompts[1], "/compact");
-    assert.deepEqual(terminal(), [], "background compaction never emits session.turn");
-    assert.equal(compactionRows().length, 1);
-    assert.equal(session.getLastContextTokens(), 18_000 + POST_COMPACT_SUMMARY_TOKENS);
-    assert.equal(session.getConsecutiveCompactFailures(), 0);
-    assert.equal(prompts.length, 2, "sticky error after a native checkpoint must not re-send /compact");
-
-    events.length = 0;
-    await session.prompt(userPrompt("Follow-up", "c3"));
-    await waitForTurnEnd(events);
-    assert.deepEqual(terminal(), ["completed"], "sticky error after an explicit response DONE completes the business turn");
-    assert.equal(session.hasCompactedSinceLastTurn(), false);
-    assert.equal(session.getLastIdleSkipReason(), "small");
-
-    events.length = 0;
-    await session.prompt(userPrompt("/compact", "c4"));
-    await waitForTurnEnd(events);
-    assert.deepEqual(terminal(), ["failed"]);
-    assert.equal(session.getConsecutiveCompactFailures(), 1);
-    assert.equal(session.isFailureBreakerOpen(), false);
-
-    events.length = 0;
-    await session.prompt(userPrompt("/compact", "c5"));
-    await waitForTurnEnd(events);
-    assert.deepEqual(terminal(), ["completed"]);
-    assert.deepEqual(prompts.slice(3), ["/compact", "/compact", "/compact"], "one stream retry, then success");
-    assert.equal(compactionRows().length, 1);
-    assert.equal(session.getConsecutiveCompactFailures(), 0, "a successful compact closes the failure streak");
-    assert.equal(session.getConsecutiveRapidRefills(), 0, "manual compact resets rapid refills");
-    assert.equal(session.isRapidRefillBreakerTripped(), false);
-    assert.equal(session.hasCompactedSinceLastTurn(), true);
-    assert.equal(session.getLastContextTokens(), 18_000 + POST_COMPACT_SUMMARY_TOKENS);
-    assert.equal(spawns, 2, "only the stream-interruption retry restarts agy");
-  } finally { await session?.dispose(); rmSync(dir, { recursive: true, force: true }); }
-});
-
-test("defaultStoreDir preserves existing ~/.paseo history when PASEO_HOME lacks a store dir, and hasTrailingNativeError matches postResponseFailure", () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "agy-store-dir-test-"));
-  const prevPaseoHome = process.env.PASEO_HOME;
-  try {
-    const store = new ConversationStore({ storeDir: dir, brainDir: dir });
-    const conv = "conv-native-err-order";
-    const logDir = path.join(dir, conv, ".system_generated", "logs");
-    mkdirSync(logDir, { recursive: true });
-    const transcriptFile = path.join(logDir, "transcript.jsonl");
-    writeFileSync(
-      transcriptFile,
-      [
-        JSON.stringify({ step_index: 0, type: "USER_INPUT", status: "DONE" }),
-        JSON.stringify({ step_index: 1, type: "ERROR_MESSAGE", status: "DONE", error: SSE_EOF_ERROR }),
-        JSON.stringify({ step_index: 2, type: "PLANNER_RESPONSE", status: "DONE", content: "Recovered" }),
-      ].join("\n") + "\n",
-      "utf8",
-    );
-    assert.equal(
-      store.hasTrailingNativeError(conv, -1),
-      false,
-      "recovered turn where PLANNER_RESPONSE follows ERROR_MESSAGE has no trailing error",
-    );
-    writeFileSync(
-      transcriptFile,
-      [
-        JSON.stringify({ step_index: 0, type: "USER_INPUT", status: "DONE" }),
-        JSON.stringify({ step_index: 1, type: "PLANNER_RESPONSE", status: "DONE", content: "Pre-tool" }),
-        JSON.stringify({ step_index: 2, type: "ERROR_MESSAGE", status: "DONE", error: SSE_EOF_ERROR }),
-      ].join("\n") + "\n",
-      "utf8",
-    );
-    assert.equal(
-      store.hasTrailingNativeError(conv, -1),
-      true,
-      "turn ending with ERROR_MESSAGE after last PLANNER_RESPONSE has a trailing error",
-    );
-
-    const populatedEnvHome = path.join(dir, "custom-paseo-home");
-    const populatedStoreDir = path.join(populatedEnvHome, "antigravity-resilient", "conversations");
-    mkdirSync(populatedStoreDir, { recursive: true });
-    process.env.PASEO_HOME = populatedEnvHome;
-    assert.equal(defaultStoreDir(), populatedStoreDir);
-  } finally {
-    if (prevPaseoHome === undefined) delete process.env.PASEO_HOME;
-    else process.env.PASEO_HOME = prevPaseoHome;
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("publishes /goal and runs it on a slash-expanding driver while literal slash messages stay literal", async () => {
-  assert.equal(isGoalPromptText("/goal ship it"), true);
-  assert.equal(isGoalPromptText("/goal"), true);
-  assert.equal(isGoalPromptText("/goals are nice"), false);
-  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-goal-"));
-  try {
-    const events: ProviderEvent[] = [];
-    const invocations: Array<{ args: readonly string[]; content: string; spawn: number }> = [];
-    let spawns = 0;
-    const spawn: SpawnFunction = (_cmd, args) => {
-      const spawnIndex = ++spawns;
-      const child = new FakeChildProcess(args, (prompt, proc) => {
-        invocations.push({ args: [...args], content: prompt.content, spawn: spawnIndex });
-        proc.sendFrame({ event: "result", conversation_id: "conv-goal", status: "success", response: "OK" });
-      });
-      queueMicrotask(() => child.sendFrame({ event: "init", conversation_id: "conv-goal" }));
-      return child as unknown as ReturnType<SpawnFunction>;
-    };
-    const session = new Session("sess-goal", "agy", [], {}, makeConfig({ systemPrompt: "System rules here" }),
-      undefined, TEST_CATALOG, (event) => events.push(event), { spawn, storeDir: tempDir, brainDir: tempDir });
-    session.open("open", [], "skip");
-    const commands = events.find((event) => event.type === "session.commands");
-    assert.deepEqual(
-      commands?.type === "session.commands" ? (commands.commands as Array<{ name: string }>).map((command) => command.name) : [],
-      ["compact", "goal"],
-    );
-
-    await session.prompt({
-      clientMessageId: "m-goal",
-      delivery: "auto",
-      input: { type: "command", name: "goal", arguments: "ship the release" },
-    });
-    await waitForTurnEnd(events);
-    events.length = 0;
-    await session.prompt(userPrompt("HELLO", "m-hello"));
-    await waitForTurnEnd(events);
-    events.length = 0;
-    await session.prompt(userPrompt("/etc/hosts looks wrong", "m-literal"));
-    await waitForTurnEnd(events);
-
-    assert.equal(invocations[0]?.content, "/goal ship the release", "the command keeps its leading slash");
-    assert.equal(invocations[0]?.args.includes("--disable-slash-commands"), false);
-    assert.match(invocations[1]?.content ?? "", /^System rules here\n\n[\s\S]*HELLO$/, "the next message carries the system prompt");
-    assert.equal(invocations[1]?.spawn, invocations[0]?.spawn, "an ordinary message reuses the expanding driver");
-    assert.ok(invocations[2]?.spawn !== invocations[1]?.spawn, "a literal slash message respawns without expansion");
-    assert.equal(invocations[2]?.content, "/etc/hosts looks wrong");
-    assert.equal(invocations[2]?.args.includes("--disable-slash-commands"), true);
-    await session.dispose();
-  } finally {
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-function launchError(code: string, async = false): NodeJS.ErrnoException {
-  const error = new Error(`spawn${async ? " agy" : ""} ${code}`) as NodeJS.ErrnoException;
-  error.code = code;
-  error.syscall = async ? "spawn agy" : "spawn";
-  return error;
-}
-
-test("retries a launch that lands in agy's self-update binary swap, sync or async", async () => {
-  assert.equal(isTransientLaunchError(launchError("UNKNOWN")), true);
-  assert.equal(isTransientLaunchError(launchError("ENOENT", true)), true);
-  assert.equal(isTransientLaunchError(Object.assign(new Error("boom"), { code: "UNKNOWN" })), false);
-  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-launch-"));
-  try {
-    const events: ProviderEvent[] = [];
-    let attempts = 0;
-    const spawn: SpawnFunction = (_cmd, args) => {
-      attempts += 1;
-      if (attempts === 1) throw launchError("UNKNOWN");
-      const child = new FakeChildProcess(args, (_prompt, proc) => {
-        sendCompletedResponse(proc, "conv-launch", "OK");
-        proc.sendFrame({ event: "result", conversation_id: "conv-launch", status: "success", response: "OK" });
-      });
-      if (attempts === 2) {
-        // Node reports ENOENT/EACCES asynchronously and never assigns a pid.
-        (child as { pid?: number }).pid = undefined;
-        queueMicrotask(() => child.emit("error", launchError("ENOENT", true)));
-      } else {
-        setTimeout(() => child.sendFrame({ event: "init", conversation_id: "conv-launch" }), 5);
-      }
-      return child as unknown as ReturnType<SpawnFunction>;
-    };
-    const session = new Session("sess-launch", "agy", [], {}, makeConfig(), undefined, TEST_CATALOG,
-      (event) => events.push(event), { spawn, storeDir: tempDir, brainDir: tempDir, launchRetryDelaysMs: [1, 1, 1] });
-    session.open("open", [], "skip");
-    await session.prompt(userPrompt("HELLO"));
-    const end = await waitForTurnEnd(events);
-    assert.equal(end.state, "completed");
-    assert.equal(attempts, 3);
-    await session.dispose();
-
-    const failing = new Session("sess-launch-fail", "agy", [], {}, makeConfig(), undefined, TEST_CATALOG,
-      (event) => events.push(event), {
-        spawn: () => { throw launchError("EBUSY"); }, storeDir: tempDir, brainDir: tempDir, launchRetryDelaysMs: [1],
-      });
-    events.length = 0;
-    failing.open("open", [], "skip");
-    await failing.prompt(userPrompt("HELLO", "m-2"));
-    assert.equal((await waitForTurnEnd(events)).state, "failed", "persistent launch failures still fail the turn");
-    await failing.dispose();
-  } finally {
-    rmSync(tempDir, { recursive: true, force: true });
-  }
-});
-
-test("availability re-checks transient agy --version failures but not unsupported or unreadable versions", async () => {
-  const outcomes = [
-    { exitCode: 1, stdout: "", stderr: "spawn UNKNOWN" },
-    { exitCode: null, stdout: "", stderr: "", timedOut: true },
-    { exitCode: 0, stdout: "1.5.3\n", stderr: "" },
-  ];
-  let calls = 0;
-  const flaky = async () => outcomes[calls++]!;
-  const status = await checkAgyStatus("agy", [], undefined, { probe: flaky, retryDelaysMs: [1, 1, 1] });
-  assert.deepEqual(status, { available: true, diagnostic: "1.5.3" });
-  assert.equal(calls, 3);
-
-  calls = 0;
-  const old = async () => { calls += 1; return { exitCode: 0, stdout: "1.1.2\n", stderr: "" }; };
-  const unsupported = await checkAgyStatus("agy", [], undefined, { probe: old, retryDelaysMs: [1, 1, 1] });
-  assert.equal(unsupported.available, false);
-  assert.equal(calls, 1, "an unsupported version is final");
-
-  calls = 0;
-  const down = async () => { calls += 1; return { exitCode: 1, stdout: "", stderr: "broken" }; };
-  const gone = await checkAgyStatus("agy", [], undefined, { probe: down, retryDelaysMs: [1, 1] });
-  assert.deepEqual(gone, { available: false, diagnostic: "broken" });
-  assert.equal(calls, 3);
-});
-
-/** A fake agy whose business turns report the next context size from `sizes`;
- * `/compact` reports cumulative totals (ignored by the post-compact estimate)
- * unless `holdCompact` keeps it pending. */
-function preTurnHarness(conv: string, sizes: number[], options: { hotCacheTtlMs: number; holdCompact?: boolean }) {
-  const tempDir = mkdtempSync(path.join(tmpdir(), "agy-resilient-preturn-"));
-  const events: ProviderEvent[] = [];
-  const invocations: string[] = [];
-  let business = 0;
-  const spawn: SpawnFunction = (_cmd, args) => {
-    const child = new FakeChildProcess(args, (prompt, proc) => {
-      invocations.push(prompt.content);
-      if (prompt.content.startsWith("/compact")) {
-        if (options.holdCompact) return;
-        proc.sendFrame({ event: "result", conversation_id: conv, status: "success",
-          stats: { input_tokens: 24_000, cache_read_tokens: 319_000, output_tokens: 2_000, total_tokens: 26_000 } });
-        return;
-      }
-      const total = sizes[business++] ?? 20_000;
-      proc.sendFrame({ event: "result", conversation_id: conv, status: "success", response: "OK",
-        stats: { input_tokens: 4_000, cache_read_tokens: total - 5_000, output_tokens: 1_000, total_tokens: total } });
-    });
-    queueMicrotask(() => child.sendFrame({ event: "init", conversation_id: conv }));
-    return child as unknown as ReturnType<SpawnFunction>;
-  };
-  const brainDir = path.join(tempDir, "brain");
-  writeFirstRequest(brainDir, conv, 17_000);
-  const session = new Session(`sess-${conv}`, "agy", [], {}, makeConfig(), undefined, TEST_CATALOG,
-    (event) => events.push(event), {
-      spawn, storeDir: tempDir, brainDir, hotCacheTtlMs: options.hotCacheTtlMs,
-      // Lead 0 arms the idle timer at expiry, where the cache is already cold:
-      // the idle compactor always skips as "lapsed", isolating the pre-turn path.
-      autoCompactLeadMs: 0, autoCompactMaxLateMs: 0,
-    });
-  return { tempDir, events, invocations, session };
-}
-
-test("pre-turn compaction: a cold cache over the idle threshold compacts before the next business prompt, inside its announced turn", async () => {
-  assert.equal(DEFAULT_PRE_TURN_COMPACT_TOKEN_THRESHOLD, 200_000);
-  const h = preTurnHarness("conv-preturn-cold", [160_000, 30_000], { hotCacheTtlMs: 30 });
-  try {
-    await h.session.prompt(userPrompt("Turn 1", "m-1"));
-    await waitForTurnEnd(h.events);
-    assert.equal(h.session.getLastContextTokens(), 160_000);
-    await new Promise((resolve) => setTimeout(resolve, 60));
-    assert.equal(h.invocations.length, 1, "The idle compactor lapsed; nothing ran while idle");
-
-    h.events.length = 0;
-    await h.session.prompt(userPrompt("Turn 2", "m-2"));
-    await waitForTurnEnd(h.events);
-    assert.deepEqual(h.invocations.slice(1).map((c) => c.split("\n").at(-1)), ["/compact", "Turn 2"]);
-
-    const turns = h.events.filter((e): e is Extract<ProviderEvent, { type: "session.turn" }> => e.type === "session.turn");
-    assert.deepEqual(turns.map((t) => [t.turnId, t.state]), [["turn-3", "started"], ["turn-3", "completed"]],
-      "The compact runs inside the business turn Paseo already shows; it gets no session.turn of its own");
-    const order = h.events.flatMap((e) => e.type === "timeline.item" && (e.item.type === "user_message" || e.item.type === "compaction")
-      ? [e.item.type] : []);
-    assert.deepEqual(order, ["user_message", "compaction"]);
-    const compaction = h.events.find((e) => e.type === "timeline.item" && e.item.type === "compaction");
-    assert.equal(compaction?.type === "timeline.item" && compaction.item.type === "compaction" ? compaction.item.preTokens : null, 160_000);
-    assert.equal(h.session.getLastContextTokens(), 30_000);
-    await h.session.dispose();
-  } finally {
-    rmSync(h.tempDir, { recursive: true, force: true });
-  }
-});
-
-test("pre-turn compaction: a warm cache waits for the hard threshold, and commands never trigger it", async () => {
-  const h = preTurnHarness("conv-preturn-warm", [180_000, 210_000, 215_000, 20_000], { hotCacheTtlMs: 10_000 });
-  try {
-    await h.session.prompt(userPrompt("Turn 1", "m-1"));
-    await waitForTurnEnd(h.events);
-    h.events.length = 0;
-    await h.session.prompt(userPrompt("Turn 2", "m-2"));
-    await waitForTurnEnd(h.events);
-    assert.equal(h.invocations.length, 2, "180K with a warm cache stays cached; no compact");
-    assert.equal(h.session.getLastContextTokens(), 210_000);
-
-    h.events.length = 0;
-    await h.session.prompt({ clientMessageId: "m-goal", delivery: "auto",
-      input: { type: "command", name: "goal", arguments: "finish" } });
-    await waitForTurnEnd(h.events);
-    assert.equal(h.invocations.at(-1), "/goal finish", "A command runs as typed, without a pre-turn compact");
-
-    h.events.length = 0;
-    await h.session.prompt(userPrompt("Turn 4", "m-4"));
-    await waitForTurnEnd(h.events);
-    assert.deepEqual(h.invocations.slice(-2).map((c) => c.split("\n").at(-1)), ["/compact", "Turn 4"],
-      "Over the hard threshold the next business turn compacts first even with a warm cache");
-    await h.session.dispose();
-  } finally {
-    rmSync(h.tempDir, { recursive: true, force: true });
-  }
-});
-
-test("pre-turn compaction: interrupting during the compact cancels the announced turn without sending its prompt", async () => {
-  const h = preTurnHarness("conv-preturn-interrupt", [230_000], { hotCacheTtlMs: 10_000, holdCompact: true });
-  try {
-    await h.session.prompt(userPrompt("Turn 1", "m-1"));
-    await waitForTurnEnd(h.events);
-    h.events.length = 0;
-    const pending = h.session.prompt(userPrompt("Turn 2", "m-2"));
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    assert.equal(h.invocations.at(-1), "/compact");
-
-    h.events.length = 0;
-    await h.session.prompt(userPrompt("Overlapping", "m-3"));
-    const rejected = h.events.find((e) => e.type === "session.prompt_result");
-    assert.equal(rejected?.type === "session.prompt_result" && rejected.result.type === "failed" ? rejected.result.error.code : null,
-      "TURN_ACTIVE", "A second prompt during the pre-turn compact is refused, not queued behind it");
-
-    await h.session.interrupt("req-int");
-    await pending;
-    const ended = await waitForTurnEnd(h.events);
-    assert.deepEqual([ended.turnId, ended.state], ["turn-3", "canceled"]);
-    assert.equal(h.invocations.includes("Turn 2") || h.invocations.some((c) => c.endsWith("Turn 2")), false);
-    await h.session.dispose();
-  } finally {
-    rmSync(h.tempDir, { recursive: true, force: true });
-  }
-});
-
-test("a native checkpoint early in a turn does not suppress idle compaction once the turn regrows past the threshold", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "agy-native-regrow-"));
-  const conv = "conv-native-regrow";
-  const events: ProviderEvent[] = [];
-  const prompts: string[] = [];
-  const logs = path.join(dir, "brain", conv, ".system_generated", "logs");
-  mkdirSync(logs, { recursive: true });
-  const file = path.join(logs, "transcript.jsonl");
-  const at = () => new Date().toISOString();
-  const rows: Record<string, unknown>[] = [
-    { step_index: 0, type: "USER_INPUT", status: "DONE", created_at: at(), content: "first request" },
-    { step_index: 1, type: "PLANNER_RESPONSE", status: "DONE", created_at: at(), input_tokens: 17_000 },
-  ];
-  const save = () => writeFileSync(file, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
-  save();
-  let step = 2;
-  const spawn: SpawnFunction = (_cmd, args) => {
-    const child = new FakeChildProcess(args, (prompt, proc) => {
-      prompts.push(prompt.content);
-      rows.push({ step_index: step++, type: "USER_INPUT", status: "DONE", created_at: at(), content: prompt.content });
-      if (prompt.content === "/compact") {
-        const cp = step++;
-        rows.push({ step_index: cp, type: "CHECKPOINT", status: "DONE", created_at: at(), content: "summary" });
-        save();
-        proc.sendFrame({ event: "step_update", conversation_id: conv, timestamp: at(), step_update: { step_index: cp, step_type: "CHECKPOINT", state: "DONE" } });
-        proc.sendFrame({ event: "result", conversation_id: conv, status: "success", stats: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } });
-        return;
-      }
-      // agy checkpoints natively early in the turn, then the same turn keeps working.
-      const cp = step++;
-      rows.push({ step_index: cp, type: "CHECKPOINT", status: "DONE", created_at: at(), content: "native summary" });
-      save();
-      proc.sendFrame({ event: "step_update", conversation_id: conv, timestamp: at(), step_update: { step_index: cp, step_type: "CHECKPOINT", state: "DONE" } });
-      for (const tokens of [60_000, 140_000, 225_000]) {
-        const s = step++;
-        rows.push({ step_index: s, type: "PLANNER_RESPONSE", status: "DONE", created_at: at(), input_tokens: tokens });
-        save();
-        proc.sendFrame({ event: "step_update", conversation_id: conv, timestamp: at(),
-          step_update: { step_index: s, step_type: "agent_response", state: "DONE", text_delta: tokens === 225_000 ? "done" : "", usage: { input_tokens: tokens } } });
-      }
-      proc.sendFrame({ event: "result", conversation_id: conv, status: "success", response: "done", stats: { input_tokens: 225_000, output_tokens: 1_000, total_tokens: 226_000 } });
-    });
-    queueMicrotask(() => child.sendFrame({ event: "init", conversation_id: conv }));
-    return child as unknown as ReturnType<SpawnFunction>;
-  };
-  const session = new Session("regrow", "agy", [], {}, makeConfig(),
-    { version: 1, data: { conversationId: conv, sessionKey: conv } }, TEST_CATALOG, (e) => events.push(e),
-    { storeDir: dir, brainDir: path.join(dir, "brain"), spawn, hotCacheTtlMs: 80, autoCompactLeadMs: 40 });
-  try {
-    await session.prompt(userPrompt("long turn", "m-1"));
-    await waitForTurnEnd(events);
-    assert.equal(session.getLastContextTokens(), 225_000);
-    assert.equal(session.hasCompactedSinceLastTurn(), false,
-      "the turn's native checkpoint was undone by regrowth past the threshold");
-    const deadline = Date.now() + 2_000;
-    while (prompts.length < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
-    assert.deepEqual(prompts.slice(1), ["/compact"], "the idle compactor runs after the regrown turn ends");
-  } finally {
-    await session.dispose();
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("the idle compactor anchors the prompt cache at the request, not at a slow reply's result", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "agy-cache-anchor-"));
-  const conv = "conv-cache-anchor";
-  const events: ProviderEvent[] = [];
-  const prompts: string[] = [];
-  let clock = 1_000_000;
-  const spawn: SpawnFunction = (_cmd, args) => {
-    const child = new FakeChildProcess(args, (prompt, proc) => {
-      prompts.push(prompt.content);
-      if (prompt.content === "/compact") {
-        proc.sendFrame({ event: "result", conversation_id: conv, status: "success", stats: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } });
-        return;
-      }
-      // The final reply streams for 250ms of the 300ms cache lifetime.
-      clock += 250;
-      proc.sendFrame({ event: "step_update", conversation_id: conv,
-        step_update: { step_index: 5, step_type: "agent_response", state: "DONE", text_delta: "done",
-          usage: { input_tokens: 5_000, cache_read_tokens: 215_000 } } });
-      clock += 10;
-      proc.sendFrame({ event: "result", conversation_id: conv, status: "success", response: "done",
-        stats: { input_tokens: 5_000, cache_read_tokens: 215_000, total_tokens: 220_000 } });
-    });
-    queueMicrotask(() => child.sendFrame({ event: "init", conversation_id: conv }));
-    return child as unknown as ReturnType<SpawnFunction>;
-  };
-  writeFirstRequest(path.join(dir, "brain"), conv, 17_000);
-  const session = new Session("anchor", "agy", [], {}, makeConfig(), undefined, TEST_CATALOG, (e) => events.push(e),
-    { storeDir: dir, brainDir: path.join(dir, "brain"), spawn, now: () => clock, hotCacheTtlMs: 300, autoCompactLeadMs: 100 });
-  try {
-    await session.prompt(userPrompt("slow reply", "m-1"));
-    await waitForTurnEnd(events);
-    // Anchored at the result, the timer would wait until result + 200ms, after
-    // the cache written at the request (expiring at request + 300ms) is gone.
-    await new Promise((resolve) => setTimeout(resolve, 40));
-    assert.deepEqual(prompts.slice(1), ["/compact"],
-      "with 40ms of cache left the compaction runs right away instead of after it expires");
-  } finally {
-    await session.dispose();
-    rmSync(dir, { recursive: true, force: true });
-  }
+  });
 });

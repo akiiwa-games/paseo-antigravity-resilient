@@ -1,14 +1,14 @@
 # 安装与验证
 
-功能差异见 [README](../README.md)。以下 Git 安装示例固定使用 `v0.2.1`。
+功能说明见 [README](../README.md)，上游基线与模块对照见 [UPSTREAM.md](UPSTREAM.md)。当前版本为 `0.3.0`。
 
 ## 安装条件
 
-- 目标 daemon 主机上 Paseo >=0.11.2，启用插件。
-- 同一 daemon 用户已安装并登录 agy >=1.1.15，其 PATH 能找到 agy。
-- 源码开发/检查使用 Node >=22.15 和 npm；Git 安装需要 Git 及仓库读取权限。
-- 插件运行时仅导入 Node 内置模块和 Paseo 提供的 SDK，无 npm 运行依赖。
-  manifest 无 build 命令，无需复制本机应用内的 TypeScript 或 SDK。
+- 目标主机运行 Paseo `>=0.17.3`（推荐 `0.17.4`），并已启用插件支持。
+- 同一 daemon 用户已安装并登录 `agy >=1.5.15`（`1.5.14` 起支持逐模型独立 `thought_level` 与 SSH 登录隔离，`1.5.15` 起保证 `session/load` 在返回前完成完整历史回放）。
+  - 在 Windows 上，若 daemon 进程的 `PATH` 未包含 `agy`，插件会自动回退到 `%LOCALAPPDATA%\agy\bin\agy.exe`，无需额外修改 `~/.paseo/config.json` 的 `env.PATH`。
+- 源码开发与本地检查需要 Node `>=22.15.0` 和 `npm`。
+- 插件运行时仅导入 Node 内置模块及 Paseo 宿主提供的 `@getpaseo/plugin` / `zod`，无 npm 运行时依赖，无需构建产物目录。
 
 ## 从目录安装及更新
 
@@ -16,87 +16,59 @@
 
 ```sh
 npm ci --ignore-scripts
-npm run typecheck
+npm run check
 paseo plugin install .
 paseo plugin ls
 paseo plugin logs antigravity-resilient-provider
 ```
 
-要求状态为 running，创建 agent 时选择 antigravity-resilient 和 full-access。
-后者传入 --dangerously-skip-permissions，驱动中的 CLI 无法交互询问权限。
+确认状态为 `running`。新建 agent 时选择 `antigravity-resilient`，默认模式为 `full-access`（自动批准工具权限请求，也可按需切换 `default` / `accept-edits` / `plan`）。
 
-拉取已审阅的更新后：
+拉取更新后重载插件：
 
 ```sh
 npm ci --ignore-scripts
-npm run typecheck
+npm run check
 paseo plugin reload antigravity-resilient-provider
 paseo plugin ls
 ```
 
-通常无需为源码更新重启 daemon；reload 会影响使用该插件的会话，应先安排好
-正在运行的工作。每台目标主机需分别安装、登录并确认实际插件来源目录。
+重载插件会重启当前正在运行的所有 `antigravity-resilient` 会话进程（重开时通过 `agy acp` `session/load` 自动恢复会话历史），请在活跃任务空闲时执行，且不要从正在使用 `antigravity-resilient` 的会话内部直接触发自身插件 reload。
 
 ## 从 Git 安装
 
 从已验收的 Git tag 安装：
 
 ```sh
-paseo plugin install github:akiiwa-games/paseo-antigravity-resilient --ref v0.2.1
+paseo plugin install github:akiiwa-games/paseo-antigravity-resilient --ref v0.3.0
 ```
 
-托管的 Git 安装使用 `paseo plugin update antigravity-resilient-provider` 更新。
-本地目录安装和托管 Git 安装的更新方式不同。npm 包标记为 private；支持本地
-pack 不表示已有 npm registry 发布。
+托管 Git 安装使用 `paseo plugin update antigravity-resilient-provider` 更新。`package.json` 标记为 `private: true`，支持本地 `npm pack` 验收，不发布到公共 npm registry。
 
-## 不调用模型的检查
+## 本地离线检查（不消耗模型额度）
 
 ```sh
-npm test
-npm run verify:install
+npm run check
+npm run verify:install -- E:/path/to/new-install-evidence
 ```
 
-verify:install 将源文件快照保存在 checkout 之外，执行干净 npm ci、类型检查、
-实际 npm pack、离线消费者安装及真实 Paseo SDK 入口链接。可在命令末尾传入
-新的绝对证据目录；打印路径保存完整日志、快照、包文件和 summary.json。
-它不安装/reload daemon 插件，不读凭据，不启动 agy。
+- `npm run check` 执行 TypeScript 严格类型检查（针对真实 `@getpaseo/plugin@0.17.4` 类型定义）与全部 `node --test` 单元及 ACP 协议测试。
+- `npm run verify:install` 将源码复制到独立目录，依次验证干净 `npm ci --ignore-scripts`、`npm run typecheck`、`npm pack`、离线消费者安装以及真实 Paseo SDK 入口链接，不访问 daemon、凭据或本机 `agy`。
 
-源码类型检查包含本地 SDK 声明，单测使用独立 SDK shim；两者均不能替代真实
-daemon 协议和模型行为验收。Node 最低版本和跨操作系统支持也需分别验收。
+## 可选 Live 验收（消耗少量模型额度）
 
-## 可选 live 检查
-
-此检查消耗模型额度并实际执行 fixture 内的命令，需 daemon PATH 有 Python：
+针对已运行新版本插件的本地 Paseo daemon 执行端到端验证：
 
 ```sh
-node scripts/verify-live.mjs --model <available-model-id> --output <new-evidence-directory>
+node scripts/verify-live.mjs --model gemini-3.8-flash --output E:/path/to/new-live-evidence
 ```
 
-检查进度、流式最终文本、reasoning、续接、回放和中断；完整事件保存在输出
-目录，测试 agent 由脚本清理。默认 fixture 路径在多次运行间固定；使用
-`--fixture <existing-test-directory> --workspace <existing-workspace-id>` 显式复用
-已有测试 workspace。`--output` 仅改变证据目录。仅准备好 reload 时加 --reload。
-不要将某次探测成功视为所有主机和现有会话均通过验收。
-
-## 可选部署工具
-
-scripts 下的部署工具独立于插件运行时。使用前需 npm ci，并提供自己的
-目标连接和路径配置。远端部署工具读取 AGENTCOMPASS_REMOTE_ENDPOINT（已有
-connection-offer 文件路径）、AGENTCOMPASS_REMOTE_ROOT 和可选的
-AGENTCOMPASS_REMOTE_PASEO_HOME；兼容旧 ROUTE_MANAGER_REMOTE_* 名称。这些
-变量名不构成 AgentCompass 运行依赖，也不包含连接凭据。
-
-当前同步脚本要求远端分支 main，执行前必须核实远端分支与工作区状态。
-连接文件、登录、真实日志与验收证据应保存在私有外部目录。
+验证流式回复、思考分块、规范化工具调用（`shell` / `write` / `edit` / `read`）、多轮续接、`refreshAgent` 历史回放以及取消回合时的子进程树回收。测试结束后自动归档并删除临时测试 agent，保留 `--output` 下的完整证据日志。
 
 ## 数据存放与许可证
 
-- 提示和工具结果通过本机 `agy` 发送给 Antigravity 服务。
-- 聊天回放数据保存在 `$PASEO_HOME/antigravity-resilient/conversations`（未设置
-  `PASEO_HOME` 时为 `~/.paseo`），可用 `providerOptions.storeDir` 修改。写入前会
-  过滤已知的凭据字段，但不能保证自由文本里的敏感信息都被去掉。
-- 额度查询会请求 `cloudcode-pa.googleapis.com`。
+- 会话历史由本机 `agy` 原生保存在 `~/.gemini/antigravity-cli/conversations/`（或 `ANTIGRAVITY_HOME`）。
+- 旧版 `stream-json` 分支遗留的 `~/.paseo/antigravity-resilient/conversations/` 数据原样保留不作修改或删除；重开旧会话时仅只读查询其中的 `session-keys/` 映射文件。
+- 额度查询仅执行本机 `agy -p /usage --output-format json`，插件自身不读取系统凭据库，也不直接请求外部 HTTP 配额接口。默认仅在 `antigravity-resilient` 会话内发现额度账号以避免与内置 `antigravity` 插件在全局额度视图重复渲染；若已禁用内置插件，可通过环境变量 `PASEO_ANTIGRAVITY_RESILIENT_GLOBAL_USAGE=1` 开启全局额度卡片。
 
-上游代码来自 [getpaseo/paseo](https://github.com/getpaseo/paseo)，采用 Apache-2.0，
-原文见 [LICENSE.paseo](../LICENSE.paseo)。本仓库修改部分的许可证尚未确定，
-公开仓库本身不代表授予新的开源许可。详见 [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)。
+上游代码来自 [getpaseo/paseo](https://github.com/getpaseo/paseo)，采用 Apache-2.0，全文见 [LICENSE.paseo](../LICENSE.paseo)。许可证与第三方说明见 [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)。

@@ -23,7 +23,7 @@ mkdirSync(snapshot);
 for (const name of [
   "package.json", "package-lock.json", "paseo-plugin.json", "tsconfig.json", ".gitignore",
   "index.server.ts", "icon.svg", "README.md", "OVERVIEW.md", "THIRD_PARTY_NOTICES.md", "LICENSE.paseo",
-  "server", "shared", "scripts", "test", "docs",
+  "server", "scripts", "test", "docs",
 ]) {
   if (existsSync(path.join(root, name))) cpSync(path.join(root, name), path.join(snapshot, name), { recursive: true });
 }
@@ -59,7 +59,7 @@ const packageName = JSON.parse(readFileSync(path.join(snapshot, "package.json"),
 const entry = path.join(consumer, "node_modules", packageName, "index.server.ts");
 // Node deliberately refuses native stripping under node_modules. Compile only the
 // packed plugin's TS with the locked TypeScript compiler; all SDK runtime imports
-// resolve to the real @getpaseo/plugin installed by npm ci, never the unit-test shim.
+// resolve to the real @getpaseo/plugin@0.17.4 installed by npm ci.
 const entryCheck = path.join(snapshot, "verify-packed-entry.mjs");
 writeFileSync(entryCheck, `
 import { registerHooks } from "node:module";

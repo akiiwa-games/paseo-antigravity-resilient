@@ -9,7 +9,7 @@ import {DaemonClient} from '@getpaseo/client/internal/daemon-client';
 import {WebSocket} from 'ws';
 
 const arg=(name,fallback)=>{const i=process.argv.indexOf(name);return i>=0?process.argv[i+1]:fallback;};
-const model=arg('--model','gemini-4-argon-high');
+const model=arg('--model','gemini-3.8-flash-low');
 const output=path.resolve(arg('--output',path.join(os.tmpdir(),`paseo-agy-live-${Date.now()}`)));
 fs.mkdirSync(output,{recursive:true});
 // Keep one fixture/workspace across runs; output directories only hold evidence.
@@ -23,7 +23,7 @@ fs.rmSync(path.join(fixture,'slow.pid'),{force:true});
 const home=process.env.PASEO_HOME||path.join(os.homedir(),'.paseo');
 const cfg=JSON.parse(fs.readFileSync(path.join(home,'config.json'),'utf8'));
 const client=new DaemonClient({url:`ws://${cfg.daemon?.listen||'127.0.0.1:6767'}/ws`,
-  clientId:randomUUID(),clientType:'cli',appVersion:'0.11.2',connectTimeoutMs:30000,
+  clientId:randomUUID(),clientType:'cli',appVersion:'0.17.4',connectTimeoutMs:30000,
   localCredential:()=>fs.readFileSync(path.join(home,'local-credential'),'utf8').trim(),
   webSocketFactory:(url,c)=>new WebSocket(url,{headers:c?.headers,protocols:c?.protocols}),reconnect:{enabled:false}});
 const types=new Set(['assistant_message','reasoning','tool_call']);
@@ -58,7 +58,7 @@ try{
     canaryPluginId='antigravity-resilient-canary-provider';
     providerId='antigravity-resilient-canary';
     fs.mkdirSync(canaryDir,{recursive:true});
-    for(const entry of ['package.json','paseo-plugin.json','icon.svg','index.server.ts','server','shared']){
+    for(const entry of ['package.json','paseo-plugin.json','icon.svg','index.server.ts','server']){
       const src=path.join(repoRoot,entry);
       if(fs.existsSync(src))fs.cpSync(src,path.join(canaryDir,entry),{recursive:true});
     }
@@ -153,33 +153,6 @@ try{
   assert.ok(items(replay).some(i=>i.type==='assistant_message'&&i.text.includes('END_MARKER')));
   assert.ok(items(replay).some(i=>i.type==='assistant_message'&&i.text.includes('THOUGHT_TAG_SURVIVED_MARKER')));
   summary.checks.replay=true;
-
-  // Simulate agy's 500-conversation cap evicting <conversationId>.db from ~/.gemini/antigravity-cli/conversations/
-  const storeDir=path.join(home,'antigravity-resilient','conversations');
-  const convFile=fs.readdirSync(storeDir).find(f=>{
-    if(!f.endsWith('.json')||f.endsWith('.compaction.json'))return false;
-    const p=path.join(storeDir,f);
-    try{
-      return fs.statSync(p).mtimeMs>=startTime&&fs.readFileSync(p,'utf8').includes('THOUGHT_TAG_SURVIVED_MARKER');
-    }catch{return false;}
-  });
-  assert.ok(convFile,'expected durable store snapshot for probe conversation');
-  const evictedConvId=convFile.replace(/\.json$/,'');
-  const agyConvDir=path.join(os.homedir(),'.gemini','antigravity-cli','conversations');
-  for(const ext of ['.db','.db-wal','.db-shm','.pb']){
-    fs.rmSync(path.join(agyConvDir,`${evictedConvId}${ext}`),{force:true});
-  }
-  await client.sendMessage(agentId,'Without tools: recall the word written to sample.txt after editing. Reply only EVICTED_RECOVERY_MARKER followed by that word.');
-  let recoveryTimeline;
-  await wait(async()=>{
-    const a=await client.fetchAgent(agentId);const snap=a?.agent||a;
-    if(snap?.status==='error')throw new Error(`Evicted DB recovery failed: ${JSON.stringify(snap.lastError)}`);
-    recoveryTimeline=await client.fetchAgentTimeline(agentId);
-    return snap?.status==='idle'&&items(recoveryTimeline).some(i=>i.type==='assistant_message'&&/EVICTED_RECOVERY_MARKER\s+beta/i.test(i.text));
-  },'evicted <conversationId>.db history recovery');
-  fs.writeFileSync(path.join(output,'evicted-recovery-timeline.json'),JSON.stringify(recoveryTimeline,null,2));
-  summary.checks.evictedDbRecovery={evictedConversationId:evictedConvId,recovered:true};
-  console.log(JSON.stringify({stage:'evictedDbRecovery',...summary.checks.evictedDbRecovery}));
 
   await client.sendMessage(agentId,'Run python slow.py exactly once in this directory. Wait for completion. Do not use other tools, change any files or delegate. This integration test will cancel the command shortly.');
   await wait(()=>fs.existsSync(path.join(fixture,'slow.pid')),'slow command start');

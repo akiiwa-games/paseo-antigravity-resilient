@@ -1,89 +1,61 @@
 # Upstream provenance and maintenance
 
-This repository adapts the Antigravity provider from
-[getpaseo/paseo](https://github.com/getpaseo/paseo). Its source directory is
-`plugins/antigravity-provider`; installed Paseo distributions put the provider under
-`resources/builtin-plugins/antigravity-provider`. The installed path is not the Git
-repository path.
+This repository adapts the Antigravity ACP provider from
+[getpaseo/paseo](https://github.com/getpaseo/paseo). Its upstream source directory is
+`plugins/antigravity-provider`; installed Paseo distributions bundle the official provider under
+`resources/builtin-plugins/antigravity-provider`.
 
-## Audited upstream pin
+## Audited upstream pin (`0.3.0` ACP rebase)
 
-Checked on 2026-11-05:
+Checked on 2026-11-25:
 
 - Repository: `https://github.com/getpaseo/paseo`
-- Branch inspected: `main`
-- Full repository commit: `b920243c74e25ec06e523019fb154f78ea9870be`
-- Commit timestamp: `2026-11-05T11:00:04+07:00`
-- Provider directory tree: `9678d16761c22cebd71a39adaaa13d75ccd8b78c`
-- Most recent commit affecting that directory:
-  `9760292650216e4cb93fa787085251029c882130` (2026-10-05),
-  “fix(providers): launch plugin CLIs on Windows and tolerate Muse startup (#6151)”.
-- Snapshot: all 243 provider-directory files, including fixtures and tests, were
-  saved before comparison. The eight runtime server modules, entry and manifest
-  matched the locally installed built-in provider line for line.
+- Tag / release baseline: `v0.17.4`
+- Full repository commit: `a583aec723d0bbd99ba1b3f42cf07b2ab7c3705c`
+- Provider directory tree (`plugins/antigravity-provider`): `11e8edda7ddba56ed519563946d769ad59703a6f`
+- SDK ACP adapter inspected (`packages/plugin/src/server/acp.ts`, `acp-internal/connection.ts`, `acp-internal/tool-call-detail.ts`): `@getpaseo/plugin@0.17.4`
+- Minimum Paseo host requirement: `>=0.17.3` (`perModelThinkingOptions` landed in `v0.17.3`; `0.17.4` adds paginated `session/list`, `LEGACY_AUTO_ACCEPT_SETTING`, and `standardToolCallDetail` refinements with zero diff in `plugins/antigravity-provider`).
+- Minimum `agy` CLI requirement: `>=1.5.15` (`1.5.14` added per-model `thought_level` and SSH sign-in separation; `1.5.15` guarantees `session/load` finishes replaying conversation history before resolving).
 
-The audit establishes the current comparison baseline. It does not establish the
-historical commit from which every pre-existing fork modification was originally made.
-The provider directory has not changed since October 5 at the audited pin; differences
-from our implementation are upstream changes absent from the older fork, rather than
-new provider changes in today's main commit.
+Upstream ACP provider capabilities inherited directly from `v0.17.4` include:
+- `#10310`: keep turns open for non-daemon background tools (`deferTurnOnRunningTools`);
+- `#10379`: canonical Antigravity tool-call detail mapping (`server/tool-calls.ts`);
+- `#10383`: separate built-in slash commands (`kind: "command"`) from invocable skills (`kind: "skill"`);
+- `#10428`: full history replay on reopened long sessions;
+- `#10469`: complete turns immediately when recurring `schedule` (`CronExpression`) stays `in_progress` after `end_turn`;
+- `#10524`: per-model `thinkingOptions` (`perModelThinkingOptions: true`, including zero thinking options on Orchestrator models).
 
-## Selective integration for 0.2.0
+## Architecture and adaptation summary for `0.3.0`
 
-The local provider keeps its own ID, persistence/replay, bounded transient recovery,
-context usage, quota reporting, native transcript handling and automatic compaction.
-The upstream provider is substantially refactored, so copying its directory wholesale
-would remove those behaviors. The release integration is split as follows:
+Starting in `0.3.0`, the legacy `stream-json` driver, native `transcript_full.jsonl` tailer, custom replay store, prompt-file image writer, and OS keyring / `cloudcode-pa` HTTP quota fetcher were removed in favor of wrapping Paseo's `runAcpProvider` (`agy acp --disable-telemetry`).
 
-| Upstream behavior | Local adaptation and ownership |
-| --- | --- |
-| Private image temporary files | `PromptFiles.encode(prompt, systemPrompt?)` writes image data into a session-owned directory, preserves visible text separately and retains the fork's command and non-image attachment support. `close()` removes the directory. Session owns calling it. |
-| Minimum CLI version | `provider.status()` accepts readable `agy` versions at least `1.1.15`, retaining the fork's probe diagnostics and timeout. |
-| Startup deadline and stdin failure | `Session.ensureDriver()` bounds initialization to 90 seconds, configurable with `providerOptions.startupTimeoutMs`. The upstream 30-second default timed out during successful silent authentication on the second test host. `spawnDriver()` forwards stdin failures. |
-| Child process tree cleanup | `spawnDriver().stop()` uses the host SDK's Windows tree termination and dedicated POSIX groups. Retired-driver callbacks are ignored and overlapping shutdown is awaited. |
-| Terminal tool status | `Session.finishTools()` finalizes running tools as completed, failed or canceled at the turn boundary. Recovery cancels the retired attempt's tools. `result.error === "interrupted"` settles tools and the turn as `canceled`. |
-| Resume identity | The init handler rejects a restored CLI conversation that differs from the requested conversation. |
-| Idle process failure | Driver close/error handlers report `session.runtime_failed` when idle. |
-| Cumulative denied actions | `Session.handleResult()` counts native denial occurrences, formats single command/action titles via `denialNoticeTitle()`, and surfaces only newly observed policy denials. |
-| Subagent & canonical tool details | `stepToolDetail()` and `toolDetail()` map `subagent_info` (`type: "sub_agent"` + `metadata.subagents`), `plain_text` fallbacks, and `agy` 1.4.12 `read_file`/`write_file`/`edit_file` (`Path`, `StartLine`, `EndLine`, `Content`, `Target`, `Replacement`) tool parameters, plus read-time `replayTimelineItem()` upgrades for persisted `unknown` tool records. |
-| Untruncated native transcript reconciliation | `NativeReasoningTail`, `parseNativeTranscript()`, and `Session.reconcileNativeTurnSteps()` read `transcript_full.jsonl` (falling back to `transcript.jsonl`) so thoughts > 4,116 chars, assistant messages truncated by literal `<thought>` tags on stdout, and steps omitted when `agy`'s stdout `stepTracker` stalls behind a `RUNNING` background tool are preserved without truncation. |
+| Area | Upstream `v0.17.4` (`plugins/antigravity-provider`) | `antigravity-resilient` (`0.3.0`) ownership & adaptation |
+| --- | --- | --- |
+| Identity | Plugin `antigravity-provider`, provider `antigravity` | Plugin `antigravity-resilient-provider`, provider `antigravity-resilient`, label `Antigravity (Resilient)` (`index.server.ts`, `server/provider.ts`). |
+| ACP core & tool calls | `runAcpProvider` + `mapToolCall` (`server/tool-calls.ts`) | Copied from `v0.17.4` with `loadReplayQuietPeriodMs: 0` (safe on enforced `agy >= 1.5.15`), `perModelThinkingOptions: true`, `waitForInitialCommands: true`, `deferTurnOnRunningTools`, and `autoAcceptMode` (`full-access`, default `true`). |
+| Process launch, Windows fallback & cleanup | Spawns bare `agy acp --disable-telemetry` | `server/launch.ts` resolves `%LOCALAPPDATA%\agy\bin\agy.exe` on Windows when `agy` is missing from daemon `PATH`, retries transient binary-swap launch errors (`1s/2s/4s`), enforces per-session (`6/60s`) & process (`30/60s`) launch rate limits, validates `agentInfo.version >= 1.5.15` on `initialize`, sanitizes `stderr`, and terminates process trees via `@getpaseo/plugin/server` `terminateProcess`. |
+| Legacy session & model-effort compatibility | `sessionOpen` reads `{ conversationId }`; `configure` splits `<model>-<effort>` | `server/legacy.ts` reads `{ sessionId }`, `{ conversationId }`, and pre-init `{ sessionKey }` (read-only lookup in `~/.paseo/antigravity-resilient/conversations/session-keys/`), emits `{ sessionId, conversationId }` in `persistence`, and attaches `<model>-<thinkingOption>` `aliases` on `discover` / `config` so Paseo's validator and external routers accept suffixed IDs on both `createAgent` and reopen. |
+| Automatic context compaction | None (manual `/compact` only) | `server/compaction.ts` + outer `ProviderConnection` wrapper in `server/provider.ts`: runs internal ACP `/compact` 2.5m after model request (`>=150K` tokens) and pre-turn (`>=150K` cold cache or `>=200K`), honors `DISABLE_COMPACT=1`, emits `compaction` timeline items (`loading` -> `completed`) without leaking user messages or turns, queues concurrent user prompts, cancels cleanly on `session.interrupt`, suppresses re-compaction until the next business model request updates `contextWindowUsedTokens`, and trips circuit breakers on 3 failures or 3 rapid refills (`<10` requests). |
+| Bounded error recovery & diagnostics | Single attempt; generic SDK transport errors | `server/recovery.ts` + `server/provider.ts`: bounded retry on OAuth 401 refresh gaps (`8s`, max 1), transient stream/network blips (`2s`, max 1), and mid-turn `agy` exits (`1.5s` + `session/load` reopen, max 1; max 2 total recoveries/turn). Uses `CONTINUE_INTERRUPTED_TURN_PROMPT` whenever a turn already made progress so completed side-effecting tools are never re-run. Re-probes live catalog once on stale startup model rejection (`db19236`), fails immediately on permanent auth / `RESOURCE_EXHAUSTED` quota / `Session not found`, and replaces generic SDK errors with exit code, signal, JSON-RPC error, and redacted `stderr`. |
+| Cancellation & tool-only turn UX | Relies on `session/cancel` response | Per-target 5s cancel fallback deadline with suspend/wake clock-jump rebasing, plus an info `session.notice` when a turn executes foreground tools and ends without trailing summary text. |
+| Usage / quota reporting | `agy -p /usage --output-format json` (`source.id = "antigravity"`) | `server/usage.ts` runs `agy -p /usage --output-format json` (`source.id = "antigravity-resilient"`, `provider = "antigravity-resilient"`), maps disabled buckets and multi-group short labels, and suppresses `scope.kind === "global"` by default (opt-in via `PASEO_ANTIGRAVITY_RESILIENT_GLOBAL_USAGE=1`) so Paseo's global usage page does not show duplicate cards alongside built-in `antigravity-provider`. |
 
-The local streaming layer also reconciles the final response and tails new native
-reasoning rows, which the audited upstream does not provide. It also handles agy
-1.4.12 retaining a historical SSE transport error in an otherwise finished result.
-Recovery requires an explicit response `DONE` (or a compaction request's completed
-native checkpoint), rejects early termination and checks for later native errors.
-Result text length and absence of an error marker are not completion evidence.
-Keep the fork's narrowed authentication classifier: upstream `wire.ts` still uses
-an overly broad `/auth/` match. Keep the fork's tolerant catalog parser, binary-aware
-cache key and bounded transient retries. Image temporary-file permissions use `0700`
-for the directory and `0600` for files on POSIX; Windows does not implement POSIX
-permission bits and relies on the user's temporary-directory ACLs.
+## Modules deleted in `0.3.0`
+
+- `server/internal/*` (`catalog.ts`, `compaction.ts`, `native-reasoning.ts`, `process.ts`, `prompt.ts`, `session.ts`, `signals.ts`, `store.ts`, `timeline.ts`, `wire.ts`): replaced by ACP runtime + focused `server/{launch,legacy,compaction,recovery}.ts`.
+- `server/credentials.ts`: removed OS keyring credential extraction and `cloudcode-pa.googleapis.com` HTTP quota fallback.
+- `server/paseo-sdk.d.ts`, `server/prompt-files.d.ts`, `shared/input.ts`, `test/sdk-shim.ts`, `test/register-sdk.mjs`, `test/fixtures/*`: replaced by real `@getpaseo/plugin@0.17.4` devDependencies and ACP protocol tests (`test/*.test.ts`).
 
 ## Updating this baseline
 
-1. Resolve and record the full upstream commit and provider tree SHA before changing
-   runtime code. Fetch source and LICENSE at that immutable commit into a separate
-   research directory; preserve the full snapshot and unabridged diffs.
-2. Compare the new provider directory to this pin, the installed built-in provider
-   and our implementation. Track new lifecycle/protocol fixes separately from local
-   replay/recovery/compaction and usage behavior.
-3. Apply each relevant fix on top of the local behavior. Do not overwrite `server/`
-   or install-source directories from an unreviewed upstream snapshot.
-4. Run clean `npm ci --ignore-scripts`, `npm run typecheck`, relevant behavioral tests
-   and `npm run verify:install`. Then validate actual model streaming, tool progress,
-   final text, interruption and resumed history in a Paseo test installation.
-5. Update this pin, integration notes and license notices. Publish the reviewed
-   repository revision and verify another host before treating the update as released.
+1. Inspect the new upstream tag in a separate checkout (`git show <tag>:plugins/antigravity-provider/...` and `packages/plugin/src/server/acp-internal/connection.ts`) without overwriting `server/` wholesale.
+2. Diff upstream `provider.ts`, `tool-calls.ts`, `usage.ts`, and SDK `connection.ts` against the commit recorded above, porting protocol/tool changes while preserving `antigravity-resilient` identity, compaction, bounded recovery, legacy compatibility, and global usage deduplication.
+3. Run `npm ci --ignore-scripts`, `npm run check`, `npm run verify:install`, and the live ACP verification harness against a real signed-in `agy` binary before cutting over a live daemon.
+4. Update this document and [LICENSE.paseo](../LICENSE.paseo) to match the newly audited upstream commit.
 
 ## License and modification notice
 
 Upstream identifies `Copyright (c) 2025-present Mohamed Boudra` and Apache License,
 Version 2.0, except for separately licensed third-party components. The complete text
-from the audited commit is retained as [LICENSE.paseo](../LICENSE.paseo).
-
-This is a modified provider: local changes add a distinct provider ID, durable replay,
-recovery, compaction, usage/quota reporting, streaming repair and installation tooling.
-The repository-wide license for local modifications has not been selected by its
-owner; the upstream license is not presented as a new grant by that owner. See
-[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
+from `v0.17.4` (`a583aec723d0bbd99ba1b3f42cf07b2ab7c3705c`) is retained in
+[LICENSE.paseo](../LICENSE.paseo). See [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).

@@ -1,451 +1,229 @@
-import { execFile } from "node:child_process";
-import fs from "node:fs";
-import os from "node:os";
+import { homedir } from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
+import { z } from "zod";
+import { execCommand } from "@getpaseo/plugin/server";
+import type { ProviderLaunch } from "@getpaseo/plugin/server/provider";
 import {
   hashAccountKey,
   toneFromUsedPct,
   unavailable,
   windowFromUsedPct,
-  type UsageAccount,
   type UsageDetail,
-  type UsageReport,
-  type UsageScope,
-  type UsageWindow,
+  type UsageSourceRegistration,
 } from "@getpaseo/plugin/server/usage";
-import { DEFAULT_KEYRING_TARGET, type UsageInput } from "../shared/input.ts";
-import {
-  readAntigravityCredential,
-  type CredentialResult,
-} from "./credentials.ts";
-import { isRecord } from "./internal/wire.ts";
-
-const execFileAsync = promisify(execFile) as (
-  file: string,
-  args: readonly string[],
-  options: Record<string, unknown>,
-) => Promise<{ stdout: string; stderr: string }>;
+import { resolveEffectiveLaunch } from "./launch.ts";
 
 export const USAGE_SOURCE_ID = "antigravity-resilient";
-export const USAGE_SOURCE_LABEL = "Antigravity";
+export const USAGE_SOURCE_LABEL = "Antigravity (Resilient)";
+export const PROVIDER_ID = "antigravity-resilient";
 
-/**
- * Provider ids whose sessions may surface this account. `antigravity` is the
- * CLI's bundled provider; `antigravity-resilient` is this plugin's.
- */
-const AFFECTED_PROVIDERS = new Set(["antigravity", "antigravity-resilient"]);
+const inputSchema = z.object({ launch: z.string() }).strict();
+const responseSchema = z.object({
+  status: z.string(),
+  error: z.string().optional(),
+  response: z.string().optional(),
+  command: z
+    .object({
+      name: z.literal("usage"),
+      data: z.object({
+        groups: z.array(
+          z.object({
+            name: z.string(),
+            description: z.string().optional(),
+            buckets: z.array(
+              z.object({
+                id: z.string().min(1),
+                name: z.string(),
+                window: z.string(),
+                remaining_fraction: z.number().min(0).max(1).nullish(),
+                reset_time: z.string().nullish(),
+                disabled: z.boolean().optional(),
+              }),
+            ),
+          }),
+        ),
+      }),
+    })
+    .optional(),
+});
 
-/**
- * Fallback HTTP endpoint when `agy -p /usage --output-format json` is
- * unavailable. Note that `agy` itself queries the `daily-cloudcode-pa` quota
- * pool via its internal language server; `readCliQuotaFromAgy` is preferred
- * so Paseo matches `agy -p /usage` and `usage-float`.
- */
-const QUOTA_URL =
-  "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
-
-/**
- * The endpoint rejects callers that do not look like the CLI (a plain
- * Gemini/HTTP user agent gets 403); `antigravity/<version>` is accepted.
- */
-const USER_AGENT = "antigravity/1.0";
-
-const FETCH_TIMEOUT_MS = 15_000;
-const CLI_USAGE_TIMEOUT_MS = 20_000;
-const CLI_MAX_BUFFER = 1024 * 1024;
-
-/** `agy` owns token refresh, so a rejected/expired token is reported for it to fix. */
-const REFRESHED_BY = "agy";
-
-const WINDOW_LABELS: Record<string, { label: string; shortLabel: string }> = {
-  weekly: { label: "Weekly", shortLabel: "wk" },
-  week: { label: "Weekly", shortLabel: "wk" },
-  "5h": { label: "5-hour", shortLabel: "5h" },
-  five_hour: { label: "5-hour", shortLabel: "5h" },
-  daily: { label: "Daily", shortLabel: "day" },
-  day: { label: "Daily", shortLabel: "day" },
-  monthly: { label: "Monthly", shortLabel: "mo" },
-  month: { label: "Monthly", shortLabel: "mo" },
-};
-
-export type UsageDeps = {
-  fetchApi?: typeof fetch;
-  now?: () => number;
-  readCredential?: (target: string) => Promise<CredentialResult>;
-  readCliQuota?: () => Promise<unknown | null>;
-};
-
-export type QuotaBucket = {
-  bucketId: string;
-  displayName?: string;
-  window?: string;
-  resetTime?: string;
-  remainingFraction: number;
-};
-
-export type QuotaGroup = {
-  displayName?: string;
-  description?: string;
-  buckets: QuotaBucket[];
-};
-
-/**
- * One account: the machine-wide `agy` login. It is only listed when the
- * credential store actually holds a token, so a machine without Antigravity
- * sees no card at all.
- */
-export async function discover(
-  scope: UsageScope,
-  deps: UsageDeps = {},
-): Promise<UsageAccount[]> {
-  if (scope.kind === "session" && !AFFECTED_PROVIDERS.has(scope.provider)) {
-    return [];
-  }
-  const target = DEFAULT_KEYRING_TARGET;
-  const read = deps.readCredential ?? readAntigravityCredential;
-  const result = await read(target);
-  if (!result.ok) {
-    return [];
-  }
-  const { credential } = result;
-  return [
-    {
-      key: hashAccountKey(target),
-      ...(credential.email ? { label: credential.email } : {}),
-      harness: USAGE_SOURCE_LABEL,
-      input: { target } satisfies UsageInput,
-    },
-  ];
+export function accountKey(env: ProviderLaunch["env"]): string {
+  const home = env.HOME ?? env.USERPROFILE ?? homedir();
+  return hashAccountKey(
+    path.resolve(env.ANTIGRAVITY_HOME ?? path.join(home, ".gemini", "antigravity-cli")),
+  );
 }
 
-export async function fetchUsage(
-  input: UsageInput,
-  deps: UsageDeps = {},
-): Promise<UsageReport> {
-  const target = input?.target?.trim() || DEFAULT_KEYRING_TARGET;
-  const read = deps.readCredential ?? readAntigravityCredential;
-  const now = deps.now ?? Date.now;
-
-  const result = await read(target);
-  if (!result.ok) {
-    return unavailable({
-      kind: "no_quota",
-      detail:
-        result.problem.kind === "unsupported"
-          ? `Reading the Antigravity login is not supported on this platform (${result.problem.platform}).`
-          : "No Antigravity login found on this machine. Run `agy` and sign in.",
-    });
-  }
-
-  const { credential } = result;
-  const readCliQuota =
-    deps.readCliQuota ??
-    (deps.fetchApi === undefined ? readCliQuotaFromAgy : undefined);
-  if (readCliQuota) {
-    try {
-      const cliPayload = await readCliQuota();
-      if (cliPayload !== null && parseQuotaGroups(cliPayload).length > 0) {
-        return reportFromQuotaResponse(cliPayload);
-      }
-    } catch {
-      // Fall back to direct HTTP quota lookup if CLI execution fails.
-    }
-  }
-
-  if (credential.expiresAt !== undefined && credential.expiresAt <= now()) {
-    return unavailable({
-      kind: "expired",
-      expiresAt: new Date(credential.expiresAt).toISOString(),
-      refreshedBy: REFRESHED_BY,
-    });
-  }
-
-  const fetchApi = deps.fetchApi ?? fetch;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  let response: Awaited<ReturnType<typeof fetch>>;
-  try {
-    response = await fetchApi(QUOTA_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${credential.accessToken}`,
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
-      },
-      body: "{}",
-      signal: controller.signal,
-    });
-  } catch (error) {
-    return {
-      status: "error",
-      error: `Antigravity quota request failed: ${describe(error)}`,
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-
-  if (response.status === 401 || response.status === 403) {
-    return unavailable({
-      kind: "rejected",
-      status: response.status,
-      refreshedBy: REFRESHED_BY,
-    });
-  }
-  if (!response.ok) {
-    return {
-      status: "error",
-      error: `Antigravity quota API returned ${response.status}`,
-    };
-  }
-
-  let payload: unknown;
-  try {
-    payload = await response.json();
-  } catch (error) {
-    return {
-      status: "error",
-      error: `Antigravity quota response was not JSON: ${describe(error)}`,
-    };
-  }
-  return reportFromQuotaResponse(payload);
+function formatWindowLabel(name: string, window: string): string {
+  if (window.trim().toLowerCase() === "5h") return "5h";
+  return name.trim().replace(/(?:\s+Limit)?\s+Remaining$/i, "");
 }
 
-/**
- * Builds an `available` report from `retrieveUserQuotaSummary`, synthetic example:
- * `{"groups":[{"displayName":"Gemini Models","description":"Models within this
- * group: Gemini Flash, Gemini Pro","buckets":[{"bucketId":"gemini-weekly",
- * "displayName":"Weekly Limit Remaining","window":"weekly","resetTime":
- * "2040-01-08T00:00:00Z","remainingFraction":0.8}]}]}`.
- */
-export function reportFromQuotaResponse(value: unknown): UsageReport {
-  const groups = parseQuotaGroups(value);
-  const windows = windowsFromGroups(groups);
-  if (windows.length === 0) {
-    // The response parsed but described nothing; make that greppable rather
-    // than silently rendering an empty card.
-    console.warn(
-      "[antigravity-resilient] Antigravity quota response produced no windows",
-    );
-  }
-  return {
-    status: "available",
-    windows,
-    balances: [],
-    details: detailsFromGroups(groups),
-  };
+function shortWindow(window: string): string {
+  const trimmed = window.trim();
+  const normalized = trimmed.toLowerCase();
+  if (normalized === "weekly") return "wk";
+  if (normalized === "monthly") return "mo";
+  return trimmed;
 }
 
-export function windowsFromQuotaResponse(value: unknown): UsageWindow[] {
-  return windowsFromGroups(parseQuotaGroups(value));
+function windowDurationSeconds(window: string): number | undefined {
+  switch (window.trim().toLowerCase()) {
+    case "5h":
+      return 5 * 3600;
+    case "weekly":
+      return 7 * 86400;
+    default:
+      return undefined;
+  }
 }
 
-function windowsFromGroups(groups: QuotaGroup[]): UsageWindow[] {
-  const windows: UsageWindow[] = [];
-  const taken = new Set<string>();
-  for (const group of groups) {
-    const groupName = group.displayName ?? USAGE_SOURCE_LABEL;
-    const shortGroup = shortGroupName(groupName);
-    for (const bucket of group.buckets) {
-      const scope = windowScope(bucket);
-      const usedPct = (1 - clamp01(bucket.remainingFraction)) * 100;
-      windows.push(
-        windowFromUsedPct({
-          id: uniqueId(bucket.bucketId, taken),
-          label: `${groupName} · ${scope.label}`,
-          shortLabel: `${shortGroup} ${scope.shortLabel}`.trim(),
-          summary: scope.shortLabel === "5h",
-          utilizationPct: usedPct,
-          resetsAt: bucket.resetTime ?? null,
-          tone: toneFromUsedPct(usedPct),
-        }),
-      );
-    }
-  }
-  return windows;
-}
-
-function detailsFromGroups(groups: QuotaGroup[]): UsageDetail[] {
-  const details: UsageDetail[] = [];
-  groups.forEach((group, index) => {
-    const value = group.description
-      ?.replace(/^models within this group:\s*/iu, "")
-      .trim();
-    if (!value) {
-      return;
-    }
-    details.push({
-      id: `group:${index}`,
-      label: group.displayName ?? `Group ${index + 1}`,
-      value,
-    });
-  });
-  return details;
-}
-
-export function parseQuotaGroups(value: unknown): QuotaGroup[] {
-  const root = unwrapQuotaRoot(value);
-  if (!isRecord(root) || !Array.isArray(root.groups)) {
-    return [];
-  }
-  const groups: QuotaGroup[] = [];
-  for (const rawGroup of root.groups) {
-    if (!isRecord(rawGroup)) {
-      continue;
-    }
-    const buckets: QuotaBucket[] = [];
-    for (const rawBucket of Array.isArray(rawGroup.buckets)
-      ? rawGroup.buckets
-      : []) {
-      if (!isRecord(rawBucket)) {
-        continue;
-      }
-      const bucketId =
-        asString(rawBucket.bucketId) ?? asString(rawBucket.id);
-      const remainingFraction =
-        asNumber(rawBucket.remainingFraction) ??
-        asNumber(rawBucket.remaining_fraction);
-      if (!bucketId || remainingFraction === null) {
-        continue;
-      }
-      const displayName =
-        asString(rawBucket.displayName) ?? asString(rawBucket.name);
-      const window = asString(rawBucket.window);
-      const resetTime =
-        asString(rawBucket.resetTime) ?? asString(rawBucket.reset_time);
-      buckets.push({
-        bucketId,
-        remainingFraction,
-        ...(displayName ? { displayName } : {}),
-        ...(window ? { window } : {}),
-        ...(resetTime ? { resetTime } : {}),
-      });
-    }
-    if (buckets.length === 0) {
-      continue;
-    }
-    const displayName =
-      asString(rawGroup.displayName) ?? asString(rawGroup.name);
-    const description = asString(rawGroup.description);
-    groups.push({
-      buckets,
-      ...(displayName ? { displayName } : {}),
-      ...(description ? { description } : {}),
-    });
-  }
-  return groups;
-}
-
-function unwrapQuotaRoot(value: unknown): unknown {
-  if (
-    isRecord(value) &&
-    isRecord(value.command) &&
-    isRecord(value.command.data) &&
-    Array.isArray(value.command.data.groups)
-  ) {
-    return value.command.data;
-  }
-  return value;
-}
-
-function resolveAgyCandidates(platform: string = process.platform): string[] {
-  const candidates: string[] = [];
-  if (platform === "win32") {
-    const localAppData =
-      process.env.LOCALAPPDATA?.trim() ||
-      path.join(os.homedir(), "AppData", "Local");
-    const agyExe = path.join(localAppData, "agy", "bin", "agy.exe");
-    if (fs.existsSync(agyExe)) {
-      candidates.push(agyExe);
-    }
-    candidates.push("agy.exe");
-  }
-  candidates.push("agy");
-  return candidates;
-}
-
-export async function readCliQuotaFromAgy(): Promise<unknown | null> {
-  for (const bin of resolveAgyCandidates()) {
-    try {
-      const { stdout } = await execFileAsync(
-        bin,
-        ["-p", "/usage", "--output-format", "json"],
-        {
-          encoding: "utf8",
-          timeout: CLI_USAGE_TIMEOUT_MS,
-          maxBuffer: CLI_MAX_BUFFER,
-          windowsHide: true,
-        },
-      );
-      const trimmed = String(stdout ?? "").trim();
-      const firstBrace = trimmed.indexOf("{");
-      const lastBrace = trimmed.lastIndexOf("}");
-      if (firstBrace < 0 || lastBrace <= firstBrace) {
-        continue;
-      }
-      const parsed: unknown = JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
-      if (parseQuotaGroups(parsed).length > 0) {
-        return parsed;
-      }
-    } catch {
-      continue;
-    }
-  }
-  return null;
-}
-
-function windowScope(bucket: QuotaBucket): {
-  label: string;
-  shortLabel: string;
-} {
-  const dash = bucket.bucketId.indexOf("-");
-  const suffix = dash >= 0 ? bucket.bucketId.slice(dash + 1) : undefined;
-  for (const candidate of [bucket.window, suffix, bucket.bucketId]) {
-    const key = candidate?.trim().toLowerCase();
-    if (key && WINDOW_LABELS[key]) {
-      return WINDOW_LABELS[key];
-    }
-  }
-  const cleaned = (bucket.displayName ?? bucket.bucketId)
-    .replace(/\s*limit remaining\s*$/iu, "")
+function formatGroupLabel(name: string): string {
+  return name
+    .trim()
+    .replace(/(?:^|\s+)models$/i, "")
     .trim();
-  return { label: cleaned || bucket.bucketId, shortLabel: "" };
 }
 
-function shortGroupName(name: string): string {
-  if (/gemini/iu.test(name)) {
-    return "Gemini";
+function formatShortLabel(groupLabel: string, window: string): string {
+  const period = shortWindow(window);
+  return groupLabel ? `${groupLabel} ${period}` : period;
+}
+
+export interface UsageOptions {
+  /**
+   * Paseo's `UsageSourceRegistry` keys global cards by `${source.id}:${account.key}`.
+   * Because built-in `antigravity-provider` already registers `source.id = "antigravity"`
+   * globally, returning an account on `scope.kind === "global"` from this plugin would
+   * render two identical Antigravity cards in the global view and run `agy -p /usage`
+   * twice. By default, global discovery is suppressed unless `allowGlobalDiscovery` is
+   * enabled (or `PASEO_ANTIGRAVITY_RESILIENT_GLOBAL_USAGE=1` is set when built-in
+   * `antigravity-provider` is disabled), while every `antigravity-resilient` session
+   * discovers its exact launch/account on `scope.kind === "session"`.
+   */
+  allowGlobalDiscovery?: boolean;
+}
+
+export class Usage {
+  private readonly launches = new Map<string, ProviderLaunch>();
+  private readonly options: UsageOptions;
+
+  constructor(options: UsageOptions = {}) {
+    this.options = options;
   }
-  if (/claude/iu.test(name)) {
-    return /gpt/iu.test(name) ? "Claude+GPT" : "Claude";
+
+  registration(): UsageSourceRegistration {
+    return {
+      id: USAGE_SOURCE_ID,
+      label: USAGE_SOURCE_LABEL,
+      icon: "icon.svg",
+      input: inputSchema,
+      provider: PROVIDER_ID,
+      discover: async (scope) => {
+        if (scope.kind === "global") {
+          const globalEnabled =
+            this.options.allowGlobalDiscovery ??
+            (scope.launch?.env.PASEO_ANTIGRAVITY_RESILIENT_GLOBAL_USAGE === "1" ||
+              process.env.PASEO_ANTIGRAVITY_RESILIENT_GLOBAL_USAGE === "1");
+          if (!globalEnabled || !scope.launch) return [];
+          const launch = resolveEffectiveLaunch(scope.launch);
+          const key = accountKey(launch.env);
+          const locator = hashAccountKey(JSON.stringify(launch));
+          this.launches.set(locator, launch);
+          return [{ key, provider: PROVIDER_ID, input: { launch: locator } }];
+        }
+
+        if (scope.provider !== PROVIDER_ID) return [];
+        if (!scope.launch) return [];
+        const launch = resolveEffectiveLaunch(scope.launch, { envOverride: scope.env });
+        const key = accountKey(launch.env);
+        const locator = hashAccountKey(JSON.stringify(launch));
+        this.launches.set(locator, launch);
+        return [{ key, provider: PROVIDER_ID, input: { launch: locator } }];
+      },
+      fetch: async (value) => {
+        const { launch: locator } = inputSchema.parse(value);
+        const launch = this.launches.get(locator);
+        if (!launch) throw new Error("Antigravity launch no longer exists");
+        const acpIndex = launch.args.indexOf("acp");
+        if (acpIndex < 0) throw new Error("Antigravity launch does not contain the acp subcommand");
+        let result;
+        try {
+          result = await execCommand(
+            launch.command,
+            [...launch.args.slice(0, acpIndex), "-p", "/usage", "--output-format", "json"],
+            {
+              env: launch.env,
+              timeout: 18_000,
+              maxBuffer: 1024 * 1024,
+            },
+          );
+        } catch {
+          throw new Error(
+            "Antigravity usage command failed or timed out. Check that agy is signed in.",
+          );
+        }
+        const trimmed = result.stdout.trim();
+        const firstBrace = trimmed.indexOf("{");
+        const lastBrace = trimmed.lastIndexOf("}");
+        const jsonSlice =
+          firstBrace >= 0 && lastBrace > firstBrace
+            ? trimmed.slice(firstBrace, lastBrace + 1)
+            : trimmed;
+        const data = responseSchema.parse(JSON.parse(jsonSlice));
+        if (data.status !== "SUCCESS") {
+          throw new Error(data.error || data.response || `agy usage returned ${data.status}`);
+        }
+        if (!data.command) throw new Error("agy did not return usage data");
+        const groups = data.command.data.groups;
+        const includeGroup = groups.length > 1;
+        const windows = groups.flatMap((group) => {
+          const groupLabel = formatGroupLabel(group.name);
+          return group.buckets.flatMap((bucket) => {
+            if (!bucket.disabled && bucket.remaining_fraction == null) return [];
+            const used = bucket.disabled ? null : (1 - bucket.remaining_fraction!) * 100;
+            return [
+              windowFromUsedPct({
+                id: bucket.id,
+                label: [
+                  groupLabel,
+                  formatWindowLabel(bucket.name, bucket.window),
+                  bucket.disabled ? "Disabled" : null,
+                ]
+                  .filter(Boolean)
+                  .join(" · "),
+                shortLabel: formatShortLabel(includeGroup ? groupLabel : "", bucket.window),
+                summary: !bucket.disabled && bucket.window === "weekly",
+                utilizationPct: used,
+                durationSeconds: windowDurationSeconds(bucket.window),
+                resetsAt: bucket.disabled ? null : bucket.reset_time,
+                tone: used === null ? "default" : toneFromUsedPct(used),
+              }),
+            ];
+          });
+        });
+        if (windows.length === 0) {
+          return unavailable({ kind: "no_quota", detail: "No usage quota reported by agy" });
+        }
+        const details: UsageDetail[] = [];
+        groups.forEach((group, index) => {
+          const modelsText = group.description
+            ?.replace(/^models within this group:\s*/iu, "")
+            .trim();
+          if (modelsText) {
+            details.push({
+              id: `group:${index}`,
+              label: group.name,
+              value: modelsText,
+            });
+          }
+        });
+        return {
+          status: "available",
+          windows,
+          ...(details.length > 0 ? { details } : {}),
+        };
+      },
+    };
   }
-  const first = name.trim().split(/\s+/u)[0] ?? "";
-  return first || name;
-}
-
-function uniqueId(candidate: string, taken: Set<string>): string {
-  let id = candidate;
-  let suffix = 2;
-  while (taken.has(id)) {
-    id = `${candidate}-${suffix}`;
-    suffix += 1;
-  }
-  taken.add(id);
-  return id;
-}
-
-function clamp01(value: number): number {
-  return Math.min(1, Math.max(0, value));
-}
-
-function asString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
-
-function asNumber(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function describe(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

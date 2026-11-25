@@ -89,7 +89,7 @@ function createDaemonClient(target) {
       url: `ws://${localListen()}/ws`,
       clientId: randomUUID(),
       clientType: "cli",
-      appVersion: "0.11.2",
+      appVersion: "0.17.4",
       connectTimeoutMs: 20_000,
       localCredential: () => fs.readFileSync(credPath, "utf8").trim(),
       webSocketFactory: (url, config) =>
@@ -111,7 +111,7 @@ function createDaemonClient(target) {
     }),
     clientId: randomUUID(),
     clientType: "cli",
-    appVersion: "0.11.2",
+    appVersion: "0.17.4",
     connectTimeoutMs: 30_000,
     webSocketFactory: (url, config) =>
       new WebSocket(url, {
@@ -267,7 +267,9 @@ async function waitForAgentTurnCompletion(client, agentId, timeoutMs = 90_000) {
 
 function extractConversationId(agent) {
   const candidates = [
+    agent?.persistence?.data?.sessionId,
     agent?.persistence?.data?.conversationId,
+    agent?.providerPersistence?.data?.sessionId,
     agent?.providerPersistence?.data?.conversationId,
     agent?.persistence?.sessionId,
     agent?.providerHandleId,
@@ -279,8 +281,9 @@ function extractConversationId(agent) {
       if (trimmed.startsWith("plugin:")) {
         try {
           const parsed = JSON.parse(trimmed.slice("plugin:".length));
-          if (typeof parsed?.data?.conversationId === "string" && parsed.data.conversationId.trim()) {
-            return parsed.data.conversationId.trim();
+          const nested = parsed?.data?.sessionId ?? parsed?.data?.conversationId;
+          if (typeof nested === "string" && nested.trim()) {
+            return nested.trim();
           }
         } catch {
           // Ignore malformed handle
@@ -436,56 +439,20 @@ async function syncRemoteCheckoutViaBundle(client, { dryRun = false } = {}) {
 }
 
 function readLocalPersistedSnapshotInfo(conversationId) {
-  const snapshotPath = path.join(
-    os.homedir(),
-    ".paseo",
-    "antigravity-resilient",
-    "conversations",
-    `${conversationId}.json`,
-  );
-  const eventsPath = path.join(
-    os.homedir(),
-    ".paseo",
-    "antigravity-resilient",
-    "conversations",
-    `${conversationId}.jsonl`,
-  );
-  const snapshotData = JSON.parse(fs.readFileSync(snapshotPath, "utf8"));
-  const eventsLines = fs.existsSync(eventsPath)
-    ? fs
-        .readFileSync(eventsPath, "utf8")
-        .split(/\r?\n/)
-        .filter(Boolean)
-    : [];
+  const agyConvDir = path.join(os.homedir(), ".gemini", "antigravity-cli", "conversations");
+  const candidates = [".pb", ".db"].map((ext) => path.join(agyConvDir, `${conversationId}${ext}`));
+  const existing = candidates.filter((p) => fs.existsSync(p));
   return {
-    snapshotPath,
-    eventsPath,
-    persistedItemCount: Array.isArray(snapshotData.items) ? snapshotData.items.length : 0,
-    persistedItemTypes: (snapshotData.items ?? []).map((entry) => entry.item?.type),
-    eventsLineCount: eventsLines.length,
+    nativeConversationFiles: existing,
+    existsInAgyStore: existing.length > 0,
   };
 }
 
-async function readRemotePersistedSnapshotInfo(client, remoteConvDir, conversationId) {
-  const snapshotPath = `${remoteConvDir}/${conversationId}.json`;
-  const eventsPath = `${remoteConvDir}/${conversationId}.jsonl`;
-  const ps = [
-    `$ErrorActionPreference = 'Continue'`,
-    `$snap = Get-Content -Raw -Encoding UTF8 '${snapshotPath}' | ConvertFrom-Json`,
-    `$lines = @()`,
-    `if (Test-Path '${eventsPath}') { $lines = @(Get-Content -Encoding UTF8 '${eventsPath}' | Where-Object { $_.Trim() -ne '' }) }`,
-    `$out = @{ snapshotPath = '${snapshotPath}'; eventsPath = '${eventsPath}'; persistedItemCount = @($snap.items).Count; persistedItemTypes = @($snap.items | ForEach-Object { $_.item.type }); eventsLineCount = $lines.Count } | ConvertTo-Json -Compress -Depth 5`,
-    `$b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($out))`,
-    `Write-Output "<<<SNAP_INFO_B64:$b64>>>"`,
-  ].join("; ");
-  const raw = await runRemotePowerShellAndCaptureMarker(
-    client,
-    REMOTE_REPO_ROOT,
-    "inspect-snapshot",
-    ps,
-    "SNAP_INFO_B64",
-  );
-  return JSON.parse(raw);
+async function readRemotePersistedSnapshotInfo(_client, _remoteConvDir, conversationId) {
+  return {
+    conversationId,
+    mode: "acp-session-load",
+  };
 }
 
 const options = parseArgs(process.argv.slice(2));

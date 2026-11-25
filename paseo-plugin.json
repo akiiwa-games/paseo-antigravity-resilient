@@ -1,8 +1,8 @@
 {
   "id": "antigravity-resilient-provider",
   "name": "Antigravity Resilient Provider",
-  "description": "Resilient Antigravity (agy) provider with durable transcript replay across restarts and bounded recovery for OAuth 401 refresh races, sticky stream-interruption errors, and catalog timeouts.",
+  "description": "Resilient Antigravity (agy acp) provider with automatic context compaction, bounded transient recovery, legacy session compatibility, and CLI quota reporting.",
   "requirements": {
-    "paseo": ">=0.11.2"
+    "paseo": ">=0.17.3"
   }
 }
