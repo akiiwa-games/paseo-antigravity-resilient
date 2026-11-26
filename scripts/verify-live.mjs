@@ -183,6 +183,21 @@ finally{
   if(canaryPluginId){
     await client.removePlugin(canaryPluginId).catch(e=>{summary.cleanupError=String(e);});
   }
+  // Creating the probe agent in the dedicated fixture directory registers a Paseo project and
+  // workspace for it; remove them so runs do not pile up in the sidebar. A caller-supplied
+  // --workspace is left alone.
+  if(agentId&&!workspaceId){
+    const norm=value=>String(value??'').split(String.fromCharCode(92)).join('/').toLowerCase().replace(/\/+$/,'');
+    try{
+      const listed=await client.listProjects({});
+      const projects=Array.isArray(listed)?listed:(listed?.projects??listed?.entries??[]);
+      for(const project of projects){
+        if(norm(project.projectRootPath)!==norm(fixture))continue;
+        const removed=await client.removeProject(project.projectId);
+        summary.removedFixtureProject={projectId:project.projectId,workspaceIds:removed?.removedWorkspaceIds??[]};
+      }
+    }catch(e){summary.cleanupError=String(e);}
+  }
   await client.close();
   fs.writeFileSync(path.join(output,'summary.json'),JSON.stringify(summary,null,2));
   console.log(`Evidence: ${output}`);
