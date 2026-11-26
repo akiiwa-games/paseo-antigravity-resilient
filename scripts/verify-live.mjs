@@ -9,7 +9,8 @@ import {DaemonClient} from '@getpaseo/client/internal/daemon-client';
 import {WebSocket} from 'ws';
 
 const arg=(name,fallback)=>{const i=process.argv.indexOf(name);return i>=0?process.argv[i+1]:fallback;};
-const model=arg('--model','gemini-3.8-flash-low');
+// Low thinking on Flash emits no reasoning, which the thinking check requires.
+const model=arg('--model','gemini-3.8-flash-high');
 const output=path.resolve(arg('--output',path.join(os.tmpdir(),`paseo-agy-live-${Date.now()}`)));
 fs.mkdirSync(output,{recursive:true});
 // Keep one fixture/workspace across runs; output directories only hold evidence.
@@ -101,7 +102,15 @@ try{
   const markerLines=text.split(/\r?\n/).map(line=>line.trim());
   for(const marker of ['PRE_TOOL_MARKER','POST_TOOL_MARKER','FINAL_MARKER','END_MARKER'])assert.equal(markerLines.filter(line=>line===marker).length,1,`${marker} line exactly once`);
   assert.equal(finalItems.filter(i=>i.type==='tool_call'&&i.status==='running').length,0);
-  const liveItems=live.flatMap(row=>items(row.message).map(item=>({at:row.at,item})));
+  // ACP streams assistant text as per-chunk deltas under one message id; accumulate them so
+  // marker and size checks see the text as the user does at each point in the stream.
+  const streamed=new Map();
+  const liveItems=live.flatMap(row=>items(row.message).map(item=>{
+    if(item.type!=='assistant_message')return {at:row.at,item};
+    const text=(streamed.get(item.id)??'')+(item.text??'');
+    streamed.set(item.id,text);
+    return {at:row.at,item:{...item,text}};
+  }));
   const progress=liveItems.findIndex(x=>x.item.type==='assistant_message'&&x.item.text.includes('PRE_TOOL_MARKER'));
   const tool=liveItems.findIndex(x=>x.item.type==='tool_call');
   assert.ok(progress>=0&&tool>progress,'progress before tool');

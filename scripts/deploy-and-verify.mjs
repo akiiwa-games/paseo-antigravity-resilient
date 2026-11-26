@@ -29,7 +29,7 @@ function parseArgs(argv) {
   let keepAgent = false;
   let dryRunSync = false;
   let replayConversationId = null;
-  let model = "gemini-3.8-flash-low";
+  let model = "gemini-3.8-flash-high";
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--target" && argv[i + 1]) {

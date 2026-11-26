@@ -60,13 +60,13 @@ npm run verify:install -- E:/path/to/new-install-evidence
 在**未重载线上插件**前，可从任意目录直接执行金丝雀（canary）隔离验证（脚本会自动将源码复制到临时目录并以独立 `antigravity-resilient-canary-provider` ID 加载和卸载，不影响线上 `antigravity-resilient` 会话）：
 
 ```sh
-node E:/PROJECTS/paseo-plugins/paseo-antigravity-resilient/scripts/verify-live.mjs --model gemini-3.8-flash-low --output E:/path/to/new-canary-evidence
+node E:/PROJECTS/paseo-plugins/paseo-antigravity-resilient/scripts/verify-live.mjs --model gemini-3.8-flash-high --output E:/path/to/new-canary-evidence
 ```
 
 在已完成代码切换、需要验证**线上已安装的 `antigravity-resilient-provider` 实例**时，在外部普通终端（非 `antigravity-resilient` 会话内）加 `--reload` 执行：
 
 ```sh
-node E:/PROJECTS/paseo-plugins/paseo-antigravity-resilient/scripts/verify-live.mjs --reload --model gemini-3.8-flash-low --output E:/path/to/new-live-evidence
+node E:/PROJECTS/paseo-plugins/paseo-antigravity-resilient/scripts/verify-live.mjs --reload --model gemini-3.8-flash-high --output E:/path/to/new-live-evidence
 ```
 
 验证流式回复、思考分块、规范化工具调用（`shell` / `write` / `edit` / `read`）、多轮续接、`refreshAgent` 历史回放以及取消回合时的子进程树回收。测试结束后自动归档并删除临时测试 agent，保留 `--output` 下的完整证据日志。
