@@ -1,8 +1,9 @@
 {
   "name": "antigravity-resilient-provider",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Paseo Antigravity ACP provider with automatic context compaction, bounded transient recovery, and CLI usage quota reporting.",
+  "license": "Apache-2.0",
   "type": "module",
   "engines": {
     "node": ">=22.15.0"
@@ -10,8 +11,10 @@
   "files": [
     "paseo-plugin.json",
     "OVERVIEW.md",
+    "OVERVIEW.zh-CN.md",
     "README.md",
     "THIRD_PARTY_NOTICES.md",
+    "LICENSE",
     "LICENSE.paseo",
     "docs/UPSTREAM.md",
     "docs/INSTALL.md",

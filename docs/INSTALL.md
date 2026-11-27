@@ -1,6 +1,6 @@
 # 安装与验证
 
-功能说明见 [README](../README.md)，上游基线与模块对照见 [UPSTREAM.md](UPSTREAM.md)。当前版本为 `0.3.0`。
+功能说明见 [README](../README.md)，上游基线与模块对照见 [UPSTREAM.md](UPSTREAM.md)。当前版本为 `0.3.1`。
 
 ## 安装条件
 
@@ -40,7 +40,7 @@ paseo plugin ls
 从已验收的 Git tag 安装：
 
 ```sh
-paseo plugin install github:akiiwa-games/paseo-antigravity-resilient --ref v0.3.0
+paseo plugin install github:akiiwa-games/paseo-antigravity-resilient --ref v0.3.1
 ```
 
 托管 Git 安装使用 `paseo plugin update antigravity-resilient-provider` 更新。`package.json` 标记为 `private: true`，支持本地 `npm pack` 验收，不发布到公共 npm registry。

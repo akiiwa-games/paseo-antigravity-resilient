@@ -7,10 +7,9 @@ Copyright (c) 2025-present Mohamed Boudra and Apache License, Version 2.0,
 except for third-party components that retain their own licenses.
 
 The source pin and adaptation history are recorded in [docs/UPSTREAM.md](docs/UPSTREAM.md).
-This notice does not grant a new license to local modifications;
-the owner has not yet selected a repository-wide license. Keep upstream notices and
-the applicable license text when redistributing upstream-derived code. The repository-wide
-licensing decision remains with the owner.
+The repository is licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE)),
+including local modifications. Keep upstream notices and the applicable license text
+when redistributing upstream-derived code.
 
 Development dependencies are pinned by `package-lock.json`; their package metadata
 and accompanying license files describe their respective terms. They are not bundled

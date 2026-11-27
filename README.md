@@ -1,6 +1,6 @@
 # Antigravity Resilient for Paseo
 
-Paseo 0.17+ 内置了基于 ACP（`agy acp`）的官方 Antigravity provider。本插件（`0.3.0`）直接基于 Paseo `v0.17.4` 官方 [`plugins/antigravity-provider`](https://github.com/getpaseo/paseo/tree/a583aec723d0bbd99ba1b3f42cf07b2ab7c3705c/plugins/antigravity-provider) 重新构建，完整继承官方 ACP 能力，并保留独立身份与生产环境韧性增强。
+Paseo 0.17+ 内置了基于 ACP（`agy acp`）的官方 Antigravity provider。本插件（`0.3.1`）直接基于 Paseo `v0.17.4` 官方 [`plugins/antigravity-provider`](https://github.com/getpaseo/paseo/tree/a583aec723d0bbd99ba1b3f42cf07b2ab7c3705c/plugins/antigravity-provider) 重新构建，完整继承官方 ACP 能力，并保留独立身份与生产环境韧性增强。
 
 插件注册为独立的 provider `antigravity-resilient`（插件 ID `antigravity-resilient-provider`），可与内置 `antigravity` 并存。对比基线与模块说明见 [docs/UPSTREAM.md](docs/UPSTREAM.md)，安装步骤见 [docs/INSTALL.md](docs/INSTALL.md)。
 
